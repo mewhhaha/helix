@@ -403,28 +403,56 @@ fn default_rainbow() -> Vec<Style> {
 }
 impl Theme {
     /// To allow `Highlight` to represent arbitrary RGB colors without turning it into an enum,
-    /// we interpret the last 256^3 numbers as RGB.
-    const RGB_START: u32 = (u32::MAX << (8 + 8 + 8)) - 1 - (u32::MAX - Highlight::MAX);
+    /// we reserve the last two 256^3 highlight values for foreground and background RGB colors.
+    const RGB_BG_TAG: u8 = u8::MAX - 1;
+    const RGB_FG_TAG: u8 = u8::MAX;
+    #[cfg(test)]
+    const DYNAMIC_RGB_HIGHLIGHT_START: u32 = u32::from_le_bytes([0, 0, 0, Self::RGB_BG_TAG]) - 2;
 
-    /// Interpret a Highlight with the RGB foreground
-    fn decode_rgb_highlight(highlight: Highlight) -> Option<(u8, u8, u8)> {
-        (highlight.get() > Self::RGB_START).then(|| {
-            let [b, g, r, ..] = (highlight.get() + 1).to_le_bytes();
-            (r, g, b)
-        })
+    fn decode_dynamic_rgb_highlight(highlight: Highlight) -> Option<(u8, u8, u8, u8)> {
+        let [b, g, r, tag] = (highlight.get() + 1).to_le_bytes();
+        matches!(tag, Self::RGB_BG_TAG | Self::RGB_FG_TAG).then_some((r, g, b, tag))
+    }
+
+    fn rgb_highlight_with_tag(r: u8, g: u8, b: u8, tag: u8) -> Highlight {
+        // -1 because highlight is "non-max": u32::MAX is reserved for the null pointer
+        // optimization.
+        Highlight::new(u32::from_le_bytes([b, g, r, tag]) - 1)
+    }
+
+    fn contrast_color(r: u8, g: u8, b: u8) -> Color {
+        // Source: https://www.w3.org/TR/WCAG21/#dfn-relative-luminance
+        // Using power 2.2 is a close approximation to the full piecewise transform.
+        let [r, g, b] = [r, g, b].map(|channel| (f32::from(channel) / 255.).powf(2.2));
+        let is_bright = (0.2126 * r + 0.7152 * g + 0.0722 * b) > 0.5;
+        if is_bright {
+            Color::Black
+        } else {
+            Color::White
+        }
     }
 
     /// Create a Highlight that represents an RGB color
     pub fn rgb_highlight(r: u8, g: u8, b: u8) -> Highlight {
-        // -1 because highlight is "non-max": u32::MAX is reserved for the null pointer
-        // optimization.
-        Highlight::new(u32::from_le_bytes([b, g, r, u8::MAX]) - 1)
+        Self::rgb_highlight_with_tag(r, g, b, Self::RGB_FG_TAG)
+    }
+
+    /// Create a Highlight that represents an RGB background color with a contrasting foreground.
+    pub fn rgb_background_highlight(r: u8, g: u8, b: u8) -> Highlight {
+        Self::rgb_highlight_with_tag(r, g, b, Self::RGB_BG_TAG)
     }
 
     #[inline]
     pub fn highlight(&self, highlight: Highlight) -> Style {
-        if let Some((red, green, blue)) = Self::decode_rgb_highlight(highlight) {
-            Style::new().fg(Color::Rgb(red, green, blue))
+        if let Some((red, green, blue, tag)) = Self::decode_dynamic_rgb_highlight(highlight) {
+            let rgb = Color::Rgb(red, green, blue);
+            if tag == Self::RGB_BG_TAG {
+                Style::new()
+                    .bg(rgb)
+                    .fg(Self::contrast_color(red, green, blue))
+            } else {
+                Style::new().fg(rgb)
+            }
         } else {
             self.highlights[highlight.idx()]
         }
@@ -738,17 +766,33 @@ mod tests {
     fn convert_to_and_from() {
         let (r, g, b) = (0xFF, 0xFE, 0xFA);
         let highlight = Theme::rgb_highlight(r, g, b);
-        assert_eq!(Theme::decode_rgb_highlight(highlight), Some((r, g, b)));
+        assert_eq!(
+            Theme::decode_dynamic_rgb_highlight(highlight),
+            Some((r, g, b, Theme::RGB_FG_TAG))
+        );
     }
 
-    /// make sure we can store all the colors at the end
+    #[test]
+    fn convert_background_highlight_to_and_from() {
+        let (r, g, b) = (0x12, 0x34, 0x56);
+        let highlight = Theme::rgb_background_highlight(r, g, b);
+        assert_eq!(
+            Theme::decode_dynamic_rgb_highlight(highlight),
+            Some((r, g, b, Theme::RGB_BG_TAG))
+        );
+    }
+
+    /// Make sure we can store both foreground and background RGB colors at the end.
     #[test]
     fn full_numeric_range() {
-        assert_eq!(Highlight::MAX - Theme::RGB_START, 256_u32.pow(3));
+        assert_eq!(
+            Highlight::MAX - Theme::DYNAMIC_RGB_HIGHLIGHT_START,
+            2 * 256_u32.pow(3)
+        );
     }
 
     #[test]
-    fn retrieve_color() {
+    fn retrieve_foreground_color() {
         // color in the middle
         let (r, g, b) = (0x14, 0xAA, 0xF7);
         assert_eq!(
@@ -770,9 +814,24 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "index out of bounds: the len is 0 but the index is 4278190078")]
+    fn retrieve_background_color() {
+        let (r, g, b) = (0xF0, 0xE0, 0x10);
+        assert_eq!(
+            Theme::default().highlight(Theme::rgb_background_highlight(r, g, b)),
+            Style::new().fg(Color::Black).bg(Color::Rgb(r, g, b))
+        );
+
+        let (r, g, b) = (0x10, 0x20, 0x30);
+        assert_eq!(
+            Theme::default().highlight(Theme::rgb_background_highlight(r, g, b)),
+            Style::new().fg(Color::White).bg(Color::Rgb(r, g, b))
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "index out of bounds")]
     fn out_of_bounds() {
-        let highlight = Highlight::new(Theme::rgb_highlight(0, 0, 0).get() - 1);
+        let highlight = Highlight::new(Theme::DYNAMIC_RGB_HIGHLIGHT_START);
         Theme::default().highlight(highlight);
     }
 }

@@ -780,7 +780,7 @@ fn generate_edits(old_text: RopeSlice, changeset: &ChangeSet) -> Vec<InputEdit> 
 /// A set of "overlay" highlights and ranges they apply to.
 ///
 /// As overlays, the styles for the given `Highlight`s are merged on top of the syntax highlights.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum OverlayHighlights {
     /// All highlights use a single `Highlight`.
     ///
@@ -806,7 +806,7 @@ impl OverlayHighlights {
         }
     }
 
-    fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         match self {
             Self::Homogeneous { ranges, .. } => ranges.is_empty(),
             Self::Heterogenous { highlights } => highlights.is_empty(),

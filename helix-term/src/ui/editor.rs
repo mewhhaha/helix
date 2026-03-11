@@ -120,7 +120,7 @@ impl EditorView {
             Self::doc_syntax_highlighter(doc, view_offset.anchor, inner.height, &loader);
         let mut overlays = Vec::new();
 
-        overlays.push(Self::overlay_syntax_highlights(
+        overlays.extend(Self::overlay_syntax_highlights(
             doc,
             view_offset.anchor,
             inner.height,
@@ -306,7 +306,7 @@ impl EditorView {
         anchor: usize,
         height: u16,
         text_annotations: &TextAnnotations,
-    ) -> OverlayHighlights {
+    ) -> Vec<OverlayHighlights> {
         let text = doc.text().slice(..);
         let row = text.char_to_line(anchor.min(text.len_chars()));
 

@@ -206,8 +206,8 @@ pub struct Document {
 
     pub previous_diagnostic_id: Option<String>,
 
-    /// Annotations for LSP document color swatches
-    pub color_swatches: Option<DocumentColorSwatches>,
+    /// Decorations for LSP document colors
+    pub document_colors: Option<DocumentColors>,
     // NOTE: ideally this would live on the handler for color swatches. This is blocked on a
     // large refactor that would make `&mut Editor` available on the `DocumentDidChange` event.
     pub color_swatch_controller: TaskController,
@@ -220,10 +220,11 @@ pub struct Document {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct DocumentColorSwatches {
-    pub color_swatches: Vec<InlineAnnotation>,
-    pub colors: Vec<syntax::Highlight>,
-    pub color_swatches_padding: Vec<InlineAnnotation>,
+pub struct DocumentColors {
+    pub inline_annotations: Vec<InlineAnnotation>,
+    pub inline_annotation_highlights: Vec<syntax::Highlight>,
+    pub inline_padding_before: Vec<InlineAnnotation>,
+    pub overlay_highlights: Vec<syntax::OverlayHighlights>,
 }
 
 /// Inlay hints for a single `(Document, View)` combo.
@@ -728,7 +729,7 @@ impl Document {
             focused_at: std::time::Instant::now(),
             readonly: false,
             jump_labels: HashMap::new(),
-            color_swatches: None,
+            document_colors: None,
             color_swatch_controller: TaskController::new(),
             syn_loader,
             previous_diagnostic_id: None,

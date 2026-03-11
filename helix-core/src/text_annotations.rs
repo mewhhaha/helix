@@ -1,5 +1,5 @@
 use std::cell::Cell;
-use std::cmp::Ordering;
+use std::cmp::{max, min, Ordering};
 use std::fmt::Debug;
 use std::ops::Range;
 use std::ptr::NonNull;
@@ -278,6 +278,7 @@ impl<T: ?Sized> Drop for RawBox<T> {
 pub struct TextAnnotations<'a> {
     inline_annotations: Vec<Layer<'a, InlineAnnotation, Option<Highlight>>>,
     overlays: Vec<Layer<'a, Overlay, Option<Highlight>>>,
+    overlay_highlights: Vec<&'a OverlayHighlights>,
     line_annotations: Vec<(Cell<usize>, RawBox<dyn LineAnnotation + 'a>)>,
 }
 
@@ -286,6 +287,7 @@ impl Debug for TextAnnotations<'_> {
         f.debug_struct("TextAnnotations")
             .field("inline_annotations", &self.inline_annotations)
             .field("overlays", &self.overlays)
+            .field("overlay_highlights", &self.overlay_highlights)
             .finish_non_exhaustive()
     }
 }
@@ -300,10 +302,11 @@ impl<'a> TextAnnotations<'a> {
         }
     }
 
-    pub fn collect_overlay_highlights(&self, char_range: Range<usize>) -> OverlayHighlights {
+    pub fn collect_overlay_highlights(&self, char_range: Range<usize>) -> Vec<OverlayHighlights> {
+        let visible_range = char_range.clone();
         let mut highlights = Vec::new();
-        self.reset_pos(char_range.start);
-        for char_idx in char_range {
+        self.reset_pos(visible_range.start);
+        for char_idx in visible_range.clone() {
             if let Some((_, Some(highlight))) = self.overlay_at(char_idx) {
                 // we don't know the number of chars the original grapheme takes
                 // however it doesn't matter as highlight boundaries are automatically
@@ -312,7 +315,18 @@ impl<'a> TextAnnotations<'a> {
             }
         }
 
-        OverlayHighlights::Heterogenous { highlights }
+        let mut overlay_highlights =
+            Vec::with_capacity(usize::from(!highlights.is_empty()) + self.overlay_highlights.len());
+        if !highlights.is_empty() {
+            overlay_highlights.push(OverlayHighlights::Heterogenous { highlights });
+        }
+        overlay_highlights.extend(
+            self.overlay_highlights
+                .iter()
+                .filter_map(|highlights| clip_overlay_highlights(highlights, &visible_range)),
+        );
+
+        overlay_highlights
     }
 
     /// Add new inline annotations.
@@ -350,6 +364,14 @@ impl<'a> TextAnnotations<'a> {
     pub fn add_overlay(&mut self, layer: &'a [Overlay], highlight: Option<Highlight>) -> &mut Self {
         if !layer.is_empty() {
             self.overlays.push((layer, highlight).into());
+        }
+        self
+    }
+
+    /// Add overlay highlights that merge on top of the rendered document text.
+    pub fn add_overlay_highlights(&mut self, layer: &'a OverlayHighlights) -> &mut Self {
+        if !layer.is_empty() {
+            self.overlay_highlights.push(layer);
         }
         self
     }
@@ -420,5 +442,38 @@ impl<'a> TextAnnotations<'a> {
             };
         }
         virt_off.row
+    }
+}
+
+fn clip_overlay_highlights(
+    overlay_highlights: &OverlayHighlights,
+    visible_range: &Range<usize>,
+) -> Option<OverlayHighlights> {
+    fn clip_range(range: &Range<usize>, visible_range: &Range<usize>) -> Option<Range<usize>> {
+        let start = max(range.start, visible_range.start);
+        let end = min(range.end, visible_range.end);
+        (start < end).then_some(start..end)
+    }
+
+    match overlay_highlights {
+        OverlayHighlights::Homogeneous { highlight, ranges } => {
+            let ranges: Vec<_> = ranges
+                .iter()
+                .filter_map(|range| clip_range(range, visible_range))
+                .collect();
+            (!ranges.is_empty()).then_some(OverlayHighlights::Homogeneous {
+                highlight: *highlight,
+                ranges,
+            })
+        }
+        OverlayHighlights::Heterogenous { highlights } => {
+            let highlights: Vec<_> = highlights
+                .iter()
+                .filter_map(|(highlight, range)| {
+                    clip_range(range, visible_range).map(|range| (*highlight, range))
+                })
+                .collect();
+            (!highlights.is_empty()).then_some(OverlayHighlights::Heterogenous { highlights })
+        }
     }
 }

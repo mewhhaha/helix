@@ -1,7 +1,7 @@
 use crate::{
     align_view,
     annotations::diagnostics::InlineDiagnostics,
-    document::{DocumentColorSwatches, DocumentInlayHints},
+    document::{DocumentColors, DocumentInlayHints},
     editor::{GutterConfig, GutterType},
     graphics::Rect,
     handlers::diagnostics::DiagnosticsHandler,
@@ -479,18 +479,24 @@ impl View {
         let config = doc.config.load();
 
         if config.lsp.display_color_swatches {
-            if let Some(DocumentColorSwatches {
-                color_swatches,
-                colors,
-                color_swatches_padding,
-            }) = &doc.color_swatches
+            if let Some(DocumentColors {
+                inline_annotations,
+                inline_annotation_highlights,
+                inline_padding_before,
+                overlay_highlights,
+            }) = &doc.document_colors
             {
-                for (color_swatch, color) in color_swatches.iter().zip(colors) {
+                for (annotation, highlight) in
+                    inline_annotations.iter().zip(inline_annotation_highlights)
+                {
                     text_annotations
-                        .add_inline_annotations(std::slice::from_ref(color_swatch), Some(*color));
+                        .add_inline_annotations(std::slice::from_ref(annotation), Some(*highlight));
                 }
 
-                text_annotations.add_inline_annotations(color_swatches_padding, None);
+                text_annotations.add_inline_annotations(inline_padding_before, None);
+                for overlay_highlights in overlay_highlights {
+                    text_annotations.add_overlay_highlights(overlay_highlights);
+                }
             }
         }
 

@@ -554,6 +554,8 @@ pub struct LspConfig {
     pub inlay_hints_length_limit: Option<NonZeroU8>,
     /// Display document color swatches
     pub display_color_swatches: bool,
+    /// How to render document colors reported by the language server
+    pub document_color_mode: DocumentColorMode,
     /// Whether to enable snippet support
     pub snippets: bool,
     /// Whether to include declaration in the goto reference query
@@ -573,8 +575,18 @@ impl Default for LspConfig {
             snippets: true,
             goto_reference_include_declaration: true,
             display_color_swatches: true,
+            document_color_mode: DocumentColorMode::Virtual,
         }
     }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DocumentColorMode {
+    Background,
+    Foreground,
+    #[default]
+    Virtual,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
