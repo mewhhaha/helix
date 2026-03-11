@@ -7,6 +7,7 @@ use crate::{
     keymap::{KeymapResult, Keymaps},
     ui::{
         document::{render_document, LinePos, TextRenderer},
+        file_tree::{FileTreeEvent, FileTreeOptions, FileTreeSidebar},
         statusline,
         text_decorations::{self, Decoration, DecorationManager, InlineDiagnostics},
         Completion, ProgressSpinners,
@@ -15,6 +16,7 @@ use crate::{
 
 use helix_core::{
     diagnostic::NumberOrString,
+    find_workspace,
     graphemes::{next_grapheme_boundary, prev_grapheme_boundary},
     movement::Direction,
     syntax::{self, OverlayHighlights},
@@ -44,6 +46,11 @@ pub struct EditorView {
     spinners: ProgressSpinners,
     /// Tracks if the terminal window is focused by reaction to terminal focus events
     terminal_focused: bool,
+    file_tree: Option<FileTreeSidebar>,
+    file_tree_focused: bool,
+    file_tree_resizing: bool,
+    last_file_tree_area: Option<Rect>,
+    last_editor_area: Rect,
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +74,11 @@ impl EditorView {
             completion: None,
             spinners: ProgressSpinners::default(),
             terminal_focused: true,
+            file_tree: None,
+            file_tree_focused: false,
+            file_tree_resizing: false,
+            last_file_tree_area: None,
+            last_editor_area: Rect::default(),
         }
     }
 
@@ -1156,6 +1168,44 @@ impl EditorView {
 
         match kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(sidebar_area) = self.last_file_tree_area {
+                    let divider_column = sidebar_area.right().saturating_sub(1);
+                    if row >= sidebar_area.top() && row < sidebar_area.bottom() {
+                        if column == divider_column {
+                            self.file_tree_resizing = true;
+                            self.file_tree_focused = true;
+                            return EventResult::Consumed(None);
+                        }
+
+                        if column >= sidebar_area.left() && column < divider_column {
+                            self.file_tree_focused = true;
+                            if let Some(file_tree) = self.file_tree.as_mut() {
+                                match file_tree.click_at_row(sidebar_area, row) {
+                                    FileTreeEvent::Consumed => return EventResult::Consumed(None),
+                                    FileTreeEvent::Close => {
+                                        self.file_tree = None;
+                                        self.file_tree_focused = false;
+                                        self.file_tree_resizing = false;
+                                        self.last_file_tree_area = None;
+                                        return EventResult::Consumed(None);
+                                    }
+                                    FileTreeEvent::Open(path) => {
+                                        if let Err(err) = cxt.editor.open(&path, helix_view::editor::Action::Replace) {
+                                            cxt.editor.set_error(format!("{err}"));
+                                        } else {
+                                            file_tree.reveal_path(&path);
+                                            self.file_tree_focused = false;
+                                        }
+                                        return EventResult::Consumed(None);
+                                    }
+                                }
+                            }
+                            return EventResult::Consumed(None);
+                        }
+                    }
+                }
+
+                self.file_tree_focused = false;
                 let editor = &mut cxt.editor;
 
                 if let Some((pos, view_id)) = pos_and_view(editor, row, column, true) {
@@ -1212,6 +1262,13 @@ impl EditorView {
             }
 
             MouseEventKind::Drag(MouseButton::Left) => {
+                if self.file_tree_resizing {
+                    if let Some(file_tree) = self.file_tree.as_mut() {
+                        file_tree.set_width_from_column(self.last_editor_area, column);
+                    }
+                    return EventResult::Consumed(None);
+                }
+
                 let (view, doc) = current!(cxt.editor);
 
                 let pos = match view.pos_at_screen_coords(doc, row, column, true) {
@@ -1252,6 +1309,11 @@ impl EditorView {
             }
 
             MouseEventKind::Up(MouseButton::Left) => {
+                if self.file_tree_resizing {
+                    self.file_tree_resizing = false;
+                    return EventResult::Consumed(None);
+                }
+
                 if !config.middle_click_paste {
                     return EventResult::Ignored(None);
                 }
@@ -1401,6 +1463,56 @@ impl Component for EditorView {
                 // clear status
                 cx.editor.status_msg = None;
 
+                if key.code == KeyCode::Char('b') && key.modifiers == KeyModifiers::SUPER {
+                    if let Some(file_tree) = self.file_tree.as_mut() {
+                        self.file_tree_focused = !self.file_tree_focused;
+                        if self.file_tree_focused {
+                            file_tree.refresh_git_statuses(&cx.editor.diff_providers);
+                            if let Some(path) = current_ref!(cx.editor).1.path() {
+                                file_tree.reveal_path(path);
+                            }
+                        }
+                    } else {
+                        let root = find_workspace().0;
+                        match FileTreeSidebar::new(root, FileTreeOptions::from_editor(cx.editor)) {
+                            Ok(mut sidebar) => {
+                                sidebar.refresh_git_statuses(&cx.editor.diff_providers);
+                                if let Some(path) = current_ref!(cx.editor).1.path() {
+                                    sidebar.reveal_path(path);
+                                }
+                                self.file_tree = Some(sidebar);
+                                self.file_tree_focused = true;
+                            }
+                            Err(err) => cx.editor.set_error(format!("Failed to open file tree: {err}")),
+                        }
+                    }
+                    return EventResult::Consumed(None);
+                }
+
+                if self.file_tree_focused {
+                    if let Some(file_tree) = self.file_tree.as_mut() {
+                        match file_tree.handle_key(key) {
+                            FileTreeEvent::Consumed => return EventResult::Consumed(None),
+                            FileTreeEvent::Close => {
+                                self.file_tree = None;
+                                self.file_tree_focused = false;
+                                self.file_tree_resizing = false;
+                                self.last_file_tree_area = None;
+                                return EventResult::Consumed(None);
+                            }
+                            FileTreeEvent::Open(path) => {
+                                if let Err(err) = cx.editor.open(&path, helix_view::editor::Action::Replace) {
+                                    cx.editor.set_error(format!("{err}"));
+                                } else {
+                                    file_tree.reveal_path(&path);
+                                    self.file_tree_focused = false;
+                                }
+                                return EventResult::Consumed(None);
+                            }
+                        }
+                    }
+                }
+
                 let mode = cx.editor.mode();
 
                 if !self.on_next_key(OnKeyCallbackKind::PseudoPending, &mut cx, key) {
@@ -1541,11 +1653,27 @@ impl Component for EditorView {
             editor_area = editor_area.clip_top(1);
         }
 
+        self.last_editor_area = editor_area;
+        let sidebar_width = self
+            .file_tree
+            .as_ref()
+            .and_then(|file_tree| file_tree.width_for(editor_area));
+        self.last_file_tree_area = sidebar_width.map(|width| editor_area.with_width(width));
+        let main_area = if let Some(width) = sidebar_width {
+            editor_area.clip_left(width)
+        } else {
+            editor_area
+        };
+
         // if the terminal size suddenly changed, we need to trigger a resize
-        cx.editor.resize(editor_area);
+        cx.editor.resize(main_area);
 
         if use_bufferline {
             Self::render_bufferline(cx.editor, area.with_height(1), surface);
+        }
+
+        if let (Some(file_tree), Some(width)) = (self.file_tree.as_mut(), sidebar_width) {
+            file_tree.render(editor_area.with_width(width), surface, cx.editor, self.file_tree_focused);
         }
 
         for (view, is_focused) in cx.editor.tree.views() {

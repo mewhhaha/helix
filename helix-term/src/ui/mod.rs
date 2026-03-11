@@ -1,6 +1,7 @@
 mod completion;
 mod document;
 pub(crate) mod editor;
+mod file_tree;
 mod info;
 pub mod lsp;
 mod markdown;
@@ -189,7 +190,7 @@ pub fn raw_regex_prompt(
 }
 
 /// We want to exclude files that the editor can't handle yet
-fn get_excluded_types() -> ignore::types::Types {
+pub(super) fn get_excluded_types() -> ignore::types::Types {
     use ignore::types::TypesBuilder;
     let mut type_builder = TypesBuilder::new();
     type_builder
