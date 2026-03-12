@@ -1463,7 +1463,10 @@ impl Component for EditorView {
                 // clear status
                 cx.editor.status_msg = None;
 
-                if key.code == KeyCode::Char('b') && key.modifiers == KeyModifiers::SUPER {
+                let file_tree_toggle = key.code == KeyCode::Char('b')
+                    && (key.modifiers == KeyModifiers::SUPER
+                        || key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::ALT));
+                if file_tree_toggle {
                     if let Some(file_tree) = self.file_tree.as_mut() {
                         self.file_tree_focused = !self.file_tree_focused;
                         if self.file_tree_focused {
