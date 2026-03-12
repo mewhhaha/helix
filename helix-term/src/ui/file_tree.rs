@@ -4,7 +4,7 @@ use helix_lsp::lsp::DiagnosticSeverity;
 use helix_stdx::path::normalize;
 use helix_vcs::{DiffProviderRegistry, FileChange};
 use helix_view::{
-    graphics::{Modifier, Rect, Style},
+    graphics::{Color, Modifier, Rect, Style, UnderlineStyle},
     input::KeyEvent,
     keyboard::KeyCode,
     Editor,
@@ -469,13 +469,14 @@ impl FileTreeSidebar {
         is_selected: bool,
         is_active: bool,
     ) -> Spans<'static> {
-        let mut base_style = match entry.kind {
+        let mut prefix_style = match entry.kind {
             EntryKind::Directory => directory_style,
             EntryKind::File => file_style,
         };
+        let mut name_style = prefix_style;
 
         if let Some(change) = change {
-            base_style = base_style.patch(change_style(
+            name_style = name_style.patch(change_style(
                 change,
                 added_style,
                 modified_style,
@@ -483,12 +484,18 @@ impl FileTreeSidebar {
                 error_style,
             ));
         }
+        if let Some(underline_style) = diagnostic_underline_style(counts, warning_style, error_style)
+        {
+            name_style = name_style.patch(underline_style);
+        }
 
         if is_active {
-            base_style = base_style.add_modifier(Modifier::BOLD);
+            prefix_style = prefix_style.add_modifier(Modifier::BOLD);
+            name_style = name_style.add_modifier(Modifier::BOLD);
         }
         if is_selected {
-            base_style = selected_style.patch(base_style);
+            prefix_style = selected_style.patch(prefix_style);
+            name_style = selected_style.patch(name_style);
         }
 
         let mut suffix = Vec::new();
@@ -498,7 +505,7 @@ impl FileTreeSidebar {
             } else {
                 warning_style
             };
-            suffix.push(Span::styled(format!(" {}", counts.warnings), style));
+            suffix.push(Span::styled(format!(" {}", counts.warnings), style));
         }
         if counts.errors > 0 {
             let style = if is_selected {
@@ -506,14 +513,23 @@ impl FileTreeSidebar {
             } else {
                 error_style
             };
-            suffix.push(Span::styled(format!(" {}", counts.errors), style));
+            suffix.push(Span::styled(format!(" {}", counts.errors), style));
         }
 
         let suffix_width: usize = suffix.iter().map(|span| span.content.width()).sum();
         let label_width = max_width.saturating_sub(suffix_width);
-        let label = truncate_to_width(&self.entry_label(entry), label_width);
+        let (prefix, name) = self.entry_label_parts(entry);
+        let prefix_width = prefix.width();
+        let mut spans = Vec::new();
 
-        let mut spans = vec![Span::styled(label, base_style)];
+        if label_width <= prefix_width {
+            let label = truncate_to_width(&format!("{prefix}{name}"), label_width);
+            spans.push(Span::styled(label, prefix_style));
+        } else {
+            let name_width = label_width.saturating_sub(prefix_width);
+            spans.push(Span::styled(prefix, prefix_style));
+            spans.push(Span::styled(truncate_to_width(&name, name_width), name_style));
+        }
         spans.extend(suffix);
         Spans::from(spans)
     }
@@ -653,7 +669,7 @@ impl FileTreeSidebar {
         }
     }
 
-    fn entry_label(&self, entry: &FileTreeEntry) -> String {
+    fn entry_label_parts(&self, entry: &FileTreeEntry) -> (String, String) {
         let disclosure = match entry.kind {
             EntryKind::Directory if entry.expanded => "▾",
             EntryKind::Directory => "▸",
@@ -666,7 +682,7 @@ impl FileTreeSidebar {
         };
         let indent = "  ".repeat(entry.depth);
         let name = file_name(&entry.path);
-        format!("{indent}{disclosure} {icon} {name}")
+        (format!("{indent}{disclosure} {icon} "), name)
     }
 
     fn root_label(&self) -> String {
@@ -708,6 +724,26 @@ fn change_style(
         FileChangeKind::Deleted => removed_style,
         FileChangeKind::Renamed => modified_style.add_modifier(Modifier::ITALIC),
     }
+}
+
+fn diagnostic_underline_style(
+    counts: DiagnosticCounts,
+    warning_style: Style,
+    error_style: Style,
+) -> Option<Style> {
+    let underline_color = if counts.errors > 0 {
+        error_style.fg.unwrap_or(Color::Red)
+    } else if counts.warnings > 0 {
+        warning_style.fg.unwrap_or(Color::Yellow)
+    } else {
+        return None;
+    };
+
+    Some(
+        Style::default()
+            .underline_color(underline_color)
+            .underline_style(UnderlineStyle::Dotted),
+    )
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -766,9 +802,11 @@ fn file_icon(path: &Path) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{FileTreeOptions, FileTreeSidebar, MIN_SIDEBAR_WIDTH};
+    use super::{
+        DiagnosticCounts, FileChangeKind, FileTreeOptions, FileTreeSidebar, MIN_SIDEBAR_WIDTH,
+    };
     use helix_view::{
-        graphics::Rect,
+        graphics::{Color, Rect, Style, UnderlineStyle},
         input::KeyEvent,
         keyboard::{KeyCode, KeyModifiers},
     };
@@ -870,5 +908,49 @@ mod tests {
         let area = Rect::new(0, 0, 60, 20);
         assert_eq!(FileTreeSidebar::clamp_width(area, 5), Some(MIN_SIDEBAR_WIDTH));
         assert_eq!(FileTreeSidebar::clamp_width(Rect::new(0, 0, 30, 20), 20), None);
+    }
+
+    #[test]
+    fn entry_spans_only_style_filename_and_use_numeric_diagnostics() {
+        let dir = tempdir().unwrap();
+        setup_tree(dir.path());
+        let sidebar = FileTreeSidebar::new(dir.path().to_path_buf(), options()).unwrap();
+        let entry = sidebar
+            .entries
+            .iter()
+            .find(|entry| entry.path.ends_with("Cargo.toml"))
+            .unwrap();
+
+        let spans = sidebar.entry_spans(
+            entry,
+            80,
+            Style::default().fg(Color::Blue),
+            Style::default().fg(Color::White),
+            Style::default().bg(Color::Gray),
+            Style::default().fg(Color::Green),
+            Style::default().fg(Color::Yellow),
+            Style::default().fg(Color::Red),
+            Style::default().fg(Color::Yellow),
+            Style::default().fg(Color::Red),
+            Some(FileChangeKind::Modified),
+            DiagnosticCounts {
+                warnings: 2,
+                errors: 1,
+            },
+            false,
+            false,
+        );
+
+        assert_eq!(spans.0.len(), 4);
+        assert_eq!(spans.0[0].style.fg, Some(Color::White));
+        assert_eq!(spans.0[0].style.underline_style, None);
+        assert_eq!(spans.0[1].content.as_ref(), "Cargo.toml");
+        assert_eq!(spans.0[1].style.fg, Some(Color::Yellow));
+        assert_eq!(spans.0[1].style.underline_style, Some(UnderlineStyle::Dotted));
+        assert_eq!(spans.0[1].style.underline_color, Some(Color::Red));
+        assert_eq!(spans.0[2].content.as_ref(), " 2");
+        assert_eq!(spans.0[2].style.fg, Some(Color::Yellow));
+        assert_eq!(spans.0[3].content.as_ref(), " 1");
+        assert_eq!(spans.0[3].style.fg, Some(Color::Red));
     }
 }
