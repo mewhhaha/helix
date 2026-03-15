@@ -1188,6 +1188,14 @@ use futures_util::stream::{Flatten, Once};
 
 type Diagnostics = BTreeMap<Uri, Vec<(lsp::Diagnostic, DiagnosticProvider)>>;
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct WorkspaceDiagnosticCounts {
+    pub hints: u32,
+    pub info: u32,
+    pub warnings: u32,
+    pub errors: u32,
+}
+
 pub struct Editor {
     /// Current editing mode.
     pub mode: Mode,
@@ -1208,6 +1216,8 @@ pub struct Editor {
     pub macro_replaying: Vec<char>,
     pub language_servers: helix_lsp::Registry,
     pub diagnostics: Diagnostics,
+    diagnostics_generation: u64,
+    workspace_diagnostic_counts: WorkspaceDiagnosticCounts,
     pub diff_providers: DiffProviderRegistry,
 
     pub debug_adapters: dap::registry::Registry,
@@ -1354,6 +1364,8 @@ impl Editor {
             theme: theme_loader.default(),
             language_servers,
             diagnostics: Diagnostics::new(),
+            diagnostics_generation: 0,
+            workspace_diagnostic_counts: WorkspaceDiagnosticCounts::default(),
             diff_providers: DiffProviderRegistry::default(),
             debug_adapters: dap::registry::Registry::new(),
             breakpoints: HashMap::new(),
@@ -2173,6 +2185,19 @@ impl Editor {
             .find(|doc| doc.path().map(|p| p == path.as_ref()).unwrap_or(false))
     }
 
+    pub fn diagnostics_generation(&self) -> u64 {
+        self.diagnostics_generation
+    }
+
+    pub fn workspace_diagnostic_counts(&self) -> WorkspaceDiagnosticCounts {
+        self.workspace_diagnostic_counts
+    }
+
+    pub fn refresh_workspace_diagnostics(&mut self) {
+        self.diagnostics_generation = self.diagnostics_generation.wrapping_add(1);
+        self.workspace_diagnostic_counts = count_workspace_diagnostics(&self.diagnostics);
+    }
+
     /// Returns all supported diagnostics for the document
     pub fn doc_diagnostics<'a>(
         language_servers: &'a helix_lsp::Registry,
@@ -2435,6 +2460,21 @@ impl Editor {
         doc.set_selection(view_id, selection);
         view.ensure_cursor_in_view_center(doc, self.config.load().scrolloff);
     }
+}
+
+fn count_workspace_diagnostics(diagnostics: &Diagnostics) -> WorkspaceDiagnosticCounts {
+    diagnostics.values().flatten().fold(
+        WorkspaceDiagnosticCounts::default(),
+        |mut counts, (diag, _)| {
+            match diag.severity {
+                Some(lsp::DiagnosticSeverity::WARNING) => counts.warnings += 1,
+                Some(lsp::DiagnosticSeverity::ERROR) => counts.errors += 1,
+                Some(lsp::DiagnosticSeverity::INFORMATION) => counts.info += 1,
+                Some(lsp::DiagnosticSeverity::HINT) | None | Some(_) => counts.hints += 1,
+            }
+            counts
+        },
+    )
 }
 
 fn try_restore_indent(doc: &mut Document, view: &mut View) {

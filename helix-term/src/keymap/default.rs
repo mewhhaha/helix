@@ -36,6 +36,7 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
 
         "v" => select_mode,
         "G" => goto_line,
+        "Cmd-b" | "C-A-b" => toggle_file_tree,
         "g" => { "Goto"
             "g" => goto_file_start,
             "|" => goto_column,
@@ -380,6 +381,7 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
     }));
     let insert = keymap!({ "Insert mode"
         "esc" => normal_mode,
+        "Cmd-b" | "C-A-b" => toggle_file_tree,
 
         "C-s" => commit_undo_checkpoint,
         "C-x" => completion,

@@ -82,6 +82,32 @@ impl EditorView {
         }
     }
 
+    pub(crate) fn toggle_file_tree(&mut self, editor: &mut Editor) {
+        if let Some(file_tree) = self.file_tree.as_mut() {
+            self.file_tree_focused = !self.file_tree_focused;
+            if self.file_tree_focused {
+                file_tree.refresh_git_statuses(&editor.diff_providers);
+                if let Some(path) = current_ref!(editor).1.path() {
+                    file_tree.reveal_path(path);
+                }
+            }
+            return;
+        }
+
+        let root = find_workspace().0;
+        match FileTreeSidebar::new(root, FileTreeOptions::from_editor(editor)) {
+            Ok(mut sidebar) => {
+                sidebar.refresh_git_statuses(&editor.diff_providers);
+                if let Some(path) = current_ref!(editor).1.path() {
+                    sidebar.reveal_path(path);
+                }
+                self.file_tree = Some(sidebar);
+                self.file_tree_focused = true;
+            }
+            Err(err) => editor.set_error(format!("Failed to open file tree: {err}")),
+        }
+    }
+
     pub fn spinners_mut(&mut self) -> &mut ProgressSpinners {
         &mut self.spinners
     }
@@ -666,11 +692,14 @@ impl EditorView {
         decoration_manager: &mut DecorationManager<'d>,
     ) {
         let text = doc.text().slice(..);
-        let cursors: Rc<[_]> = doc
+        let mut cursors: Vec<_> = doc
             .selection(view.id)
             .iter()
             .map(|range| range.cursor_line(text))
             .collect();
+        cursors.sort_unstable();
+        cursors.dedup();
+        let cursors: Rc<[_]> = cursors.into();
 
         let mut offset = 0;
 
@@ -687,7 +716,7 @@ impl EditorView {
             let cursors = cursors.clone();
             let gutter_decoration = move |renderer: &mut TextRenderer, pos: LinePos| {
                 // TODO handle softwrap in gutters
-                let selected = cursors.contains(&pos.doc_line);
+                let selected = cursors.binary_search(&pos.doc_line).is_ok();
                 let x = viewport.x + offset;
                 let y = pos.visual_line;
 
@@ -1190,7 +1219,10 @@ impl EditorView {
                                         return EventResult::Consumed(None);
                                     }
                                     FileTreeEvent::Open(path) => {
-                                        if let Err(err) = cxt.editor.open(&path, helix_view::editor::Action::Replace) {
+                                        if let Err(err) = cxt
+                                            .editor
+                                            .open(&path, helix_view::editor::Action::Replace)
+                                        {
                                             cxt.editor.set_error(format!("{err}"));
                                         } else {
                                             file_tree.reveal_path(&path);
@@ -1463,39 +1495,11 @@ impl Component for EditorView {
                 // clear status
                 cx.editor.status_msg = None;
 
-                let file_tree_toggle = key.code == KeyCode::Char('b')
-                    && (key.modifiers == KeyModifiers::SUPER
-                        || key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::ALT));
-                if file_tree_toggle {
-                    if let Some(file_tree) = self.file_tree.as_mut() {
-                        self.file_tree_focused = !self.file_tree_focused;
-                        if self.file_tree_focused {
-                            file_tree.refresh_git_statuses(&cx.editor.diff_providers);
-                            if let Some(path) = current_ref!(cx.editor).1.path() {
-                                file_tree.reveal_path(path);
-                            }
-                        }
-                    } else {
-                        let root = find_workspace().0;
-                        match FileTreeSidebar::new(root, FileTreeOptions::from_editor(cx.editor)) {
-                            Ok(mut sidebar) => {
-                                sidebar.refresh_git_statuses(&cx.editor.diff_providers);
-                                if let Some(path) = current_ref!(cx.editor).1.path() {
-                                    sidebar.reveal_path(path);
-                                }
-                                self.file_tree = Some(sidebar);
-                                self.file_tree_focused = true;
-                            }
-                            Err(err) => cx.editor.set_error(format!("Failed to open file tree: {err}")),
-                        }
-                    }
-                    return EventResult::Consumed(None);
-                }
-
                 if self.file_tree_focused {
                     if let Some(file_tree) = self.file_tree.as_mut() {
                         match file_tree.handle_key(key) {
                             FileTreeEvent::Consumed => return EventResult::Consumed(None),
+                            FileTreeEvent::Ignored => {}
                             FileTreeEvent::Close => {
                                 self.file_tree = None;
                                 self.file_tree_focused = false;
@@ -1504,7 +1508,9 @@ impl Component for EditorView {
                                 return EventResult::Consumed(None);
                             }
                             FileTreeEvent::Open(path) => {
-                                if let Err(err) = cx.editor.open(&path, helix_view::editor::Action::Replace) {
+                                if let Err(err) =
+                                    cx.editor.open(&path, helix_view::editor::Action::Replace)
+                                {
                                     cx.editor.set_error(format!("{err}"));
                                 } else {
                                     file_tree.reveal_path(&path);
@@ -1676,7 +1682,12 @@ impl Component for EditorView {
         }
 
         if let (Some(file_tree), Some(width)) = (self.file_tree.as_mut(), sidebar_width) {
-            file_tree.render(editor_area.with_width(width), surface, cx.editor, self.file_tree_focused);
+            file_tree.render(
+                editor_area.with_width(width),
+                surface,
+                cx.editor,
+                self.file_tree_focused,
+            );
         }
 
         for (view, is_focused) in cx.editor.tree.views() {

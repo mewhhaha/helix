@@ -403,6 +403,7 @@ impl MappableCommand {
         file_picker, "Open file picker",
         file_picker_in_current_buffer_directory, "Open file picker at current buffer's directory",
         file_picker_in_current_directory, "Open file picker at current working directory",
+        toggle_file_tree, "Toggle file tree sidebar",
         file_explorer, "Open file explorer in workspace root",
         file_explorer_in_current_buffer_directory, "Open file explorer at current buffer's directory",
         file_explorer_in_current_directory, "Open file explorer at current working directory",
@@ -3102,6 +3103,20 @@ fn file_picker_in_current_directory(cx: &mut Context) {
     }
     let picker = ui::file_picker(cx.editor, cwd);
     cx.push_layer(Box::new(overlaid(picker)));
+}
+
+pub(super) fn toggle_file_tree_impl(editor: &mut Editor, compositor: &mut Compositor) {
+    let Some(editor_view) = compositor.find::<ui::EditorView>() else {
+        editor.set_error("Editor view is not available");
+        return;
+    };
+    editor_view.toggle_file_tree(editor);
+}
+
+fn toggle_file_tree(cx: &mut Context) {
+    cx.callback.push(Box::new(|compositor, ctx| {
+        toggle_file_tree_impl(ctx.editor, compositor);
+    }));
 }
 
 fn file_explorer(cx: &mut Context) {

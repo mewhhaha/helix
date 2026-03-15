@@ -930,6 +930,7 @@ impl Application {
                         }
 
                         self.editor.diagnostics.retain(|_, diags| !diags.is_empty());
+                        self.editor.refresh_workspace_diagnostics();
 
                         // Clear any diagnostics for documents with this server open.
                         for doc in self.editor.documents_mut() {

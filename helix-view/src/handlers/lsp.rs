@@ -298,12 +298,14 @@ impl Editor {
         version: Option<i32>,
         mut diagnostics: Vec<lsp::Diagnostic>,
     ) {
-        let doc = self
+        let doc_id = self
             .documents
-            .values_mut()
-            .find(|doc| doc.uri().is_some_and(|u| u == uri));
+            .values()
+            .find(|doc| doc.uri().is_some_and(|u| u == uri))
+            .map(|doc| doc.id());
 
-        if let Some((version, doc)) = version.zip(doc.as_ref()) {
+        if let Some((version, doc_id)) = version.zip(doc_id) {
+            let doc = self.documents.get(&doc_id).unwrap();
             if version != doc.version() {
                 log::info!("Version ({version}) is out of date for {uri:?} (expected ({})), dropping PublishDiagnostic notification", doc.version());
                 return;
@@ -311,10 +313,11 @@ impl Editor {
         }
 
         let mut unchanged_diag_sources = Vec::new();
-        if let Some((lang_conf, old_diagnostics)) = doc
-            .as_ref()
-            .and_then(|doc| Some((doc.language_config()?, self.diagnostics.get(&uri)?)))
-        {
+        if let Some((lang_conf, old_diagnostics)) = doc_id.and_then(|doc_id| {
+            self.documents
+                .get(&doc_id)
+                .and_then(|doc| Some((doc.language_config()?, self.diagnostics.get(&uri)?)))
+        }) {
             if !lang_conf.persistent_diagnostic_sources.is_empty() {
                 // Sort diagnostics first by severity and then by line numbers.
                 // Note: The `lsp::DiagnosticSeverity` enum is already defined in decreasing order
@@ -356,8 +359,10 @@ impl Editor {
         // Sort diagnostics first by severity and then by line numbers.
         // Note: The `lsp::DiagnosticSeverity` enum is already defined in decreasing order
         diagnostics.sort_by_key(|(d, provider)| (d.severity, d.range.start, provider.clone()));
+        self.refresh_workspace_diagnostics();
 
-        if let Some(doc) = doc {
+        if let Some(doc_id) = doc_id {
+            let doc = self.documents.get_mut(&doc_id).unwrap();
             let diagnostic_of_language_server_and_not_in_unchanged_sources =
                 |diagnostic: &lsp::Diagnostic, d_provider: &DiagnosticProvider| {
                     d_provider == provider

@@ -1,64 +1,33 @@
-<div align="center">
+# Fork Notes
 
-<h1>
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="logo_dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="logo_light.svg">
-  <img alt="Helix" height="128" src="logo_light.svg">
-</picture>
-</h1>
+This repository is a fork of [Helix](https://github.com/helix-editor/helix).
 
-[![Build status](https://github.com/helix-editor/helix/actions/workflows/build.yml/badge.svg)](https://github.com/helix-editor/helix/actions)
-[![GitHub Release](https://img.shields.io/github/v/release/helix-editor/helix)](https://github.com/helix-editor/helix/releases/latest)
-[![Documentation](https://shields.io/badge/-documentation-452859)](https://docs.helix-editor.com/)
-[![GitHub contributors](https://img.shields.io/github/contributors/helix-editor/helix)](https://github.com/helix-editor/helix/graphs/contributors)
-[![Matrix Space](https://img.shields.io/matrix/helix-community:matrix.org)](https://matrix.to/#/#helix-community:matrix.org)
+Most of the editor still follows upstream Helix closely. This README only calls out the behavior and options added in this fork.
 
-</div>
+# Extra Options And Features
 
-![Screenshot](./screenshot.png)
+## LSP document colors
 
-A [Kakoune](https://github.com/mawww/kakoune) / [Neovim](https://github.com/neovim/neovim) inspired editor, written in Rust.
+This fork adds configurable rendering for document colors reported by the language server.
 
-The editing model is very heavily based on Kakoune; during development I found
-myself agreeing with most of Kakoune's design decisions.
+- `editor.lsp.display-color-swatches` enables or disables document color decorations.
+- `editor.lsp.document-color-mode` controls how those colors are rendered:
+  - `virtual`: shows an inline swatch beside the color.
+  - `foreground`: paints the text itself with the reported color.
+  - `background`: paints the text background with the reported color and automatically chooses a contrasting foreground color.
 
-For more information, see the [website](https://helix-editor.com) or
-[documentation](https://docs.helix-editor.com/).
+Example:
 
-All shortcuts/keymaps can be found [in the documentation on the website](https://docs.helix-editor.com/keymap.html).
+```toml
+[editor.lsp]
+display-color-swatches = true
+document-color-mode = "background"
+```
 
-[Troubleshooting](https://github.com/helix-editor/helix/wiki/Troubleshooting)
+## File tree toggle
 
-# Features
+This fork also includes a file tree sidebar that can be toggled with `Cmd-b` / `SUPER+b` (or `C-A-b`).
 
-- Vim-like modal editing
-- Multiple selections
-- Built-in language server support
-- Smart, incremental syntax highlighting and code editing via tree-sitter
+# Upstream
 
-Although it's primarily a terminal-based editor, I am interested in exploring
-a custom renderer (similar to Emacs) using wgpu.
-
-Note: Only certain languages have indentation definitions at the moment. Check
-`runtime/queries/<lang>/` for `indents.scm`.
-
-# Installation
-
-[Installation documentation](https://docs.helix-editor.com/install.html).
-
-[![Packaging status](https://repology.org/badge/vertical-allrepos/helix-editor.svg?exclude_unsupported=1)](https://repology.org/project/helix-editor/versions)
-
-# Contributing
-
-Contributing guidelines can be found [here](./docs/CONTRIBUTING.md).
-
-# Getting help
-
-Your question might already be answered on the [FAQ](https://github.com/helix-editor/helix/wiki/FAQ).
-
-Discuss the project on the community [Matrix Space](https://matrix.to/#/#helix-community:matrix.org) (make sure to join `#helix-editor:matrix.org` if you're on a client that doesn't support Matrix Spaces yet).
-
-# Credits
-
-Thanks to [@jakenvac](https://github.com/jakenvac) for designing the logo!
+For the base editor, upstream documentation, installation notes, and the original project, see [Helix](https://github.com/helix-editor/helix).
