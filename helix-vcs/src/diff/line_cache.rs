@@ -22,7 +22,7 @@ use super::{MAX_DIFF_BYTES, MAX_DIFF_LINES};
 pub(crate) struct InternedRopeLines {
     diff_base: Box<Rope>,
     doc: Box<Rope>,
-    num_tokens_diff_base: u32,
+    num_tokens_diff_base: Option<u32>,
     interned: InternedInput<RopeSlice<'static>>,
 }
 
@@ -30,16 +30,20 @@ impl InternedRopeLines {
     pub fn new(diff_base: Rope, doc: Rope) -> InternedRopeLines {
         let mut res = InternedRopeLines {
             interned: InternedInput {
-                before: Vec::with_capacity(diff_base.len_lines()),
-                after: Vec::with_capacity(doc.len_lines()),
-                interner: Interner::new(diff_base.len_lines() + doc.len_lines()),
+                before: Vec::new(),
+                after: Vec::new(),
+                interner: Interner::new(0),
             },
             diff_base: Box::new(diff_base),
             doc: Box::new(doc),
             // will be populated by update_diff_base_impl
-            num_tokens_diff_base: 0,
+            num_tokens_diff_base: None,
         };
-        res.update_diff_base_impl();
+        if !res.is_too_large() {
+            res.interned
+                .reserve(res.diff_base.len_lines() as u32, res.doc.len_lines() as u32);
+            res.update_diff_base_impl();
+        }
         res
     }
 
@@ -54,6 +58,7 @@ impl InternedRopeLines {
     /// Updates the `diff_base` and optionally the document if `doc` is not None
     pub fn update_diff_base(&mut self, diff_base: Rope, doc: Option<Rope>) {
         self.interned.clear();
+        self.num_tokens_diff_base = None;
         *self.diff_base = diff_base;
         if let Some(doc) = doc {
             *self.doc = doc
@@ -70,15 +75,17 @@ impl InternedRopeLines {
         // the interning of `self.diff_base` finished so
         // all lines that refer to `self.doc` have been purged.
 
-        self.interned
-            .interner
-            .erase_tokens_after(self.num_tokens_diff_base.into());
+        if let Some(num_tokens) = self.num_tokens_diff_base {
+            self.interned.interner.erase_tokens_after(num_tokens.into());
+        }
 
         *self.doc = doc;
         if self.is_too_large() {
             self.interned.after.clear();
-        } else {
+        } else if self.num_tokens_diff_base.is_some() {
             self.update_doc_impl();
+        } else {
+            self.update_diff_base_impl();
         }
     }
 
@@ -94,7 +101,7 @@ impl InternedRopeLines {
             .lines()
             .map(|line: RopeSlice| -> RopeSlice<'static> { unsafe { transmute(line) } });
         self.interned.update_before(before);
-        self.num_tokens_diff_base = self.interned.interner.num_tokens();
+        self.num_tokens_diff_base = Some(self.interned.interner.num_tokens());
         // the has to be interned again because the interner was fully cleared
         self.update_doc_impl()
     }
@@ -134,5 +141,70 @@ impl InternedRopeLines {
         } else {
             Some(&self.interned)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn oversized() -> Rope {
+        Rope::from_str(&"\n".repeat(MAX_DIFF_LINES))
+    }
+
+    fn assert_interned(cache: &InternedRopeLines, base: &str, doc: &str) {
+        let input = cache.interned_lines().unwrap();
+        let lines = |tokens: &[imara_diff::Token]| {
+            tokens
+                .iter()
+                .map(|token| input.interner[*token].to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            lines(&input.before),
+            Rope::from_str(base)
+                .lines()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            lines(&input.after),
+            Rope::from_str(doc)
+                .lines()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn oversized_base_can_be_updated_and_replaced() {
+        let mut cache = InternedRopeLines::new(Rope::from_str("base\n"), Rope::from_str("doc\n"));
+        cache.update_diff_base(oversized(), None);
+        cache.update_doc(Rope::from_str("edited\n"));
+        assert!(cache.interned_lines().is_none());
+
+        cache.update_diff_base(Rope::from_str("new base\n"), None);
+        assert_interned(&cache, "new base\n", "edited\n");
+    }
+
+    #[test]
+    fn base_changed_while_document_is_oversized_is_rebuilt() {
+        let mut cache = InternedRopeLines::new(Rope::from_str("base\n"), Rope::from_str("doc\n"));
+        cache.update_doc(oversized());
+        cache.update_diff_base(Rope::from_str("new base\n"), None);
+        cache.update_doc(Rope::from_str("edited\n"));
+
+        assert_interned(&cache, "new base\n", "edited\n");
+    }
+
+    #[test]
+    fn initially_oversized_document_is_not_interned_and_can_shrink() {
+        let mut cache = InternedRopeLines::new(Rope::from_str("base\n"), oversized());
+        assert!(cache.interned.before.is_empty());
+        assert!(cache.interned.after.is_empty());
+        assert_eq!(cache.interned.interner.num_tokens(), 0);
+        cache.update_doc(Rope::from_str("doc\n"));
+
+        assert_interned(&cache, "base\n", "doc\n");
     }
 }

@@ -1,8 +1,11 @@
+use std::any::Any;
 use std::cell::Cell;
 use std::cmp::Ordering;
 use std::fmt::Debug;
+use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::ptr::NonNull;
+use std::sync::Arc;
 
 use crate::doc_formatter::FormattedGrapheme;
 use crate::syntax::{Highlight, OverlayHighlights};
@@ -23,6 +26,17 @@ impl InlineAnnotation {
             char_idx,
             text: text.into(),
         }
+    }
+
+    /// Fingerprint immutable annotation positions and text once at their source.
+    pub fn layout_key(annotations: &[Self]) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        annotations.len().hash(&mut hasher);
+        for annotation in annotations {
+            annotation.char_idx.hash(&mut hasher);
+            annotation.text.as_bytes().hash(&mut hasher);
+        }
+        hasher.finish()
     }
 }
 
@@ -113,6 +127,34 @@ impl Overlay {
 /// caches is preferable as otherwise a lot of lifetimes become invariant
 /// which complicates APIs a lot.
 pub trait LineAnnotation {
+    /// Stable identity of the annotation's layout inputs. Opaque annotations
+    /// keep the default and use ordinary traversal.
+    fn checkpoint_key(&self) -> Option<u64> {
+        None
+    }
+
+    /// Capture owned traversal state for a formatter checkpoint.
+    fn checkpoint(&self) -> Option<Arc<dyn Any + Send + Sync>> {
+        None
+    }
+
+    /// Restore a state captured with matching layout inputs.
+    fn restore_checkpoint(&mut self, _state: &(dyn Any + Send + Sync)) -> bool {
+        false
+    }
+
+    /// Validate traversal state when inputs that only affect a portion of the
+    /// document (such as the cursor's visual row) have changed.
+    fn checkpoint_is_valid(&self, _state: &(dyn Any + Send + Sync), _char_idx: usize) -> bool {
+        true
+    }
+
+    /// Recompute an anchor whose position depends on inputs excluded from the
+    /// layout key. Other annotations retain their recorded anchor.
+    fn checkpoint_next_anchor(&self, _char_idx: usize) -> Option<usize> {
+        None
+    }
+
     /// Resets the internal position to `char_idx`. This function is called
     /// when a new traversal of a document starts.
     ///
@@ -178,6 +220,183 @@ struct Layer<'a, A, M> {
     annotations: &'a [A],
     current_index: Cell<usize>,
     metadata: M,
+    content_key: Option<u64>,
+    highlights_key: Option<u64>,
+}
+
+#[derive(Clone)]
+pub(crate) struct LineAnnotationCheckpoint {
+    next_anchor: usize,
+    state: Arc<dyn Any + Send + Sync>,
+}
+
+impl Debug for LineAnnotationCheckpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LineAnnotationCheckpoint")
+            .field("next_anchor", &self.next_anchor)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum InlineHighlights<'a> {
+    Homogeneous(Option<Highlight>),
+    Heterogeneous(&'a [Highlight]),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prepared_fingerprints_match_content_and_track_replacements() {
+        let inline = [InlineAnnotation::new(10_000, "■")];
+        let colors = [Highlight::new(2)];
+        let mut raw = TextAnnotations::default();
+        raw.add_inline_annotations_with_highlights(&inline, &colors);
+        let mut prepared = TextAnnotations::default();
+        prepared.add_inline_annotations_with_highlights_cached(
+            &inline,
+            &colors,
+            Some((
+                InlineAnnotation::layout_key(&inline),
+                TextAnnotations::highlights_key(&colors),
+            )),
+        );
+        assert_eq!(raw.layout_key(), prepared.layout_key());
+        prepared.reset_pos(10_000);
+        prepared.next_inline_annotation_at(10_000);
+        assert_eq!(raw.layout_key(), prepared.layout_key());
+
+        let replacement = [InlineAnnotation::new(10_001, "■ ")];
+        let changed_colors = [Highlight::new(3)];
+        let mut changed = TextAnnotations::default();
+        changed.add_inline_annotations_with_highlights_cached(
+            &replacement,
+            &changed_colors,
+            Some((
+                InlineAnnotation::layout_key(&replacement),
+                TextAnnotations::highlights_key(&changed_colors),
+            )),
+        );
+        assert_ne!(changed.layout_key(), prepared.layout_key());
+    }
+
+    #[test]
+    fn heterogeneous_inline_stream_preserves_styles_and_same_position_order() {
+        let before = [InlineAnnotation::new(1, "前")];
+        let colors = [
+            InlineAnnotation::new(0, "skipped"),
+            InlineAnnotation::new(1, "■"),
+            InlineAnnotation::new(1, "é"),
+            InlineAnnotation::new(3, "later"),
+        ];
+        let highlights = [
+            Highlight::new(1),
+            Highlight::new(2),
+            Highlight::new(3),
+            Highlight::new(4),
+        ];
+        let after = [InlineAnnotation::new(1, " ")];
+        let mut annotations = TextAnnotations::default();
+        annotations
+            .add_inline_annotations(&before, Some(Highlight::new(0)))
+            .add_inline_annotations_with_highlights(&colors, &highlights)
+            .add_inline_annotations(&after, None);
+        assert_eq!(annotations.inline_annotations.len(), 3);
+        annotations.reset_pos(1);
+        let mut actual = Vec::new();
+        while let Some((annotation, highlight)) = annotations.next_inline_annotation_at(1) {
+            actual.push((annotation.text.to_string(), highlight));
+        }
+        assert_eq!(
+            actual,
+            [
+                ("前".into(), Some(Highlight::new(0))),
+                ("■".into(), Some(Highlight::new(2))),
+                ("é".into(), Some(Highlight::new(3))),
+                (" ".into(), None)
+            ]
+        );
+        assert!(annotations.next_inline_annotation_at(2).is_none());
+        assert_eq!(
+            annotations.next_inline_annotation_at(3).unwrap().1,
+            Some(Highlight::new(4))
+        );
+        annotations.reset_pos(1);
+        assert_eq!(
+            annotations
+                .next_inline_annotation_at(1)
+                .unwrap()
+                .0
+                .text
+                .as_str(),
+            "前"
+        );
+    }
+
+    #[test]
+    fn sparse_overlay_collection_preserves_last_layer_and_unstyled_precedence() {
+        let first = [
+            Overlay::new(1, "α"),
+            Overlay::new(3, "β"),
+            Overlay::new(1_000_000, "γ"),
+        ];
+        let unstyled = [Overlay::new(1, "x")];
+        let last = [
+            Overlay::new(3, "y"),
+            Overlay::new(3, "z"),
+            Overlay::new(8, "q"),
+        ];
+        let mut annotations = TextAnnotations::default();
+        annotations
+            .add_overlay(&first, Some(Highlight::new(1)))
+            .add_overlay(&unstyled, None)
+            .add_overlay(&last, Some(Highlight::new(2)));
+        let OverlayHighlights::Heterogenous { highlights } =
+            annotations.collect_overlay_highlights(1..8)
+        else {
+            unreachable!()
+        };
+        assert_eq!(highlights, [(Highlight::new(2), 3..4)]);
+        let OverlayHighlights::Heterogenous { highlights } =
+            annotations.collect_overlay_highlights(8..2_000_000)
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            highlights,
+            [
+                (Highlight::new(2), 8..9),
+                (Highlight::new(1), 1_000_000..1_000_001)
+            ]
+        );
+        // Collection does not disturb traversal or consume duplicate overlays.
+        annotations.reset_pos(3);
+        assert_eq!(annotations.overlay_at(3).unwrap().0.grapheme.as_str(), "z");
+    }
+
+    #[test]
+    fn layout_fingerprint_tracks_content_and_ignores_traversal() {
+        let inline = [InlineAnnotation::new(2, "é")];
+        let color = [Highlight::new(1)];
+        let overlay = [Overlay::new(0, "x")];
+        let mut annotations = TextAnnotations::default();
+        let empty = annotations.layout_key();
+        annotations.add_inline_annotations_with_highlights(&inline, &color);
+        let populated = annotations.layout_key();
+        assert_ne!(empty, populated);
+        annotations.reset_pos(2);
+        annotations.next_inline_annotation_at(2);
+        assert_eq!(annotations.layout_key(), populated);
+        let different = [InlineAnnotation::new(2, "α")];
+        let mut other = TextAnnotations::default();
+        other.add_inline_annotations_with_highlights(&different, &color);
+        assert_ne!(other.layout_key(), populated);
+        annotations.add_overlay(&overlay, None);
+        assert_ne!(annotations.layout_key(), populated);
+        assert!(!annotations.has_line_annotations());
+    }
 }
 
 impl<A, M: Clone> Clone for Layer<'_, A, M> {
@@ -186,6 +405,8 @@ impl<A, M: Clone> Clone for Layer<'_, A, M> {
             annotations: self.annotations,
             current_index: self.current_index.clone(),
             metadata: self.metadata.clone(),
+            content_key: self.content_key,
+            highlights_key: self.highlights_key,
         }
     }
 }
@@ -216,6 +437,8 @@ impl<'a, A, M> From<(&'a [A], M)> for Layer<'a, A, M> {
             annotations,
             current_index: Cell::new(0),
             metadata,
+            content_key: None,
+            highlights_key: None,
         }
     }
 }
@@ -276,9 +499,10 @@ impl<T: ?Sized> Drop for RawBox<T> {
 /// Also commonly called virtual text.
 #[derive(Default)]
 pub struct TextAnnotations<'a> {
-    inline_annotations: Vec<Layer<'a, InlineAnnotation, Option<Highlight>>>,
+    inline_annotations: Vec<Layer<'a, InlineAnnotation, InlineHighlights<'a>>>,
     overlays: Vec<Layer<'a, Overlay, Option<Highlight>>>,
     line_annotations: Vec<(Cell<usize>, RawBox<dyn LineAnnotation + 'a>)>,
+    layout_key: Cell<Option<u64>>,
 }
 
 impl Debug for TextAnnotations<'_> {
@@ -301,18 +525,182 @@ impl<'a> TextAnnotations<'a> {
     }
 
     pub fn collect_overlay_highlights(&self, char_range: Range<usize>) -> OverlayHighlights {
-        let mut highlights = Vec::new();
-        self.reset_pos(char_range.start);
-        for char_idx in char_range {
-            if let Some((_, Some(highlight))) = self.overlay_at(char_idx) {
-                // we don't know the number of chars the original grapheme takes
-                // however it doesn't matter as highlight boundaries are automatically
-                // aligned to grapheme boundaries in the rendering code
-                highlights.push((highlight, char_idx..char_idx + 1));
+        let mut candidates = Vec::new();
+        for layer in &self.overlays {
+            let start = layer
+                .annotations
+                .partition_point(|annotation| annotation.char_idx < char_range.start);
+            for annotation in layer.annotations[start..]
+                .iter()
+                .take_while(|annotation| annotation.char_idx < char_range.end)
+            {
+                // Preserve both layer precedence and duplicate ordering. A final
+                // unstyled overlay also masks an earlier styled overlay.
+                candidates.push((annotation.char_idx, candidates.len(), layer.metadata));
             }
         }
+        candidates.sort_unstable_by_key(|&(pos, order, _)| (pos, order));
+        let highlights = candidates
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &(pos, _, highlight))| {
+                if candidates.get(index + 1).is_some_and(|next| next.0 == pos) {
+                    return None;
+                }
+                // The renderer aligns this character range to its grapheme.
+                highlight.map(|highlight| (highlight, pos..pos + 1))
+            })
+            .collect();
 
         OverlayHighlights::Heterogenous { highlights }
+    }
+
+    /// Fingerprint the immutable annotation content used by formatter checkpoints.
+    /// This is computed lazily once per annotation set, excluding traversal state.
+    pub fn layout_key(&self) -> u64 {
+        if let Some(key) = self.layout_key.get() {
+            return key;
+        }
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.inline_annotations.len().hash(&mut hasher);
+        for layer in &self.inline_annotations {
+            layer
+                .content_key
+                .unwrap_or_else(|| InlineAnnotation::layout_key(layer.annotations))
+                .hash(&mut hasher);
+            match &layer.metadata {
+                InlineHighlights::Homogeneous(highlight) => {
+                    0u8.hash(&mut hasher);
+                    highlight.map(|highlight| highlight.get()).hash(&mut hasher);
+                }
+                InlineHighlights::Heterogeneous(highlights) => {
+                    1u8.hash(&mut hasher);
+                    layer
+                        .highlights_key
+                        .unwrap_or_else(|| Self::highlights_key(highlights))
+                        .hash(&mut hasher);
+                }
+            }
+        }
+        self.overlays.len().hash(&mut hasher);
+        for layer in &self.overlays {
+            layer.annotations.len().hash(&mut hasher);
+            layer
+                .metadata
+                .map(|highlight| highlight.get())
+                .hash(&mut hasher);
+            for annotation in layer.annotations {
+                annotation.char_idx.hash(&mut hasher);
+                annotation.grapheme.as_bytes().hash(&mut hasher);
+            }
+        }
+        self.line_annotations.len().hash(&mut hasher);
+        for (_, layer) in &self.line_annotations {
+            unsafe { layer.get().checkpoint_key() }.hash(&mut hasher);
+        }
+        let key = hasher.finish();
+        self.layout_key.set(Some(key));
+        key
+    }
+
+    /// Stateful line annotations cannot yet be restored from a formatter checkpoint.
+    pub fn has_line_annotations(&self) -> bool {
+        !self.line_annotations.is_empty()
+    }
+
+    pub(crate) fn can_checkpoint(&self) -> bool {
+        self.line_annotations
+            .iter()
+            .all(|(_, layer)| unsafe { layer.get().checkpoint_key().is_some() })
+    }
+
+    pub(crate) fn checkpoint(&self) -> Option<Vec<LineAnnotationCheckpoint>> {
+        self.line_annotations
+            .iter()
+            .map(|(anchor, layer)| {
+                Some(LineAnnotationCheckpoint {
+                    next_anchor: anchor.get(),
+                    state: unsafe { layer.get().checkpoint()? },
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) fn checkpoint_is_valid(
+        &self,
+        checkpoints: &[LineAnnotationCheckpoint],
+        char_idx: usize,
+    ) -> bool {
+        self.line_annotations.len() == checkpoints.len()
+            && self.line_annotations.iter().zip(checkpoints).all(
+                |((_, layer), checkpoint)| unsafe {
+                    layer
+                        .get()
+                        .checkpoint_is_valid(checkpoint.state.as_ref(), char_idx)
+                },
+            )
+    }
+
+    pub(crate) fn restore_checkpoint(
+        &self,
+        checkpoints: &[LineAnnotationCheckpoint],
+        char_idx: usize,
+    ) -> bool {
+        self.line_annotations.len() == checkpoints.len()
+            && self
+                .line_annotations
+                .iter()
+                .zip(checkpoints)
+                .all(|((anchor, layer), checkpoint)| {
+                    if unsafe { layer.get().restore_checkpoint(checkpoint.state.as_ref()) } {
+                        anchor.set(
+                            unsafe { layer.get().checkpoint_next_anchor(char_idx) }
+                                .unwrap_or(checkpoint.next_anchor),
+                        );
+                        true
+                    } else {
+                        false
+                    }
+                })
+    }
+
+    pub fn highlights_key(highlights: &[Highlight]) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        highlights.len().hash(&mut hasher);
+        for highlight in highlights {
+            highlight.get().hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
+    /// Add a layer whose immutable content fingerprint was prepared at mutation.
+    pub fn add_inline_annotations_cached(
+        &mut self,
+        layer: &'a [InlineAnnotation],
+        highlight: Option<Highlight>,
+        content_key: Option<u64>,
+    ) -> &mut Self {
+        self.add_inline_annotations(layer, highlight);
+        if !layer.is_empty() {
+            self.inline_annotations.last_mut().unwrap().content_key = content_key;
+        }
+        self
+    }
+
+    /// Cached counterpart of `add_inline_annotations_with_highlights`.
+    pub fn add_inline_annotations_with_highlights_cached(
+        &mut self,
+        layer: &'a [InlineAnnotation],
+        highlights: &'a [Highlight],
+        keys: Option<(u64, u64)>,
+    ) -> &mut Self {
+        self.add_inline_annotations_with_highlights(layer, highlights);
+        if let Some((content, colors)) = keys.filter(|_| !layer.is_empty()) {
+            let layer = self.inline_annotations.last_mut().unwrap();
+            layer.content_key = Some(content);
+            layer.highlights_key = Some(colors);
+        }
+        self
     }
 
     /// Add new inline annotations.
@@ -332,7 +720,26 @@ impl<'a> TextAnnotations<'a> {
         highlight: Option<Highlight>,
     ) -> &mut Self {
         if !layer.is_empty() {
-            self.inline_annotations.push((layer, highlight).into());
+            self.layout_key.set(None);
+            self.inline_annotations
+                .push((layer, InlineHighlights::Homogeneous(highlight)).into());
+        }
+        self
+    }
+
+    /// Add one sorted annotation stream with a highlight for each item.
+    /// Its order relative to other streams, and duplicate positions within the
+    /// stream, follow the same rules as `add_inline_annotations`.
+    pub fn add_inline_annotations_with_highlights(
+        &mut self,
+        layer: &'a [InlineAnnotation],
+        highlights: &'a [Highlight],
+    ) -> &mut Self {
+        assert_eq!(layer.len(), highlights.len());
+        if !layer.is_empty() {
+            self.layout_key.set(None);
+            self.inline_annotations
+                .push((layer, InlineHighlights::Heterogeneous(highlights)).into());
         }
         self
     }
@@ -349,6 +756,7 @@ impl<'a> TextAnnotations<'a> {
     /// the overlay from the layer added last will be show.
     pub fn add_overlay(&mut self, layer: &'a [Overlay], highlight: Option<Highlight>) -> &mut Self {
         if !layer.is_empty() {
+            self.layout_key.set(None);
             self.overlays.push((layer, highlight).into());
         }
         self
@@ -359,6 +767,7 @@ impl<'a> TextAnnotations<'a> {
     /// The line annotations **must be sorted** by their `char_idx`.
     /// Multiple line annotations with the same `char_idx` **are not allowed**.
     pub fn add_line_annotation(&mut self, layer: Box<dyn LineAnnotation + 'a>) -> &mut Self {
+        self.layout_key.set(None);
         self.line_annotations
             .push((Cell::new(usize::MAX), layer.into()));
         self
@@ -367,6 +776,7 @@ impl<'a> TextAnnotations<'a> {
     /// Removes all line annotations, useful for vertical motions
     /// so that virtual text lines are automatically skipped.
     pub fn clear_line_annotations(&mut self) {
+        self.layout_key.set(None);
         self.line_annotations.clear();
     }
 
@@ -375,8 +785,13 @@ impl<'a> TextAnnotations<'a> {
         char_idx: usize,
     ) -> Option<(&InlineAnnotation, Option<Highlight>)> {
         self.inline_annotations.iter().find_map(|layer| {
+            let index = layer.current_index.get();
             let annotation = layer.consume(char_idx, |annot| annot.char_idx)?;
-            Some((annotation, layer.metadata))
+            let highlight = match layer.metadata {
+                InlineHighlights::Homogeneous(highlight) => highlight,
+                InlineHighlights::Heterogeneous(highlights) => Some(highlights[index]),
+            };
+            Some((annotation, highlight))
         })
     }
 

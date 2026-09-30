@@ -27,11 +27,21 @@ fn thread_picker(
 ) {
     let debugger = debugger!(cx.editor);
 
+    let guard = debugger.stop_guard();
+    let id = debugger.id();
     let future = debugger.threads();
     dap_callback(
         cx.jobs,
         future,
         move |editor, compositor, response: dap::requests::ThreadsResponse| {
+            if !guard.is_current()
+                || editor
+                    .debug_adapters
+                    .get_active_client()
+                    .is_none_or(|client| client.id() != id)
+            {
+                return;
+            }
             let threads = response.threads;
             if threads.len() == 1 {
                 callback_fn(editor, &threads[0]);
@@ -55,7 +65,17 @@ fn thread_picker(
                 0,
                 threads,
                 thread_states,
-                move |cx, thread, _action| callback_fn(cx.editor, thread),
+                move |cx, thread, _action| {
+                    if guard.is_current()
+                        && cx
+                            .editor
+                            .debug_adapters
+                            .get_active_client()
+                            .is_some_and(|client| client.id() == id)
+                    {
+                        callback_fn(cx.editor, thread);
+                    }
+                },
             )
             .with_preview(move |editor, thread| {
                 let frames = editor
@@ -136,10 +156,11 @@ pub fn dap_start_impl(
         .and_then(|config| config.debugger.as_ref())
         .ok_or_else(|| anyhow!("No debug adapter available for language"))?;
 
+    let supports_run_in_terminal = cx.editor.config().terminal.is_some();
     let id = cx
         .editor
         .debug_adapters
-        .start_client(socket, config)
+        .start_client(socket, config, supports_run_in_terminal)
         .map_err(|e| anyhow!("Failed to start debug client: {}", e))?;
 
     // TODO: avoid refetching all of this... pass a config in
@@ -298,7 +319,7 @@ pub fn dap_launch(cx: &mut Context) {
 }
 
 pub fn dap_restart(cx: &mut Context) {
-    let debugger = match cx.editor.debug_adapters.get_active_client() {
+    let debugger = match cx.editor.debug_adapters.get_active_client_mut() {
         Some(debugger) => debugger,
         None => {
             cx.editor.set_error("Debugger is not running");
@@ -438,19 +459,41 @@ pub fn dap_toggle_breakpoint_impl(cx: &mut Context, path: PathBuf, line: usize) 
     }
 }
 
+fn resume_after_request(
+    jobs: &mut Jobs,
+    debugger: &mut dap::Client,
+    request: impl Future<Output = dap::Result<Value>> + Send + 'static,
+) {
+    debugger.begin_resume();
+    let guard = debugger.stop_guard();
+    let id = debugger.id();
+    jobs.callback(async move {
+        let result = request.await;
+        Ok(Callback::Editor(Box::new(move |editor| {
+            if !guard.is_current() {
+                return;
+            }
+            let Some(debugger) = editor.debug_adapters.get_client_mut(id) else {
+                return;
+            };
+            match result {
+                Ok(_) => debugger.resume_application(),
+                Err(err) => {
+                    debugger.cancel_resume();
+                    editor.set_error(format!("Failed to resume debugger: {err}"));
+                }
+            }
+        })))
+    });
+}
+
 pub fn dap_continue(cx: &mut Context) {
     let debugger = debugger!(cx.editor);
 
     if let Some(thread_id) = debugger.thread_id {
         let request = debugger.continue_thread(thread_id);
 
-        dap_callback(
-            cx.jobs,
-            request,
-            |editor, _compositor, _response: dap::requests::ContinueResponse| {
-                debugger!(editor).resume_application();
-            },
-        );
+        resume_after_request(cx.jobs, debugger, request);
     } else {
         cx.editor
             .set_error("Currently active thread is not stopped. Switch the thread.");
@@ -474,9 +517,7 @@ pub fn dap_step_in(cx: &mut Context) {
     if let Some(thread_id) = debugger.thread_id {
         let request = debugger.step_in(thread_id);
 
-        dap_callback(cx.jobs, request, |editor, _compositor, _response: ()| {
-            debugger!(editor).resume_application();
-        });
+        resume_after_request(cx.jobs, debugger, request);
     } else {
         cx.editor
             .set_error("Currently active thread is not stopped. Switch the thread.");
@@ -488,9 +529,7 @@ pub fn dap_step_out(cx: &mut Context) {
 
     if let Some(thread_id) = debugger.thread_id {
         let request = debugger.step_out(thread_id);
-        dap_callback(cx.jobs, request, |editor, _compositor, _response: ()| {
-            debugger!(editor).resume_application();
-        });
+        resume_after_request(cx.jobs, debugger, request);
     } else {
         cx.editor
             .set_error("Currently active thread is not stopped. Switch the thread.");
@@ -502,9 +541,7 @@ pub fn dap_next(cx: &mut Context) {
 
     if let Some(thread_id) = debugger.thread_id {
         let request = debugger.next(thread_id);
-        dap_callback(cx.jobs, request, |editor, _compositor, _response: ()| {
-            debugger!(editor).resume_application();
-        });
+        resume_after_request(cx.jobs, debugger, request);
     } else {
         cx.editor
             .set_error("Currently active thread is not stopped. Switch the thread.");
@@ -514,7 +551,7 @@ pub fn dap_next(cx: &mut Context) {
 pub fn dap_variables(cx: &mut Context) {
     let debugger = debugger!(cx.editor);
 
-    if debugger.thread_id.is_none() {
+    if debugger.thread_id.is_none() || debugger.is_resuming() {
         cx.editor
             .set_status("Cannot access variables while target is running.");
         return;
@@ -547,52 +584,68 @@ pub fn dap_variables(cx: &mut Context) {
     };
 
     let frame_id = stack_frame.id;
-    let scopes = match block_on(debugger.scopes(frame_id)) {
-        Ok(s) => s,
-        Err(e) => {
-            cx.editor.set_error(format!("Failed to get scopes: {}", e));
-            return;
-        }
-    };
-
-    // TODO: allow expanding variables into sub-fields
-    let mut variables = Vec::new();
-
-    let theme = &cx.editor.theme;
-    let scope_style = theme.get("ui.linenr.selected");
-    let type_style = theme.get("ui.text");
-    let text_style = theme.get("ui.text.focus");
-
-    for scope in scopes.iter() {
-        // use helix_view::graphics::Style;
-        use tui::text::Span;
-        let response = block_on(debugger.variables(scope.variables_reference));
-
-        variables.push(Spans::from(Span::styled(
-            format!("▸ {}", scope.name),
-            scope_style,
-        )));
-
-        if let Ok(vars) = response {
-            variables.reserve(vars.len());
-            for var in vars {
-                let mut spans = Vec::with_capacity(5);
-
-                spans.push(Span::styled(var.name.to_owned(), text_style));
-                if let Some(ty) = var.ty {
-                    spans.push(Span::raw(": "));
-                    spans.push(Span::styled(ty.to_owned(), type_style));
+    let id = debugger.id();
+    let requester = debugger.requester();
+    let stop = debugger.stop_guard();
+    let selection = debugger.selection_guard();
+    let variables_guard = debugger.variables_guard();
+    cx.jobs.callback(async move {
+        let loaded = requester
+            .variables_for_frame(frame_id, &stop, &selection, &variables_guard)
+            .await;
+        Ok(Callback::EditorCompositor(Box::new(
+            move |editor, compositor| {
+                if !stop.is_current()
+                    || !selection.is_current()
+                    || !variables_guard.is_current()
+                    || editor
+                        .debug_adapters
+                        .get_active_client()
+                        .is_none_or(|client| client.id() != id)
+                {
+                    return;
                 }
-                spans.push(Span::raw(" = "));
-                spans.push(Span::styled(var.value.to_owned(), text_style));
-                variables.push(Spans::from(spans));
-            }
-        }
-    }
-
-    let contents = Text::from(tui::text::Text::from(variables));
-    let popup = Popup::new("dap-variables", contents);
-    cx.replace_or_push_layer("dap-variables", popup);
+                let Some(loaded) = loaded else {
+                    return;
+                };
+                let loaded = match loaded {
+                    Ok(loaded) => loaded,
+                    Err(err) => {
+                        editor.set_error(format!("Failed to get scopes: {err}"));
+                        return;
+                    }
+                };
+                let scope_style = editor.theme.get("ui.linenr.selected");
+                let type_style = editor.theme.get("ui.text");
+                let text_style = editor.theme.get("ui.text.focus");
+                let mut variables = Vec::new();
+                for (scope, response) in loaded {
+                    use tui::text::Span;
+                    variables.push(Spans::from(Span::styled(
+                        format!("▸ {}", scope.name),
+                        scope_style,
+                    )));
+                    if let Ok(response) = response {
+                        for var in response.variables {
+                            let mut spans = vec![Span::styled(var.name, text_style)];
+                            if let Some(ty) = var.ty {
+                                spans.push(Span::raw(": "));
+                                spans.push(Span::styled(ty, type_style));
+                            }
+                            spans.push(Span::raw(" = "));
+                            spans.push(Span::styled(var.value, text_style));
+                            variables.push(Spans::from(spans));
+                        }
+                    }
+                }
+                let popup = Popup::new(
+                    "dap-variables",
+                    Text::from(tui::text::Text::from(variables)),
+                );
+                compositor.replace_or_push("dap-variables", popup);
+            },
+        )))
+    });
 }
 
 pub fn dap_terminate(cx: &mut Context) {
@@ -735,7 +788,7 @@ pub fn dap_edit_log(cx: &mut Context) {
 
 pub fn dap_switch_thread(cx: &mut Context) {
     thread_picker(cx, |editor, thread| {
-        block_on(select_thread_id(editor, thread.id, true));
+        select_thread_id(editor, thread.id, true);
     })
 }
 pub fn dap_switch_stack_frame(cx: &mut Context) {
@@ -749,11 +802,14 @@ pub fn dap_switch_stack_frame(cx: &mut Context) {
         }
     };
 
-    let frames = debugger.stack_frames[&thread_id]
-        .iter()
-        .cloned()
-        .enumerate()
-        .collect::<Vec<_>>();
+    let Some(frames) = debugger.stack_frames.get(&thread_id) else {
+        cx.editor.set_status("Stack frames are still loading.");
+        return;
+    };
+    let guard = debugger.stop_guard();
+    let selection = debugger.selection_guard();
+    let id = debugger.id();
+    let frames = frames.iter().cloned().enumerate().collect::<Vec<_>>();
     let thread_state = debugger
         .thread_states
         .get(&thread_id)
@@ -772,8 +828,14 @@ pub fn dap_switch_stack_frame(cx: &mut Context) {
         frames,
         thread_state,
         move |cx, (index, frame), _action| {
+            if !guard.is_current() || !selection.is_current() {
+                return;
+            }
             let debugger = debugger!(cx.editor);
-            debugger.active_frame = Some(*index);
+            if debugger.id() != id {
+                return;
+            }
+            debugger.select_frame(*index);
             jump_to_stack_frame(cx.editor, frame);
         },
     )

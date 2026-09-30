@@ -46,10 +46,14 @@
 //!     Span::raw(" title"),
 //! ]);
 //! ```
+use crate::widgets::ParagraphCache;
 use helix_core::line_ending::str_is_line_ending;
 use helix_core::unicode::width::UnicodeWidthStr;
 use helix_view::graphics::Style;
-use std::borrow::Cow;
+use std::{
+    borrow::Cow,
+    sync::{Arc, Mutex, OnceLock},
+};
 use unicode_segmentation::UnicodeSegmentation;
 
 /// A grapheme associated to a style.
@@ -297,10 +301,18 @@ impl<'a> From<&Spans<'a>> for String {
 /// text.extend(Text::styled("Some more lines\nnow with more style!", style));
 /// assert_eq!(6, text.height());
 /// ```
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone)]
 pub struct Text<'a> {
     pub lines: Vec<Spans<'a>>,
+    pub(crate) layout_cache: OnceLock<Arc<Mutex<ParagraphCache>>>,
 }
+
+impl PartialEq for Text<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.lines == other.lines
+    }
+}
+impl Eq for Text<'_> {}
 
 impl<'a> Text<'a> {
     /// Create some text (potentially multiple lines) with no style.
@@ -321,6 +333,7 @@ impl<'a> Text<'a> {
                 Cow::Borrowed(s) => s.lines().map(Spans::from).collect(),
                 Cow::Owned(s) => s.lines().map(|l| Spans::from(l.to_owned())).collect(),
             },
+            layout_cache: Default::default(),
         }
     }
 
@@ -444,19 +457,26 @@ impl<'a> From<Span<'a>> for Text<'a> {
     fn from(span: Span<'a>) -> Text<'a> {
         Text {
             lines: vec![Spans::from(span)],
+            layout_cache: Default::default(),
         }
     }
 }
 
 impl<'a> From<Spans<'a>> for Text<'a> {
     fn from(spans: Spans<'a>) -> Text<'a> {
-        Text { lines: vec![spans] }
+        Text {
+            lines: vec![spans],
+            layout_cache: Default::default(),
+        }
     }
 }
 
 impl<'a> From<Vec<Spans<'a>>> for Text<'a> {
     fn from(lines: Vec<Spans<'a>>) -> Text<'a> {
-        Text { lines }
+        Text {
+            lines,
+            layout_cache: Default::default(),
+        }
     }
 }
 

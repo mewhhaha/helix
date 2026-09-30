@@ -3,6 +3,90 @@ use tokio::task::JoinHandle;
 
 use crate::diff::{DiffHandle, Hunk};
 
+use super::{spawn_diff_notification, RenderLock};
+use std::{sync::Arc, time::Duration};
+use tokio::sync::Notify;
+
+#[tokio::test]
+async fn async_redraw_observes_completion_before_task_starts() {
+    let notify = Arc::new(Notify::new());
+    let task = spawn_diff_notification(None, notify.clone());
+    notify.notify_waiters();
+    tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn blocking_render_lock_observes_completion_before_task_starts() {
+    let lock = Box::leak(Box::new(parking_lot::RwLock::new(())));
+    let notify = Arc::new(Notify::new());
+    let task = spawn_diff_notification(
+        Some(RenderLock {
+            lock: lock.read(),
+            timeout: None,
+        }),
+        notify.clone(),
+    );
+    notify.notify_waiters();
+    tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(lock.try_write().is_some());
+}
+
+#[tokio::test]
+async fn timed_out_render_lock_still_waits_for_diff_completion() {
+    let lock = Box::leak(Box::new(parking_lot::RwLock::new(())));
+    let notify = Arc::new(Notify::new());
+    let task = spawn_diff_notification(
+        Some(RenderLock {
+            lock: lock.read(),
+            timeout: Some(tokio::time::Instant::now()),
+        }),
+        notify.clone(),
+    );
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while lock.try_write().is_none() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!task.is_finished());
+    notify.notify_waiters();
+    tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn oversized_document_clears_existing_hunks() {
+    let (differ, handle) = DiffHandle::new_test("base\n", "doc\n");
+    differ.update_document(
+        Rope::from_str(&"\n".repeat(crate::diff::MAX_DIFF_LINES)),
+        false,
+    );
+    assert!(differ.into_diff(handle).await.is_empty());
+}
+
+#[tokio::test]
+async fn initially_oversized_document_resumes_diffing_when_small() {
+    let (differ, handle) =
+        DiffHandle::new_test("base\n", &"\n".repeat(crate::diff::MAX_DIFF_LINES));
+    differ.update_document(Rope::from_str("doc\n"), false);
+    assert_eq!(
+        differ.into_diff(handle).await,
+        vec![Hunk {
+            before: 0..1,
+            after: 0..1
+        }]
+    );
+}
+
 impl DiffHandle {
     fn new_test(diff_base: &str, doc: &str) -> (DiffHandle, JoinHandle<()>) {
         DiffHandle::new_with_handle(Rope::from_str(diff_base), Rope::from_str(doc))

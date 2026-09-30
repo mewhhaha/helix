@@ -1,3 +1,4 @@
+pub(crate) mod color;
 mod completion;
 mod document;
 pub(crate) mod editor;
@@ -219,44 +220,12 @@ type FilePicker = Picker<PathBuf, FilePickerData>;
 
 pub fn file_picker(editor: &Editor, root: PathBuf) -> FilePicker {
     use ignore::WalkBuilder;
-    use std::time::Instant;
 
-    let config = editor.config();
+    let config = editor.config().file_picker.clone();
     let data = FilePickerData {
         root: root.clone(),
         directory_style: editor.theme.get("ui.text.directory"),
     };
-
-    let now = Instant::now();
-
-    let dedup_symlinks = config.file_picker.deduplicate_links;
-    let absolute_root = root.canonicalize().unwrap_or_else(|_| root.clone());
-
-    let mut walk_builder = WalkBuilder::new(&root);
-
-    let mut files = walk_builder
-        .hidden(config.file_picker.hidden)
-        .parents(config.file_picker.parents)
-        .ignore(config.file_picker.ignore)
-        .follow_links(config.file_picker.follow_symlinks)
-        .git_ignore(config.file_picker.git_ignore)
-        .git_global(config.file_picker.git_global)
-        .git_exclude(config.file_picker.git_exclude)
-        .sort_by_file_name(|name1, name2| name1.cmp(name2))
-        .max_depth(config.file_picker.max_depth)
-        .filter_entry(move |entry| filter_picker_entry(entry, &absolute_root, dedup_symlinks))
-        .add_custom_ignore_filename(helix_loader::config_dir().join("ignore"))
-        .add_custom_ignore_filename(".helix/ignore")
-        .types(get_excluded_types())
-        .build()
-        .filter_map(|entry| {
-            let entry = entry.ok()?;
-            if !entry.path().is_file() {
-                return None;
-            }
-            Some(entry.into_path())
-        });
-    log::debug!("file_picker init {:?}", Instant::now().duration_since(now));
 
     let columns = [PickerColumn::new(
         "path",
@@ -289,27 +258,43 @@ pub fn file_picker(editor: &Editor, root: PathBuf) -> FilePicker {
     })
     .with_preview(|_editor, path| Some((path.as_path().into(), None)));
     let injector = picker.injector();
-    let timeout = std::time::Instant::now() + std::time::Duration::from_millis(30);
-
-    let mut hit_timeout = false;
-    for file in &mut files {
-        if injector.push(file).is_err() {
-            break;
+    let cancellation = injector.cancellation();
+    tokio::task::spawn_blocking(move || {
+        if cancellation.is_canceled() {
+            return;
         }
-        if std::time::Instant::now() >= timeout {
-            hit_timeout = true;
-            break;
-        }
-    }
-    if hit_timeout {
-        std::thread::spawn(move || {
-            for file in files {
-                if injector.push(file).is_err() {
-                    break;
-                }
+        let absolute_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+        let dedup_symlinks = config.deduplicate_links;
+        let mut walk_builder = WalkBuilder::new(&root);
+        let files = walk_builder
+            .hidden(config.hidden)
+            .parents(config.parents)
+            .ignore(config.ignore)
+            .follow_links(config.follow_symlinks)
+            .git_ignore(config.git_ignore)
+            .git_global(config.git_global)
+            .git_exclude(config.git_exclude)
+            .sort_by_file_name(|name1, name2| name1.cmp(name2))
+            .max_depth(config.max_depth)
+            .filter_entry(move |entry| filter_picker_entry(entry, &absolute_root, dedup_symlinks))
+            .add_custom_ignore_filename(helix_loader::config_dir().join("ignore"))
+            .add_custom_ignore_filename(".helix/ignore")
+            .types(get_excluded_types())
+            .build();
+        for entry in files {
+            if cancellation.is_canceled() {
+                break;
             }
-        });
-    }
+            let Ok(entry) = entry else {
+                continue;
+            };
+            let is_file = entry.file_type().is_some_and(|kind| kind.is_file())
+                || (entry.path_is_symlink() && entry.path().is_file());
+            if is_file && injector.push(entry.into_path()).is_err() {
+                break;
+            }
+        }
+    });
     picker
 }
 
@@ -317,7 +302,7 @@ type FileExplorer = Picker<(PathBuf, bool), (PathBuf, Style)>;
 
 pub fn file_explorer(root: PathBuf, editor: &Editor) -> Result<FileExplorer, std::io::Error> {
     let directory_style = editor.theme.get("ui.text.directory");
-    let directory_content = directory_content(&root, editor)?;
+    let config = editor.config().clone();
 
     let columns = [PickerColumn::new(
         "path",
@@ -333,8 +318,8 @@ pub fn file_explorer(root: PathBuf, editor: &Editor) -> Result<FileExplorer, std
     let picker = Picker::new(
         columns,
         0,
-        directory_content,
-        (root, directory_style),
+        [],
+        (root.clone(), directory_style),
         move |cx, (path, is_dir): &(PathBuf, bool), action| {
             if *is_dir {
                 let new_root = helix_stdx::path::normalize(path);
@@ -360,13 +345,35 @@ pub fn file_explorer(root: PathBuf, editor: &Editor) -> Result<FileExplorer, std
     )
     .with_preview(|_editor, (path, _is_dir)| Some((path.as_path().into(), None)));
 
+    let injector = picker.injector();
+    let cancellation = injector.cancellation();
+    tokio::task::spawn_blocking(move || {
+        let result =
+            directory_content_with_config_and_cancel(&root, &config, || cancellation.is_canceled());
+        match result {
+            Ok(entries) => {
+                for entry in entries {
+                    if injector.push(entry).is_err() {
+                        break;
+                    }
+                }
+            }
+            Err(err) if !cancellation.is_canceled() => {
+                log::error!("Failed to enumerate directory '{}': {err}", root.display());
+            }
+            Err(_) => {}
+        }
+    });
+
     Ok(picker)
 }
 
-fn directory_content(root: &Path, editor: &Editor) -> Result<Vec<(PathBuf, bool)>, std::io::Error> {
+fn directory_content_with_config_and_cancel(
+    root: &Path,
+    config: &helix_view::editor::Config,
+    canceled: impl Fn() -> bool,
+) -> Result<Vec<(PathBuf, bool)>, std::io::Error> {
     use ignore::WalkBuilder;
-
-    let config = editor.config();
 
     let mut walk_builder = WalkBuilder::new(root);
 
@@ -383,6 +390,7 @@ fn directory_content(root: &Path, editor: &Editor) -> Result<Vec<(PathBuf, bool)
         .add_custom_ignore_filename(".helix/ignore")
         .types(get_excluded_types())
         .build()
+        .take_while(|_| !canceled())
         .filter_map(|entry| {
             entry
                 .map(|entry| {
@@ -390,7 +398,11 @@ fn directory_content(root: &Path, editor: &Editor) -> Result<Vec<(PathBuf, bool)
                     let is_dir = path.is_dir();
                     let mut path = path.to_path_buf();
                     if is_dir && path != root && config.file_explorer.flatten_dirs {
-                        while let Some(single_child_directory) = get_child_if_single_dir(&path) {
+                        while !canceled() {
+                            let Some(single_child_directory) = get_child_if_single_dir(&path)
+                            else {
+                                break;
+                            };
                             path = single_child_directory;
                         }
                     }
@@ -400,6 +412,10 @@ fn directory_content(root: &Path, editor: &Editor) -> Result<Vec<(PathBuf, bool)
                 .filter(|entry| entry.0 != root)
         })
         .collect();
+
+    if canceled() {
+        return Err(std::io::Error::other("directory listing canceled"));
+    }
 
     content.sort_by(|(path1, is_dir1), (path2, is_dir2)| (!is_dir1, path1).cmp(&(!is_dir2, path2)));
 
@@ -819,5 +835,51 @@ mod tests {
         File::create(file).unwrap();
 
         assert_eq!(get_child_if_single_dir(root.path()), None);
+    }
+
+    #[test]
+    fn background_directory_listing_keeps_sorting_flattening_and_hidden_policy() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("z-dir/child/grandchild")).unwrap();
+        create_dir(root.path().join("a-dir")).unwrap();
+        File::create(root.path().join("z.txt")).unwrap();
+        File::create(root.path().join("a.txt")).unwrap();
+        File::create(root.path().join(".hidden")).unwrap();
+        let mut config = helix_view::editor::Config::default();
+        config.file_explorer.hidden = true;
+        config.file_explorer.flatten_dirs = true;
+        let content =
+            directory_content_with_config_and_cancel(root.path(), &config, || false).unwrap();
+        assert_eq!(
+            content,
+            vec![
+                (root.path().join(".."), true),
+                (root.path().join("a-dir"), true),
+                (root.path().join("z-dir/child/grandchild"), true),
+                (root.path().join("a.txt"), false),
+                (root.path().join("z.txt"), false),
+            ]
+        );
+        config.file_explorer.hidden = false;
+        let content =
+            directory_content_with_config_and_cancel(root.path(), &config, || false).unwrap();
+        assert!(content.contains(&(root.path().join(".hidden"), false)));
+        assert!(directory_content_with_config_and_cancel(root.path(), &config, || true).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn background_directory_listing_preserves_file_and_directory_symlinks() {
+        let root = tempfile::tempdir().unwrap();
+        File::create(root.path().join("file")).unwrap();
+        create_dir(root.path().join("directory")).unwrap();
+        std::os::unix::fs::symlink("file", root.path().join("file-link")).unwrap();
+        std::os::unix::fs::symlink("directory", root.path().join("directory-link")).unwrap();
+        let mut config = helix_view::editor::Config::default();
+        config.file_explorer.flatten_dirs = false;
+        let content =
+            directory_content_with_config_and_cancel(root.path(), &config, || false).unwrap();
+        assert!(content.contains(&(root.path().join("file-link"), false)));
+        assert!(content.contains(&(root.path().join("directory-link"), true)));
     }
 }

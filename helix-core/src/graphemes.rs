@@ -242,6 +242,114 @@ pub fn ensure_grapheme_boundary_prev(slice: RopeSlice, char_idx: usize) -> usize
     }
 }
 
+/// Share Unicode pre-context when aligning a sorted batch of nearby positions.
+/// Sparse positions restart instead of traversing the intervening document.
+pub(crate) struct GraphemeBoundaryCursor<'a> {
+    text: RopeSlice<'a>,
+    cursor: GraphemeCursor,
+    chunk: Cow<'a, str>,
+    chunk_start: usize,
+    chars: ropey::iter::Chars<'a>,
+    byte_pos: usize,
+    previous: usize,
+    current: usize,
+}
+
+impl<'a> GraphemeBoundaryCursor<'a> {
+    pub(crate) fn new(text: RopeSlice<'a>, pos: usize) -> Self {
+        let start = ensure_grapheme_boundary_prev(text, pos);
+        let byte_pos = text.char_to_byte(start);
+        let (chunk, chunk_start, ..) = text.chunk_at_byte(byte_pos);
+        Self {
+            text,
+            cursor: GraphemeCursor::new(byte_pos, text.len_bytes(), true),
+            chunk: Cow::Borrowed(chunk),
+            chunk_start,
+            chars: text.chars_at(start),
+            byte_pos,
+            previous: start,
+            current: start,
+        }
+    }
+
+    fn advance(&mut self) {
+        self.previous = self.current;
+        let next = loop {
+            match self.cursor.next_boundary(&self.chunk, self.chunk_start) {
+                Ok(Some(next)) => break next,
+                Ok(None) => break self.text.len_bytes(),
+                Err(GraphemeIncomplete::NextChunk) => {
+                    let next_start = self.chunk_start + self.chunk.len();
+                    let next = self.text.chunk_at_byte(next_start).0;
+                    // Preserve the immediately preceding scalar at a seam.
+                    // Otherwise unicode-segmentation re-requests pre-context
+                    // for RI/Indic/emoji even when this cursor already has it,
+                    // which can count an RI prefix twice and change parity.
+                    let previous = self.chunk.chars().next_back().unwrap();
+                    let mut joined = String::with_capacity(previous.len_utf8() + next.len());
+                    joined.push(previous);
+                    joined.push_str(next);
+                    self.chunk_start = next_start - previous.len_utf8();
+                    self.chunk = Cow::Owned(joined);
+                }
+                Err(GraphemeIncomplete::PreContext(end)) => {
+                    let (context, start, ..) = self.text.chunk_at_byte(end - 1);
+                    self.cursor.provide_context(&context[..end - start], start);
+                }
+                _ => unreachable!(),
+            }
+        };
+        while self.byte_pos < next {
+            self.byte_pos += self.chars.next().unwrap().len_utf8();
+            self.current += 1;
+        }
+    }
+
+    pub(crate) fn bounds(&mut self, pos: usize) -> (usize, usize) {
+        assert!(
+            pos <= self.text.len_chars(),
+            "grapheme position is out of bounds"
+        );
+        // Dense endpoints retain the cursor's RI/Indic/emoji context. For a
+        // sparse batch, random boundary discovery avoids scanning long gaps.
+        if pos.saturating_sub(self.current) > 256 {
+            *self = Self::new(self.text, pos);
+        }
+        while self.current < pos {
+            let previous = self.current;
+            self.advance();
+            assert!(self.current > previous, "grapheme cursor did not advance");
+        }
+        if pos == self.current || pos == self.previous {
+            (pos, pos)
+        } else {
+            (self.previous, self.current)
+        }
+    }
+
+    pub(crate) fn ceil(&mut self, pos: usize) -> usize {
+        // Match ensure_grapheme_boundary_next: its search begins one character
+        // before pos, so a temporary endpoint one past EOF aligns back to EOF.
+        // Forward deletion creates this endpoint before applying its edit.
+        assert!(
+            pos.saturating_sub(1) <= self.text.len_chars(),
+            "grapheme position is out of bounds"
+        );
+        self.bounds(pos.min(self.text.len_chars())).1
+    }
+
+    pub(crate) fn next(&mut self, pos: usize) -> usize {
+        let (_, ceil) = self.bounds(pos);
+        if ceil > pos {
+            return ceil;
+        }
+        if self.current == pos && pos < self.text.len_chars() {
+            self.advance();
+        }
+        self.current
+    }
+}
+
 /// A highly compressed Cow<'a, str> that holds
 /// atmost u31::MAX bytes and is readonly
 pub struct GraphemeStr<'a> {

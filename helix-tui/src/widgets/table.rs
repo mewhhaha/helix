@@ -123,8 +123,13 @@ impl<'a> Row<'a> {
     }
 
     /// Returns the total height of the row.
-    fn total_height(&self) -> u16 {
+    pub fn total_height(&self) -> u16 {
         self.height.saturating_add(self.bottom_margin)
+    }
+
+    /// Height occupied by cells, excluding the bottom margin.
+    pub fn row_height(&self) -> u16 {
+        self.height
     }
 
     /// Returns the contents of cells as plain text, without styles and colors.

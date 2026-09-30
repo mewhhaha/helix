@@ -2,7 +2,7 @@ mod client;
 pub mod registry;
 mod transport;
 
-pub use client::Client;
+pub use client::{Client, RequestGuard, Requester};
 pub use helix_dap_types::*;
 pub use transport::{Payload, Response, Transport};
 

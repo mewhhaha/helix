@@ -22,7 +22,10 @@ use crate::ui::{self, Popup};
 
 use super::Handlers;
 
-pub use item::{CompletionItem, CompletionItems, CompletionResponse, LspCompletionItem};
+pub use item::{
+    CompletionItem, CompletionItems, CompletionResponse, LspCompletionItem, WordCompletionItem,
+    WordEditContext,
+};
 pub use request::CompletionHandler;
 pub use resolve::ResolveHandler;
 

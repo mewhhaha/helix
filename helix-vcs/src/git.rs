@@ -17,7 +17,7 @@ use gix::status::{
 };
 use gix::{Commit, ObjectId, Repository, ThreadSafeRepository};
 
-use crate::FileChange;
+use crate::{FileChange, PreparedVcs};
 
 #[cfg(test)]
 mod test;
@@ -39,10 +39,25 @@ pub fn get_diff_base(file: &Path, trust_full: bool) -> Result<Vec<u8>> {
         .context("failed to open git repo")?
         .to_thread_local();
     let head = repo.head_commit()?;
-    let file_oid = find_file_in_commit(&repo, &head, &file)?;
+    get_diff_base_from_repo(&repo, &head, &file, None)
+}
+
+fn get_diff_base_from_repo(
+    repo: &Repository,
+    head: &Commit,
+    file: &Path,
+    cancel: Option<&helix_event::TaskHandle>,
+) -> Result<Vec<u8>> {
+    if cancel.is_some_and(helix_event::TaskHandle::is_canceled) {
+        bail!("VCS preparation canceled");
+    }
+    let file_oid = find_file_in_commit(repo, head, file)?;
 
     let file_object = repo.find_object(file_oid)?;
     let data = file_object.detach().data;
+    if cancel.is_some_and(helix_event::TaskHandle::is_canceled) {
+        bail!("VCS preparation canceled");
+    }
     // Get the actual data that git would make out of the git object.
     // This will apply the user's git config or attributes like crlf conversions.
     //
@@ -58,7 +73,21 @@ pub fn get_diff_base(file: &Path, trust_full: bool) -> Result<Vec<u8>> {
         let mut worktree_outcome =
             pipeline.convert_to_worktree(&data, rela_path.as_ref(), Delay::Forbid)?;
         let mut buf = Vec::with_capacity(data.len());
-        worktree_outcome.read_to_end(&mut buf)?;
+        if let Some(cancel) = cancel {
+            let mut chunk = [0; 64 * 1024];
+            loop {
+                if cancel.is_canceled() {
+                    bail!("VCS preparation canceled");
+                }
+                let len = worktree_outcome.read(&mut chunk)?;
+                if len == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..len]);
+            }
+        } else {
+            worktree_outcome.read_to_end(&mut buf)?;
+        }
         Ok(buf)
     } else {
         Ok(data)
@@ -74,8 +103,12 @@ pub fn get_current_head_name(file: &Path, trust_full: bool) -> Result<Arc<ArcSwa
     let repo = open_repo(repo_dir, trust_full)
         .context("failed to open git repo")?
         .to_thread_local();
-    let head_ref = repo.head_ref()?;
     let head_commit = repo.head_commit()?;
+    current_head_name(&repo, &head_commit)
+}
+
+fn current_head_name(repo: &Repository, head_commit: &Commit) -> Result<Arc<ArcSwap<Box<str>>>> {
+    let head_ref = repo.head_ref()?;
 
     let name = match head_ref {
         Some(reference) => reference.name().shorten().to_string(),
@@ -85,12 +118,40 @@ pub fn get_current_head_name(file: &Path, trust_full: bool) -> Result<Arc<ArcSwa
     Ok(Arc::new(ArcSwap::from_pointee(name.into_boxed_str())))
 }
 
+pub fn prepare_vcs(
+    file: &Path,
+    trust_full: bool,
+    cancel: &helix_event::TaskHandle,
+) -> Result<PreparedVcs> {
+    if cancel.is_canceled() {
+        bail!("VCS preparation canceled");
+    }
+    let file = gix::path::realpath(file).context("resolve symlinks")?;
+    let repo = open_repo(get_repo_dir(&file)?, trust_full)?.to_thread_local();
+    if cancel.is_canceled() {
+        bail!("VCS preparation canceled");
+    }
+    let head = repo.head_commit()?;
+    let head_name = current_head_name(&repo, &head)?;
+    let diff_base = get_diff_base_from_repo(&repo, &head, &file, Some(cancel))
+        .map_err(|err| log::debug!("Loading VCS baseline for {}: {err:#}", file.display()))
+        .ok();
+    Ok(PreparedVcs {
+        diff_base,
+        head: Some(head_name),
+    })
+}
+
 pub fn for_each_changed_file(
     cwd: &Path,
     trust_full: bool,
+    interrupt: std::sync::Arc<std::sync::atomic::AtomicBool>,
     f: impl Fn(Result<FileChange>) -> bool,
 ) -> Result<()> {
-    status(&open_repo(cwd, trust_full)?.to_thread_local(), f)
+    if interrupt.load(std::sync::atomic::Ordering::Relaxed) {
+        return Ok(());
+    }
+    status(&open_repo(cwd, trust_full)?.to_thread_local(), interrupt, f)
 }
 
 fn open_repo(path: &Path, trust_full: bool) -> Result<ThreadSafeRepository> {
@@ -145,7 +206,11 @@ fn open_repo(path: &Path, trust_full: bool) -> Result<ThreadSafeRepository> {
 }
 
 /// Emulates the result of running `git status` from the command line.
-fn status(repo: &Repository, f: impl Fn(Result<FileChange>) -> bool) -> Result<()> {
+fn status(
+    repo: &Repository,
+    interrupt: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    f: impl Fn(Result<FileChange>) -> bool,
+) -> Result<()> {
     let work_dir = repo
         .workdir()
         .ok_or_else(|| anyhow::anyhow!("working tree not found"))?
@@ -158,6 +223,7 @@ fn status(repo: &Repository, f: impl Fn(Result<FileChange>) -> bool) -> Result<(
         // if the default value weren't `Collapsed` though, as this default value would render
         // the feature unusable to many.
         .untracked_files(UntrackedFiles::Files)
+        .should_interrupt_owned(interrupt.clone())
         // Turn on file rename detection, which is off by default.
         .index_worktree_rewrites(Some(Rewrites {
             copies: None,
@@ -172,8 +238,18 @@ fn status(repo: &Repository, f: impl Fn(Result<FileChange>) -> bool) -> Result<(
     let status_iter = status_platform.into_index_worktree_iter(empty_patterns)?;
 
     for item in status_iter {
-        let Ok(item) = item.map_err(|err| f(Err(err.into()))) else {
-            continue;
+        if interrupt.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
+        let item = match item {
+            Ok(item) => item,
+            Err(err) => {
+                if !f(Err(err.into())) {
+                    interrupt.store(true, std::sync::atomic::Ordering::Relaxed);
+                    break;
+                }
+                continue;
+            }
         };
         let change = match item {
             Item::Modification {
@@ -212,6 +288,7 @@ fn status(repo: &Repository, f: impl Fn(Result<FileChange>) -> bool) -> Result<(
             _ => continue,
         };
         if !f(Ok(change)) {
+            interrupt.store(true, std::sync::atomic::Ordering::Relaxed);
             break;
         }
     }

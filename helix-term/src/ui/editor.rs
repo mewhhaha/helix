@@ -143,7 +143,19 @@ impl EditorView {
             overlays.push(overlay);
         }
 
-        Self::doc_diagnostics_highlights_into(doc, theme, &mut overlays);
+        if let Some(overlay) =
+            Self::doc_color_value_highlights(doc, view_offset.anchor, inner.height)
+        {
+            overlays.push(overlay);
+        }
+
+        Self::doc_diagnostics_highlights_into(
+            doc,
+            theme,
+            view_offset.anchor,
+            inner.height,
+            &mut overlays,
+        );
 
         if is_focused {
             if config.lsp.auto_document_highlight {
@@ -299,14 +311,14 @@ impl EditorView {
         anchor: usize,
         height: u16,
         loader: &'editor syntax::Loader,
-    ) -> Option<syntax::Highlighter<'editor>> {
+    ) -> Option<syntax::DisplayHighlighter<'editor>> {
         let syntax = doc.syntax()?;
         let text = doc.text().slice(..);
         let row = text.char_to_line(anchor.min(text.len_chars()));
         let range = Self::viewport_byte_range(text, row, height);
         let range = range.start as u32..range.end as u32;
 
-        let highlighter = syntax.highlighter(text, loader, range);
+        let highlighter = syntax.display_highlighter(text, loader, range);
         Some(highlighter)
     }
 
@@ -323,6 +335,26 @@ impl EditorView {
         range = text.byte_to_char(range.start)..text.byte_to_char(range.end);
 
         text_annotations.collect_overlay_highlights(range)
+    }
+
+    pub fn doc_color_value_highlights(
+        doc: &Document,
+        anchor: usize,
+        height: u16,
+    ) -> Option<OverlayHighlights> {
+        if !doc.config.load().lsp.display_color_values {
+            return None;
+        }
+        let colors = doc.color_swatches.as_ref()?;
+        if colors.color_ranges.is_empty() || height == 0 {
+            return None;
+        }
+        let text = doc.text().slice(..);
+        let row = text.char_to_line(anchor.min(text.len_chars()));
+        let bytes = Self::viewport_byte_range(text, row, height);
+        let visible = text.byte_to_char(bytes.start)..text.byte_to_char(bytes.end);
+        let overlay = OverlayHighlights::shared_heterogenous(colors.color_ranges.clone(), visible);
+        (!overlay.is_empty()).then_some(overlay)
     }
 
     pub fn doc_rainbow_highlights(
@@ -350,127 +382,48 @@ impl EditorView {
     pub fn doc_diagnostics_highlights_into(
         doc: &Document,
         theme: &Theme,
+        anchor: usize,
+        height: u16,
         overlay_highlights: &mut Vec<OverlayHighlights>,
     ) {
-        // Skip redundant work if no diagnostics.
-        if doc.diagnostics().is_empty() {
+        if doc.diagnostics().is_empty() || height == 0 {
             return;
         }
-
-        use helix_core::diagnostic::{DiagnosticTag, Range, Severity};
-        let get_scope_of = |scope| {
+        use helix_view::document::DiagnosticHighlightKind;
+        let text = doc.text().slice(..);
+        let row = text.char_to_line(anchor.min(text.len_chars()));
+        let bytes = Self::viewport_byte_range(text, row, height);
+        let visible = text.byte_to_char(bytes.start)..text.byte_to_char(bytes.end);
+        let get_scope = |scope| {
             theme
                 .find_highlight_exact(scope)
-                // get one of the themes below as fallback values
                 .or_else(|| theme.find_highlight_exact("diagnostic"))
                 .or_else(|| theme.find_highlight_exact("ui.cursor"))
                 .or_else(|| theme.find_highlight_exact("ui.selection"))
-                .expect(
-                    "at least one of the following scopes must be defined in the theme: `diagnostic`, `ui.cursor`, or `ui.selection`",
-                )
+                .expect("theme must define diagnostic, ui.cursor, or ui.selection")
         };
-
-        // Diagnostic tags
-        let unnecessary = theme.find_highlight_exact("diagnostic.unnecessary");
-        let deprecated = theme.find_highlight_exact("diagnostic.deprecated");
-
-        let mut default_vec = Vec::new();
-        let mut info_vec = Vec::new();
-        let mut hint_vec = Vec::new();
-        let mut warning_vec = Vec::new();
-        let mut error_vec = Vec::new();
-        let mut unnecessary_vec = Vec::new();
-        let mut deprecated_vec = Vec::new();
-
-        let push_diagnostic = |vec: &mut Vec<ops::Range<usize>>, range: Range| {
-            // If any diagnostic overlaps ranges with the prior diagnostic,
-            // merge the two together. Otherwise push a new span.
-            match vec.last_mut() {
-                Some(existing_range) if range.start <= existing_range.end => {
-                    // This branch merges overlapping diagnostics, assuming that the current
-                    // diagnostic starts on range.start or later. If this assertion fails,
-                    // we will discard some part of `diagnostic`. This implies that
-                    // `doc.diagnostics()` is not sorted by `diagnostic.range`.
-                    debug_assert!(existing_range.start <= range.start);
-                    existing_range.end = range.end.max(existing_range.end)
-                }
-                _ => vec.push(range.start..range.end),
+        let mut push = |kind, highlight| {
+            let ranges = doc.diagnostic_snapshot().ranges(kind).clone();
+            let overlay = OverlayHighlights::shared_homogeneous(highlight, ranges, visible.clone());
+            if !overlay.is_empty() {
+                overlay_highlights.push(overlay);
             }
         };
-
-        for diagnostic in doc.diagnostics() {
-            // Separate diagnostics into different Vecs by severity.
-            let vec = match diagnostic.severity {
-                Some(Severity::Info) => &mut info_vec,
-                Some(Severity::Hint) => &mut hint_vec,
-                Some(Severity::Warning) => &mut warning_vec,
-                Some(Severity::Error) => &mut error_vec,
-                _ => &mut default_vec,
-            };
-
-            // If the diagnostic has tags and a non-warning/error severity, skip rendering
-            // the diagnostic as info/hint/default and only render it as unnecessary/deprecated
-            // instead. For warning/error diagnostics, render both the severity highlight and
-            // the tag highlight.
-            if diagnostic.tags.is_empty()
-                || matches!(
-                    diagnostic.severity,
-                    Some(Severity::Warning | Severity::Error)
-                )
-            {
-                push_diagnostic(vec, diagnostic.range);
-            }
-
-            for tag in &diagnostic.tags {
-                match tag {
-                    DiagnosticTag::Unnecessary => {
-                        if unnecessary.is_some() {
-                            push_diagnostic(&mut unnecessary_vec, diagnostic.range)
-                        }
-                    }
-                    DiagnosticTag::Deprecated => {
-                        if deprecated.is_some() {
-                            push_diagnostic(&mut deprecated_vec, diagnostic.range)
-                        }
-                    }
-                }
-            }
+        push(DiagnosticHighlightKind::Default, get_scope("diagnostic"));
+        if let Some(highlight) = theme.find_highlight_exact("diagnostic.unnecessary") {
+            push(DiagnosticHighlightKind::Unnecessary, highlight);
         }
-
-        overlay_highlights.push(OverlayHighlights::Homogeneous {
-            highlight: get_scope_of("diagnostic"),
-            ranges: default_vec,
-        });
-        if let Some(highlight) = unnecessary {
-            overlay_highlights.push(OverlayHighlights::Homogeneous {
-                highlight,
-                ranges: unnecessary_vec,
-            });
+        if let Some(highlight) = theme.find_highlight_exact("diagnostic.deprecated") {
+            push(DiagnosticHighlightKind::Deprecated, highlight);
         }
-        if let Some(highlight) = deprecated {
-            overlay_highlights.push(OverlayHighlights::Homogeneous {
-                highlight,
-                ranges: deprecated_vec,
-            });
+        for (kind, scope) in [
+            (DiagnosticHighlightKind::Info, "diagnostic.info"),
+            (DiagnosticHighlightKind::Hint, "diagnostic.hint"),
+            (DiagnosticHighlightKind::Warning, "diagnostic.warning"),
+            (DiagnosticHighlightKind::Error, "diagnostic.error"),
+        ] {
+            push(kind, get_scope(scope));
         }
-        overlay_highlights.extend([
-            OverlayHighlights::Homogeneous {
-                highlight: get_scope_of("diagnostic.info"),
-                ranges: info_vec,
-            },
-            OverlayHighlights::Homogeneous {
-                highlight: get_scope_of("diagnostic.hint"),
-                ranges: hint_vec,
-            },
-            OverlayHighlights::Homogeneous {
-                highlight: get_scope_of("diagnostic.warning"),
-                ranges: warning_vec,
-            },
-            OverlayHighlights::Homogeneous {
-                highlight: get_scope_of("diagnostic.error"),
-                ranges: error_vec,
-            },
-        ]);
     }
 
     pub fn doc_document_highlights(
@@ -527,6 +480,36 @@ impl EditorView {
         Some(OverlayHighlights::Homogeneous { highlight, ranges })
     }
 
+    fn visible_selection_indices(doc: &Document, view: &View) -> std::ops::Range<usize> {
+        let height = view.inner_area(doc).height;
+        if height == 0 {
+            return 0..0;
+        }
+        let text = doc.text();
+        let row = text.char_to_line(doc.view_offset(view.id).anchor.min(text.len_chars()));
+        let start = text.line_to_char(row);
+        let end = text.line_to_char((row + height as usize).min(text.len_lines()));
+        let ranges = doc.selection(view.id).ranges();
+        // Include crossing selections and EOF cursors. Whole physical lines are a
+        // conservative bound when softwrap or virtual lines consume viewport rows.
+        let first = ranges.partition_point(|range| range.to() < start);
+        let last = ranges.partition_point(|range| {
+            range.from() < end || (end == text.len_chars() && range.from() == end)
+        });
+        first..last
+    }
+
+    fn visible_cursor_lines(doc: &Document, view: &View) -> Vec<usize> {
+        let text = doc.text().slice(..);
+        let indices = Self::visible_selection_indices(doc, view);
+        let mut lines: Vec<_> = doc.selection(view.id).ranges()[indices]
+            .iter()
+            .map(|range| range.cursor_line(text))
+            .collect();
+        lines.dedup();
+        lines
+    }
+
     /// Get highlight spans for selections in a document view.
     pub fn doc_selection_highlights(
         mode: Mode,
@@ -572,7 +555,9 @@ impl EditorView {
         .unwrap_or(base_primary_cursor_scope);
 
         let mut spans = Vec::new();
-        for (i, range) in selection.iter().enumerate() {
+        let visible = Self::visible_selection_indices(doc, view);
+        for (offset, range) in selection.ranges()[visible.clone()].iter().enumerate() {
+            let i = visible.start + offset;
             let selection_is_primary = i == primary_idx;
             let (cursor_scope, selection_scope) = if selection_is_primary {
                 (primary_cursor_scope, primary_selection_scope)
@@ -721,12 +706,7 @@ impl EditorView {
         is_focused: bool,
         decoration_manager: &mut DecorationManager<'d>,
     ) {
-        let text = doc.text().slice(..);
-        let cursors: Rc<[_]> = doc
-            .selection(view.id)
-            .iter()
-            .map(|range| range.cursor_line(text))
-            .collect();
+        let cursors: Rc<[_]> = Self::visible_cursor_lines(doc, view).into();
 
         let mut offset = 0;
 
@@ -743,7 +723,7 @@ impl EditorView {
             let cursors = cursors.clone();
             let gutter_decoration = move |renderer: &mut TextRenderer, pos: LinePos| {
                 // TODO handle softwrap in gutters
-                let selected = cursors.contains(&pos.doc_line);
+                let selected = cursors.binary_search(&pos.doc_line).is_ok();
                 let x = viewport.x + offset;
                 let y = pos.visual_line;
 
@@ -846,17 +826,7 @@ impl EditorView {
         // TODO only highlight the visual line that contains the cursor instead of the full visual line
         let primary_line = doc.selection(view.id).primary().cursor_line(text);
 
-        // The secondary_lines do contain the primary_line, it doesn't matter
-        // as the else-if clause in the loop later won't test for the
-        // secondary_lines if primary_line == line.
-        // It's used inside a loop so the collect isn't needless:
-        // https://github.com/rust-lang/rust-clippy/issues/6164
-        #[allow(clippy::needless_collect)]
-        let secondary_lines: Vec<_> = doc
-            .selection(view.id)
-            .iter()
-            .map(|range| range.cursor_line(text))
-            .collect();
+        let secondary_lines = Self::visible_cursor_lines(doc, view);
 
         let primary_style = theme.get("ui.cursorline.primary");
         let secondary_style = theme.get("ui.cursorline.secondary");
@@ -1150,7 +1120,8 @@ impl EditorView {
                 }
                 CompleteAction::Selected { savepoint } => {
                     let (view, doc) = current!(editor);
-                    doc.restore(view, &savepoint, false);
+                    let colors = restore_completion_preview(doc, view, &savepoint);
+                    helix_event::send_blocking(&editor.handlers.document_colors, colors);
                 }
             }
         }
@@ -1757,5 +1728,285 @@ fn canonicalize_key(key: &mut KeyEvent) {
     } = key
     {
         key.modifiers.remove(KeyModifiers::SHIFT)
+    }
+}
+
+fn restore_completion_preview(
+    doc: &mut Document,
+    view: &mut View,
+    savepoint: &helix_view::document::SavePoint,
+) -> helix_view::handlers::lsp::DocumentColorsEvent {
+    doc.restore(view, savepoint, false);
+    // The restored text matches the language server again. A preview may have
+    // removed the edited token's cached tint.
+    helix_view::handlers::lsp::DocumentColorsEvent(doc.id(), doc.version())
+}
+
+#[cfg(test)]
+mod color_value_tests {
+    use std::sync::Arc;
+
+    use arc_swap::ArcSwap;
+    use helix_core::{syntax::OverlayHighlighter, Rope};
+    use helix_view::{
+        document::DocumentColorSwatches,
+        editor::{Config, LspConfig},
+    };
+
+    use super::*;
+
+    fn document(values: bool, swatches: bool) -> Document {
+        document_with_text(values, swatches, "bg-red-500\n")
+    }
+
+    fn document_with_text(values: bool, swatches: bool, text: &str) -> Document {
+        let config = Config {
+            lsp: LspConfig {
+                display_color_values: values,
+                display_color_swatches: swatches,
+                ..LspConfig::default()
+            },
+            ..Config::default()
+        };
+        let mut doc = Document::from(
+            Rope::from_str(text),
+            None,
+            Arc::new(ArcSwap::from_pointee(config)),
+            Arc::new(ArcSwap::from_pointee(syntax::Loader::default())),
+        );
+        doc.color_swatches = Some(DocumentColorSwatches {
+            color_ranges: Arc::new(vec![(Theme::rgb_highlight(251, 44, 54), 0..10)]),
+            ..DocumentColorSwatches::default()
+        });
+        doc
+    }
+
+    #[tokio::test]
+    async fn selection_window_retains_crossing_ranges_primary_identity_and_eof() {
+        let mut doc = document_with_text(false, false, &"a\n".repeat(100));
+        let mut view = View::new(doc.id(), Config::default().gutters);
+        view.area = Rect::new(0, 0, 80, 4);
+        doc.set_selection(
+            view.id,
+            Selection::new(
+                vec![
+                    Range::new(0, 0),
+                    Range::new(2, 102),
+                    Range::new(104, 104),
+                    Range::new(108, 108),
+                    Range::new(200, 200),
+                ]
+                .into(),
+                2,
+            ),
+        );
+        doc.set_view_offset(
+            view.id,
+            helix_view::view::ViewPosition {
+                anchor: 100,
+                ..Default::default()
+            },
+        );
+        let window = EditorView::visible_selection_indices(&doc, &view);
+        assert_eq!(window, 1..3);
+        assert_eq!(doc.selection(view.id).primary_index(), 2);
+        assert_eq!(EditorView::visible_cursor_lines(&doc, &view), vec![50, 52]);
+        let theme: Theme = toml::from_str(
+            "\"ui.selection\" = \"#aaaaaa\"\n\"ui.cursor\" = \"#bbbbbb\"\n\"ui.cursor.primary\" = \"#cccccc\"",
+        ).unwrap();
+        let OverlayHighlights::Heterogenous { highlights } = EditorView::doc_selection_highlights(
+            Mode::Normal,
+            &doc,
+            &view,
+            &theme,
+            &Config::default().cursor_shape,
+            true,
+        ) else {
+            unreachable!()
+        };
+        assert_eq!(highlights.len(), 4);
+        assert_eq!(highlights.last().unwrap().1, 104..105);
+        assert_eq!(
+            highlights.last().unwrap().0,
+            theme.find_highlight("ui.cursor.primary").unwrap()
+        );
+
+        doc.set_view_offset(
+            view.id,
+            helix_view::view::ViewPosition {
+                anchor: 200,
+                ..Default::default()
+            },
+        );
+        assert_eq!(EditorView::visible_selection_indices(&doc, &view), 4..5);
+        view.area.height = 0;
+        assert!(EditorView::visible_selection_indices(&doc, &view).is_empty());
+    }
+
+    #[test]
+    fn lsp_color_values_have_rgb_foreground_without_inline_swatches() {
+        let doc = document(true, false);
+        let overlay = EditorView::doc_color_value_highlights(&doc, 0, 1).unwrap();
+        let OverlayHighlights::SharedHeterogenous {
+            highlights,
+            indices,
+        } = overlay
+        else {
+            panic!("color values must use individual color ranges");
+        };
+        assert_eq!(highlights.len(), 1);
+        assert_eq!(indices, 0..1);
+        assert_eq!(highlights[0].1, 0..10);
+        assert_eq!(
+            Theme::default().highlight(highlights[0].0).fg,
+            Some(Color::Rgb(251, 44, 54))
+        );
+    }
+
+    #[test]
+    fn disabled_color_values_do_not_add_overlays_with_swatches_enabled() {
+        assert!(EditorView::doc_color_value_highlights(&document(false, true), 0, 1).is_none());
+    }
+
+    #[test]
+    fn color_overlays_share_storage_and_seek_to_visible_document_rows() {
+        let mut doc = document_with_text(true, true, &"a\n".repeat(10_001));
+        let highlights = Arc::new(
+            (0..10_000)
+                .map(|index| {
+                    (
+                        Theme::rgb_highlight((index >> 8) as u8, index as u8, 0),
+                        index * 2..index * 2 + 1,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+        doc.color_swatches.as_mut().unwrap().color_ranges = highlights.clone();
+        let overlay = EditorView::doc_color_value_highlights(&doc, 6, 2).unwrap();
+        let OverlayHighlights::SharedHeterogenous {
+            highlights: snapshot,
+            indices,
+        } = overlay
+        else {
+            unreachable!()
+        };
+        assert!(Arc::ptr_eq(&highlights, &snapshot));
+        assert_eq!(indices, 3..5);
+        assert_eq!(snapshot[indices.start].1, 6..7);
+        assert!(EditorView::doc_color_value_highlights(&doc, 20_000, 1).is_none());
+    }
+
+    #[test]
+    fn later_selection_overlay_preserves_its_foreground() {
+        let colors = EditorView::doc_color_value_highlights(&document(true, false), 0, 1).unwrap();
+        let selected = Theme::rgb_highlight(255, 255, 255);
+        let mut highlighter =
+            OverlayHighlighter::new([colors, OverlayHighlights::single(selected, 0..1)]);
+        let theme = Theme::default();
+        let (_, highlights) = highlighter.advance();
+        let style = highlights.fold(Style::default(), |style, highlight| {
+            style.patch(theme.highlight(highlight))
+        });
+        assert_eq!(style.fg, Some(Color::Rgb(255, 255, 255)));
+    }
+
+    #[test]
+    fn diagnostic_overlays_share_viewport_ranges_and_preserve_precedence() {
+        use helix_core::diagnostic::{Diagnostic, DiagnosticProvider, DiagnosticTag, Severity};
+        use helix_view::document::DiagnosticHighlightKind;
+
+        let mut doc = document_with_text(false, false, &"a\n".repeat(10_001));
+        let diagnostic = |start, end, severity, tags| Diagnostic {
+            range: helix_core::diagnostic::Range { start, end },
+            starts_at_word: false,
+            ends_at_word: false,
+            zero_width: false,
+            line: start / 2,
+            message: String::new(),
+            severity: Some(severity),
+            code: None,
+            provider: DiagnosticProvider::Lsp {
+                server_id: helix_core::diagnostic::LanguageServerId::default(),
+                identifier: None,
+            },
+            tags,
+            source: None,
+            data: None,
+        };
+        doc.replace_diagnostics(
+            std::iter::once(diagnostic(0, 9, Severity::Warning, vec![]))
+                .chain(std::iter::once(diagnostic(
+                    0,
+                    12,
+                    Severity::Error,
+                    vec![DiagnosticTag::Unnecessary],
+                )))
+                .chain(
+                    (10..10_000).map(|index| {
+                        diagnostic(index * 2, index * 2 + 1, Severity::Warning, vec![])
+                    }),
+                ),
+            &[],
+            None,
+        );
+        let theme: Theme = toml::from_str(
+            "\"diagnostic\" = { fg = \"#ffffff\" }\n\"diagnostic.unnecessary\" = { fg = \"#0000ff\", modifiers = [\"dim\"] }\n\"diagnostic.warning\" = { fg = \"#ffff00\" }\n\"diagnostic.error\" = { fg = \"#ff0000\" }",
+        ).unwrap();
+        let warning_ranges = doc
+            .diagnostic_snapshot()
+            .ranges(DiagnosticHighlightKind::Warning);
+        let mut overlays = Vec::new();
+        EditorView::doc_diagnostics_highlights_into(&doc, &theme, 6, 2, &mut overlays);
+        assert_eq!(overlays.len(), 3);
+        let OverlayHighlights::SharedHomogeneous {
+            ranges, indices, ..
+        } = &overlays[1]
+        else {
+            unreachable!()
+        };
+        assert!(Arc::ptr_eq(ranges, warning_ranges));
+        assert_eq!(indices, &(0..1));
+        assert_eq!(ranges[indices.start], 0..9);
+        let mut highlighter = OverlayHighlighter::new(overlays);
+        let (_, highlights) = highlighter.advance();
+        let style = highlights.fold(Style::default(), |style, highlight| {
+            style.patch(theme.highlight(highlight))
+        });
+        assert_eq!(style.fg, Some(Color::Rgb(255, 0, 0)));
+        assert!(style
+            .add_modifier
+            .contains(helix_view::graphics::Modifier::DIM));
+        let mut invisible = Vec::new();
+        EditorView::doc_diagnostics_highlights_into(&doc, &theme, 20_000, 1, &mut invisible);
+        assert!(invisible.is_empty());
+        EditorView::doc_diagnostics_highlights_into(&doc, &theme, 0, 0, &mut invisible);
+        assert!(invisible.is_empty());
+    }
+
+    #[tokio::test]
+    async fn aborted_preview_refreshes_colors_for_restored_text() {
+        let mut doc = document(true, false);
+        let mut view = View::new(doc.id(), Config::default().gutters);
+        doc.set_selection(view.id, Selection::single(0, 0));
+        let savepoint = doc.savepoint(&view);
+        let preview = Transaction::change(
+            doc.text(),
+            [(0, 10, Some("bg-blue-500".into()))].into_iter(),
+        );
+        doc.apply_temporary(&preview, view.id);
+        // Preview edits invalidate the edited token's cached color.
+        Arc::make_mut(&mut doc.color_swatches.as_mut().unwrap().color_ranges).clear();
+        let refresh = restore_completion_preview(&mut doc, &mut view, &savepoint);
+        assert_eq!(doc.text().to_string(), "bg-red-500\n");
+        assert_eq!(refresh.0, doc.id());
+        assert_eq!(refresh.1, doc.version());
+
+        // Accepting another edit before debounce makes this refresh obsolete.
+        let accepted = Transaction::change(
+            doc.text(),
+            [(0, 10, Some("bg-green-500".into()))].into_iter(),
+        );
+        doc.apply(&accepted, view.id);
+        assert_ne!(refresh.1, doc.version());
     }
 }

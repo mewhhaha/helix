@@ -18,7 +18,7 @@ use helix_event::dispatch;
 use helix_loader::workspace_trust::{ImplicitTrustLevel, TrustQuery, WorkspaceTrust};
 use helix_vcs::DiffProviderRegistry;
 
-use futures_util::stream::select_all::SelectAll;
+use futures_util::stream::{select_all::SelectAll, FuturesUnordered};
 use futures_util::StreamExt;
 use helix_lsp::{Call, LanguageServerId};
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -639,6 +639,8 @@ pub struct LspConfig {
     pub inlay_hints_length_limit: Option<NonZeroU8>,
     /// Display document color swatches
     pub display_color_swatches: bool,
+    /// Tint document color values with their LSP color.
+    pub display_color_values: bool,
     /// Whether to enable snippet support
     pub snippets: bool,
     /// Whether to include declaration in the goto reference query
@@ -659,6 +661,7 @@ impl Default for LspConfig {
             snippets: true,
             goto_reference_include_declaration: true,
             display_color_swatches: true,
+            display_color_values: true,
         }
     }
 }
@@ -1268,7 +1271,141 @@ pub struct Breakpoint {
 
 use futures_util::stream::{Flatten, Once};
 
-type Diagnostics = BTreeMap<Uri, Vec<(lsp::Diagnostic, DiagnosticProvider)>>;
+type DiagnosticMap = BTreeMap<Uri, Vec<(lsp::Diagnostic, DiagnosticProvider)>>;
+
+#[derive(Clone, Default)]
+pub struct Diagnostics {
+    entries: DiagnosticMap,
+    counts: Cell<Option<crate::document::DiagnosticCounts>>,
+}
+
+impl Diagnostics {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn counts(&self) -> crate::document::DiagnosticCounts {
+        if let Some(counts) = self.counts.get() {
+            return counts;
+        }
+        let mut counts = crate::document::DiagnosticCounts::default();
+        for (diagnostic, _) in self.entries.values().flatten() {
+            match diagnostic.severity {
+                Some(lsp::DiagnosticSeverity::ERROR) => counts.errors += 1,
+                Some(lsp::DiagnosticSeverity::WARNING) => counts.warnings += 1,
+                Some(lsp::DiagnosticSeverity::INFORMATION) => counts.info += 1,
+                _ => counts.hints += 1,
+            }
+        }
+        self.counts.set(Some(counts));
+        counts
+    }
+}
+
+impl std::ops::Deref for Diagnostics {
+    type Target = DiagnosticMap;
+
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
+
+impl std::ops::DerefMut for Diagnostics {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.counts.set(None);
+        &mut self.entries
+    }
+}
+
+impl IntoIterator for Diagnostics {
+    type Item = (Uri, Vec<(lsp::Diagnostic, DiagnosticProvider)>);
+    type IntoIter =
+        std::collections::btree_map::IntoIter<Uri, Vec<(lsp::Diagnostic, DiagnosticProvider)>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a Diagnostics {
+    type Item = (&'a Uri, &'a Vec<(lsp::Diagnostic, DiagnosticProvider)>);
+    type IntoIter =
+        std::collections::btree_map::Iter<'a, Uri, Vec<(lsp::Diagnostic, DiagnosticProvider)>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a mut Diagnostics {
+    type Item = (&'a Uri, &'a mut Vec<(lsp::Diagnostic, DiagnosticProvider)>);
+    type IntoIter =
+        std::collections::btree_map::IterMut<'a, Uri, Vec<(lsp::Diagnostic, DiagnosticProvider)>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.counts.set(None);
+        self.entries.iter_mut()
+    }
+}
+
+#[cfg(test)]
+mod workspace_diagnostic_count_tests {
+    use super::*;
+
+    fn entry(severity: Option<lsp::DiagnosticSeverity>) -> (lsp::Diagnostic, DiagnosticProvider) {
+        (
+            lsp::Diagnostic {
+                severity,
+                ..lsp::Diagnostic::default()
+            },
+            DiagnosticProvider::Lsp {
+                server_id: LanguageServerId::default(),
+                identifier: None,
+            },
+        )
+    }
+
+    #[test]
+    fn cached_workspace_counts_invalidate_on_all_map_mutations() {
+        let mut diagnostics = Diagnostics::new();
+        let first = Uri::from(PathBuf::from("/diagnostics/first"));
+        let second = Uri::from(PathBuf::from("/diagnostics/second"));
+        diagnostics.entry(first.clone()).or_default().extend([
+            entry(None),
+            entry(Some(lsp::DiagnosticSeverity::INFORMATION)),
+            entry(Some(lsp::DiagnosticSeverity::ERROR)),
+        ]);
+        diagnostics.insert(
+            second.clone(),
+            vec![entry(Some(lsp::DiagnosticSeverity::WARNING))],
+        );
+        assert_eq!(diagnostics.counts().as_tuple(), (1, 1, 1, 1));
+        assert!(diagnostics.counts.get().is_some());
+        assert_eq!(diagnostics.counts().as_tuple(), (1, 1, 1, 1));
+        assert_eq!(diagnostics.clone().into_iter().count(), 2);
+
+        diagnostics.get_mut(&first).unwrap().clear();
+        assert!(diagnostics.counts.get().is_none());
+        assert_eq!(diagnostics.counts().as_tuple(), (0, 0, 1, 0));
+        diagnostics
+            .values_mut()
+            .for_each(|entries| entries.push(entry(None)));
+        assert_eq!(diagnostics.counts().as_tuple(), (2, 0, 1, 0));
+        for (_, entries) in &mut diagnostics {
+            entries.retain(|(diagnostic, _)| diagnostic.severity.is_some());
+        }
+        assert_eq!(diagnostics.counts().as_tuple(), (0, 0, 1, 0));
+        diagnostics.retain(|uri, _| uri != &second);
+        assert_eq!(diagnostics.counts().as_tuple(), (0, 0, 0, 0));
+        diagnostics.insert(first, vec![entry(Some(lsp::DiagnosticSeverity::ERROR))]);
+        assert_eq!(diagnostics.counts().errors, 1);
+        diagnostics.clear();
+        assert_eq!(
+            diagnostics.counts(),
+            crate::document::DiagnosticCounts::default()
+        );
+    }
+}
 
 pub struct Editor {
     /// Current editing mode.
@@ -1282,6 +1419,7 @@ pub struct Editor {
     pub saves: HashMap<DocumentId, UnboundedSender<Once<DocumentSavedEventFuture>>>,
     pub save_queue: SelectAll<Flatten<UnboundedReceiverStream<Once<DocumentSavedEventFuture>>>>,
     pub write_count: usize,
+    vcs_tasks: FuturesUnordered<tokio::task::JoinHandle<Option<PreparedDocumentVcs>>>,
 
     pub count: Option<std::num::NonZeroUsize>,
     pub selected_register: Option<char>,
@@ -1293,6 +1431,8 @@ pub struct Editor {
     pub diff_providers: DiffProviderRegistry,
 
     pub debug_adapters: dap::registry::Registry,
+    pub(crate) dap_tasks:
+        FuturesUnordered<tokio::task::JoinHandle<Option<crate::handlers::dap::PreparedDap>>>,
     pub breakpoints: HashMap<PathBuf, Vec<Breakpoint>>,
 
     pub syn_loader: Arc<ArcSwap<syntax::Loader>>,
@@ -1346,6 +1486,16 @@ pub struct Editor {
 }
 
 pub type Motion = Box<dyn Fn(&mut Editor)>;
+
+struct PreparedDocumentVcs {
+    document: DocumentId,
+    path: PathBuf,
+    trust_full: bool,
+    encoding: &'static helix_core::encoding::Encoding,
+    cancel: helix_event::TaskHandle,
+    diff_base: Option<helix_core::Rope>,
+    head: Option<Arc<ArcSwap<Box<str>>>>,
+}
 
 #[derive(Debug)]
 pub enum EditorEvent {
@@ -1433,6 +1583,7 @@ impl Editor {
             saves: HashMap::new(),
             save_queue: SelectAll::new(),
             write_count: 0,
+            vcs_tasks: FuturesUnordered::new(),
             count: None,
             selected_register: None,
             macro_recording: None,
@@ -1442,6 +1593,7 @@ impl Editor {
             diagnostics: Diagnostics::new(),
             diff_providers: DiffProviderRegistry::default(),
             debug_adapters: dap::registry::Registry::new(),
+            dap_tasks: FuturesUnordered::new(),
             breakpoints: HashMap::new(),
             syn_loader,
             theme_loader,
@@ -1631,6 +1783,15 @@ impl Editor {
     /// moves/renames a path, invoking any event handlers (currently only lsp)
     /// and calling `set_doc_path` if the file is open in the editor
     pub fn move_path(&mut self, old_path: &Path, new_path: &Path) -> io::Result<()> {
+        self.move_path_with_overwrite(old_path, new_path, true)
+    }
+
+    pub(crate) fn move_path_with_overwrite(
+        &mut self,
+        old_path: &Path,
+        new_path: &Path,
+        overwrite: bool,
+    ) -> io::Result<()> {
         let new_path = canonicalize(new_path);
         // sanity check
         if old_path == new_path {
@@ -1659,12 +1820,27 @@ impl Editor {
             }
         }
 
-        if old_path.exists() {
-            fs::rename(old_path, &new_path)?;
+        if old_path.exists() || old_path.is_symlink() {
+            if overwrite {
+                fs::rename(old_path, &new_path)?;
+            } else {
+                helix_stdx::path::rename_noreplace(old_path, &new_path)?;
+            }
         }
 
-        if let Some(doc) = self.document_by_path(old_path) {
-            self.set_doc_path(doc.id(), &new_path);
+        let moved_documents: Vec<_> = self
+            .documents()
+            .filter_map(|doc| {
+                let relative = doc.path()?.strip_prefix(old_path).ok()?;
+                if is_dir || relative.as_os_str().is_empty() {
+                    Some((doc.id(), new_path.join(relative)))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for (id, path) in moved_documents {
+            self.set_doc_path(id, &path);
         }
         let is_dir = new_path.is_dir();
         for ls in self.language_servers.iter_clients() {
@@ -1684,7 +1860,7 @@ impl Editor {
         Ok(())
     }
 
-    pub fn create_path(&mut self, path: &Path, is_dir: bool) -> io::Result<()> {
+    pub fn create_path(&mut self, path: &Path, is_dir: bool, overwrite: bool) -> io::Result<()> {
         let path = canonicalize(path);
         let language_servers: Vec<_> = self
             .language_servers
@@ -1716,7 +1892,12 @@ impl Editor {
         if is_dir {
             fs::create_dir(&path)?;
         } else {
-            fs::write(&path, [])?;
+            fs::OpenOptions::new()
+                .write(true)
+                .create(overwrite)
+                .create_new(!overwrite)
+                .truncate(overwrite)
+                .open(&path)?;
         }
 
         for ls in self.language_servers.iter_clients() {
@@ -1775,6 +1956,15 @@ impl Editor {
     }
 
     pub fn set_doc_path(&mut self, doc_id: DocumentId, path: &Path) {
+        self.set_doc_path_impl(doc_id, path, false);
+    }
+
+    /// Assign a successful save's destination without detaching other queued saves.
+    pub fn set_doc_path_after_save(&mut self, doc_id: DocumentId, path: &Path) {
+        self.set_doc_path_impl(doc_id, path, true);
+    }
+
+    fn set_doc_path_impl(&mut self, doc_id: DocumentId, path: &Path, after_save: bool) {
         let doc = doc_mut!(self, &doc_id);
         let old_path = doc.path();
 
@@ -1794,9 +1984,14 @@ impl Editor {
         // text_document_did_close. Since we called `text_document_did_close`
         // we have fully unregistered this document from its LS
         doc.language_servers.clear();
-        doc.set_path(Some(path));
+        if after_save {
+            doc.set_path_after_save(path);
+        } else {
+            doc.set_path(Some(path));
+        }
         doc.detect_editor_config();
-        self.refresh_doc_language(doc_id)
+        self.refresh_doc_language(doc_id);
+        self.request_vcs_refresh(doc_id);
     }
 
     pub fn refresh_doc_language(&mut self, doc_id: DocumentId) {
@@ -1821,6 +2016,8 @@ impl Editor {
         let Some(doc) = self.documents.get_mut(&doc_id) else {
             return;
         };
+        doc.color_swatch_controller.cancel();
+        doc.color_swatches = None;
         let Some(doc_url) = doc.url() else {
             return;
         };
@@ -1895,6 +2092,10 @@ impl Editor {
         }
 
         doc.language_servers = language_servers;
+        helix_event::send_blocking(
+            &self.handlers.document_colors,
+            crate::handlers::lsp::DocumentColorsEvent(doc_id, doc.version()),
+        );
     }
 
     fn _refresh(&mut self) {
@@ -2118,18 +2319,8 @@ impl Editor {
                 Editor::doc_diagnostics(&self.language_servers, &self.diagnostics, &doc);
             doc.replace_diagnostics(diagnostics, &[], None);
 
-            let trust_full = self
-                .workspace_trust
-                .query(doc.workspace_root(), TrustQuery::Git)
-                .is_trusted();
-            if let Some(diff_base) = self.diff_providers.get_diff_base(&path, trust_full) {
-                doc.set_diff_base(diff_base);
-            }
-            doc.set_version_control_head(
-                self.diff_providers.get_current_head_name(&path, trust_full),
-            );
-
             let id = self.new_document(doc);
+            self.request_vcs_refresh(id);
             self.launch_language_servers(id);
 
             helix_event::dispatch(DocumentDidOpen {
@@ -2143,6 +2334,76 @@ impl Editor {
         self.switch(id, action);
 
         Ok(id)
+    }
+
+    pub fn request_vcs_refresh(&mut self, document: DocumentId) {
+        let Some(doc) = self.documents.get_mut(&document) else {
+            return;
+        };
+        let Some(path) = doc.path().map(Path::to_owned) else {
+            return;
+        };
+        let encoding = doc.encoding();
+        let workspace = doc.workspace_root().to_owned();
+        let workspace_trust = self.workspace_trust.clone();
+        let cancel = doc.vcs_controller.restart();
+        let providers = self.diff_providers.clone();
+        self.vcs_tasks.push(tokio::spawn(async move {
+            // Renames and reload bursts replace their obsolete queued work
+            // before any repository discovery or filter process is started.
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            if cancel.is_canceled() {
+                return None;
+            }
+            let (diff_base, head, trust_full) = providers
+                .prepare_vcs_with(
+                    path.clone(),
+                    move || {
+                        workspace_trust
+                            .query(&workspace, TrustQuery::Git)
+                            .is_trusted()
+                    },
+                    cancel.clone(),
+                    move |prepared, cancel, trust_full| {
+                        let diff_base = prepared
+                            .diff_base
+                            .and_then(|bytes| Document::decode_diff_base(bytes, encoding, cancel));
+                        (diff_base, prepared.head, trust_full)
+                    },
+                )
+                .await?;
+            Some(PreparedDocumentVcs {
+                document,
+                path,
+                trust_full,
+                encoding,
+                cancel,
+                diff_base,
+                head,
+            })
+        }));
+    }
+
+    fn apply_prepared_vcs(&mut self, prepared: PreparedDocumentVcs) -> bool {
+        let Some(doc) = self.documents.get_mut(&prepared.document) else {
+            return false;
+        };
+        if prepared.cancel.is_canceled() || doc.path() != Some(prepared.path.as_path()) {
+            return false;
+        }
+        let trust_full = self
+            .workspace_trust
+            .query(doc.workspace_root(), TrustQuery::Git)
+            .is_trusted();
+        if prepared.trust_full != trust_full || !std::ptr::eq(prepared.encoding, doc.encoding()) {
+            self.request_vcs_refresh(prepared.document);
+            return false;
+        }
+        // Only the Git baseline was captured by the worker. The differ compares
+        // it against the current text, including edits made while loading.
+        doc.set_diff_base_rope(prepared.diff_base);
+        doc.set_version_control_head(prepared.head);
+        true
     }
 
     pub fn close(&mut self, id: ViewId) {
@@ -2480,11 +2741,30 @@ impl Editor {
                 Some(config_event) = self.config_events.1.recv() => {
                     return EditorEvent::ConfigEvent(config_event)
                 }
+                Some(result) = self.vcs_tasks.next() => {
+                    match result {
+                        Ok(Some(prepared)) => {
+                            if self.apply_prepared_vcs(prepared) {
+                                return EditorEvent::Redraw;
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(err) => log::error!("VCS preparation failed: {err}"),
+                    }
+                }
                 Some(message) = self.language_servers.incoming.next() => {
                     return EditorEvent::LanguageServerMessage(message)
                 }
                 Some(event) = self.debug_adapters.incoming.next() => {
                     return EditorEvent::DebuggerEvent(event)
+                }
+
+                Some(result) = self.dap_tasks.next() => {
+                    match result {
+                        Ok(Some(prepared)) => { if self.apply_prepared_dap(prepared) { return EditorEvent::Redraw; } },
+                        Ok(_) => {},
+                        Err(err) => log::error!("Debugger preparation failed: {err}"),
+                    }
                 }
 
                 _ = helix_event::redraw_requested() => {
@@ -2696,5 +2976,144 @@ impl CursorCache {
 
     pub fn reset(&self) {
         self.0.set(None)
+    }
+}
+
+#[cfg(test)]
+mod vcs_loading_tests {
+    use super::*;
+    use crate::handlers::{completion::CompletionHandler, word_index};
+    use helix_core::{encoding::UTF_8, Rope, Transaction};
+
+    fn editor() -> Editor {
+        fn sender<T>() -> tokio::sync::mpsc::Sender<T> {
+            tokio::sync::mpsc::channel(8).0
+        }
+        let handlers = Handlers {
+            completions: CompletionHandler::new(sender()),
+            signature_hints: sender(),
+            auto_save: sender(),
+            document_colors: sender(),
+            document_links: sender(),
+            word_index: word_index::Handler::spawn(),
+            pull_diagnostics: sender(),
+            pull_all_documents_diagnostics: sender(),
+            code_action_hint: sender(),
+        };
+        Editor::new(
+            Rect::new(0, 0, 80, 24),
+            Arc::new(theme::Loader::new(&[])),
+            Arc::new(ArcSwap::from_pointee(syntax::Loader::default())),
+            Arc::new(ArcSwap::from_pointee(Config {
+                editor_config: false,
+                ..Config::default()
+            })),
+            handlers,
+            WorkspaceTrust::fully_trusted(),
+        )
+    }
+
+    fn document(editor: &mut Editor, path: &Path) -> DocumentId {
+        let mut doc = Document::from(
+            Rope::from_str("committed\n"),
+            None,
+            editor.config.clone(),
+            editor.syn_loader.clone(),
+        );
+        doc.set_path(Some(path));
+        editor.new_document(doc)
+    }
+
+    fn prepared(editor: &mut Editor, document: DocumentId) -> PreparedDocumentVcs {
+        let doc = editor.documents.get_mut(&document).unwrap();
+        PreparedDocumentVcs {
+            document,
+            path: doc.path().unwrap().to_owned(),
+            trust_full: true,
+            encoding: UTF_8,
+            cancel: doc.vcs_controller.restart(),
+            diff_base: Some(Rope::from_str("committed\n")),
+            head: Some(Arc::new(ArcSwap::from_pointee("main".into()))),
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_vcs_rejects_closed_renamed_and_replaced_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut editor = editor();
+        let id = document(&mut editor, &dir.path().join("file.txt"));
+        let older = prepared(&mut editor, id);
+        let current = prepared(&mut editor, id);
+        assert!(!editor.apply_prepared_vcs(older));
+        assert!(editor.documents[&id].version_control_head().is_none());
+        assert!(editor.apply_prepared_vcs(current));
+
+        let old_path = prepared(&mut editor, id);
+        editor
+            .documents
+            .get_mut(&id)
+            .unwrap()
+            .set_path(Some(&dir.path().join("renamed.txt")));
+        assert!(!editor.apply_prepared_vcs(old_path));
+        assert!(editor.documents[&id].version_control_head().is_none());
+        assert!(editor.documents[&id].diff_handle().is_none());
+
+        let closed = prepared(&mut editor, id);
+        editor.documents.remove(&id);
+        assert!(!editor.apply_prepared_vcs(closed));
+    }
+
+    #[tokio::test]
+    async fn prepared_vcs_rechecks_trust_and_encoding_before_applying() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut editor = editor();
+        let id = document(&mut editor, &dir.path().join("file.txt"));
+        let result = prepared(&mut editor, id);
+        editor.workspace_trust = WorkspaceTrust::new(Default::default());
+        assert!(!editor.apply_prepared_vcs(result));
+        assert!(editor.documents[&id].version_control_head().is_none());
+
+        editor.workspace_trust = WorkspaceTrust::fully_trusted();
+        let result = prepared(&mut editor, id);
+        editor
+            .documents
+            .get_mut(&id)
+            .unwrap()
+            .set_encoding("windows-1252")
+            .unwrap();
+        assert!(!editor.apply_prepared_vcs(result));
+        assert!(editor.documents[&id].version_control_head().is_none());
+    }
+
+    #[tokio::test]
+    async fn prepared_git_baseline_compares_against_edits_made_during_loading() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut editor = editor();
+        let id = document(&mut editor, &dir.path().join("file.txt"));
+        let result = prepared(&mut editor, id);
+        let doc = editor.documents.get_mut(&id).unwrap();
+        let view = ViewId::default();
+        doc.ensure_view_init(view);
+        let transaction =
+            Transaction::change(doc.text(), [(0, 9, Some("edited".into()))].into_iter());
+        assert!(doc.apply(&transaction, view));
+        assert!(editor.apply_prepared_vcs(result));
+        assert_eq!(editor.documents[&id].text().to_string(), "edited\n");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let ready = {
+                    let diff = editor.documents[&id].diff_handle().unwrap().load();
+                    diff.diff_base() == "committed\n"
+                        && diff.doc() == "edited\n"
+                        && !diff.is_empty()
+                };
+                if ready {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
     }
 }

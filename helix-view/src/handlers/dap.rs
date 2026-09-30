@@ -1,11 +1,11 @@
-use crate::editor::{Action, Breakpoint};
+use crate::editor::{Action, Breakpoint, TerminalConfig};
 use crate::{align_view, Align, Editor};
 use anyhow::bail;
 use dap::requests::DisconnectArguments;
 use dap::requests::ThreadsArguments;
 use helix_core::Selection;
 use helix_dap::{
-    self as dap, registry::DebugAdapterId, Client, ConnectionType, Payload, Request, ThreadId,
+    self as dap, registry::DebugAdapterId, ConnectionType, Payload, Request, ThreadId,
 };
 use helix_lsp::block_on;
 use log::{error, warn};
@@ -32,29 +32,40 @@ pub fn dap_pos_to_pos(doc: &helix_core::Rope, line: usize, column: usize) -> Opt
     Some(pos)
 }
 
-pub async fn select_thread_id(editor: &mut Editor, thread_id: ThreadId, force: bool) {
+pub fn select_thread_id(editor: &mut Editor, thread_id: ThreadId, force: bool) {
     let debugger = debugger!(editor);
-
     if !force && debugger.thread_id.is_some() {
         return;
     }
-
-    debugger.thread_id = Some(thread_id);
-    fetch_stack_trace(debugger, thread_id).await;
-
-    let frame = debugger.stack_frames[&thread_id].first().cloned();
-    if let Some(frame) = &frame {
-        jump_to_stack_frame(editor, frame);
+    let id = debugger.id();
+    debugger.select_thread(thread_id);
+    if let Some(frame) = debugger
+        .stack_frames
+        .get(&thread_id)
+        .and_then(|frames| frames.first())
+        .cloned()
+    {
+        debugger.select_frame(0);
+        jump_to_stack_frame(editor, &frame);
+    } else {
+        editor.request_stack_trace(id, thread_id);
     }
 }
 
-pub async fn fetch_stack_trace(debugger: &mut Client, thread_id: ThreadId) {
-    let (frames, _) = match debugger.stack_trace(thread_id).await {
-        Ok(frames) => frames,
-        Err(_) => return,
-    };
-    debugger.stack_frames.insert(thread_id, frames);
-    debugger.active_frame = Some(0);
+pub(crate) enum PreparedDap {
+    Stack {
+        id: DebugAdapterId,
+        thread: ThreadId,
+        request: u64,
+        guard: dap::RequestGuard,
+        frames: dap::Result<dap::requests::StackTraceResponse>,
+    },
+    Threads {
+        id: DebugAdapterId,
+        guard: dap::RequestGuard,
+        reason: String,
+        threads: dap::Result<dap::requests::ThreadsResponse>,
+    },
 }
 
 pub fn jump_to_stack_frame(editor: &mut Editor, frame: &helix_dap::StackFrame) {
@@ -143,7 +154,122 @@ pub fn breakpoints_changed(
     Ok(())
 }
 
+fn run_in_terminal(
+    terminal: Option<&TerminalConfig>,
+    arguments: &dap::requests::RunInTerminalArguments,
+) -> dap::Result<dap::requests::RunInTerminalResponse> {
+    let terminal = terminal
+        .ok_or_else(|| dap::Error::Other(anyhow::anyhow!("No external terminal defined")))?;
+    let process = std::process::Command::new(&terminal.command)
+        .args(&terminal.args)
+        .args(&arguments.args)
+        .spawn()
+        .map_err(|err| {
+            dap::Error::Other(anyhow::anyhow!("Error starting external terminal: {err}"))
+        })?;
+
+    Ok(dap::requests::RunInTerminalResponse {
+        process_id: Some(process.id()),
+        shell_process_id: None,
+    })
+}
+
 impl Editor {
+    fn request_stack_trace(&mut self, id: DebugAdapterId, thread: ThreadId) {
+        let Some(debugger) = self.debug_adapters.get_client_mut(id) else {
+            return;
+        };
+        let Some((requester, guard, request)) = debugger.begin_stack_trace(thread) else {
+            return;
+        };
+        self.dap_tasks.push(tokio::spawn(async move {
+            let frames = requester.stack_trace(thread, &guard).await?;
+            Some(PreparedDap::Stack {
+                id,
+                thread,
+                request,
+                guard,
+                frames,
+            })
+        }));
+    }
+
+    pub(crate) fn apply_prepared_dap(&mut self, prepared: PreparedDap) -> bool {
+        match prepared {
+            PreparedDap::Stack {
+                id,
+                thread,
+                request,
+                guard,
+                frames,
+            } => {
+                if !guard.is_current() {
+                    return false;
+                }
+                let active = self
+                    .debug_adapters
+                    .get_active_client()
+                    .is_some_and(|client| client.id() == id);
+                let Some(debugger) = self.debug_adapters.get_client_mut(id) else {
+                    return false;
+                };
+                if !debugger.finish_stack_trace(thread, request) {
+                    return false;
+                }
+                let frames = match frames {
+                    Ok(response) => response.stack_frames,
+                    Err(err) => {
+                        self.set_error(format!("Failed to get stack frames: {err}"));
+                        return true;
+                    }
+                };
+                let selected =
+                    debugger.thread_id == Some(thread) && debugger.active_frame.is_none();
+                let frame = selected.then(|| frames.first().cloned()).flatten();
+                debugger.stack_frames.insert(thread, frames);
+                if selected {
+                    debugger.select_frame(0);
+                }
+                if let Some(frame) = frame.filter(|_| active) {
+                    jump_to_stack_frame(self, &frame);
+                }
+            }
+            PreparedDap::Threads {
+                id,
+                guard,
+                reason,
+                threads,
+            } => {
+                if !guard.is_current() {
+                    return false;
+                }
+                let active = self
+                    .debug_adapters
+                    .get_active_client()
+                    .is_some_and(|client| client.id() == id);
+                let Some(debugger) = self.debug_adapters.get_client_mut(id) else {
+                    return false;
+                };
+                let threads = match threads {
+                    Ok(response) => response.threads,
+                    Err(err) => {
+                        self.set_error(format!("Failed to get threads: {err}"));
+                        return true;
+                    }
+                };
+                for thread in &threads {
+                    debugger.thread_states.insert(thread.id, reason.clone());
+                }
+                if active && debugger.thread_id.is_none() {
+                    if let Some(thread) = threads.first() {
+                        select_thread_id(self, thread.id, false);
+                    }
+                }
+            }
+        }
+        true
+    }
+
     pub async fn handle_debugger_message(
         &mut self,
         id: DebugAdapterId,
@@ -180,22 +306,35 @@ impl Editor {
 
                         let all_threads_stopped = all_threads_stopped.unwrap_or_default();
 
-                        if all_threads_stopped {
-                            if let Ok(response) = debugger
-                                .request::<dap::requests::Threads>(Some(ThreadsArguments {}))
-                                .await
-                            {
-                                for thread in response.threads {
-                                    fetch_stack_trace(debugger, thread.id).await;
-                                }
-                                select_thread_id(self, thread_id.unwrap_or_default(), false).await;
-                            }
-                        } else if let Some(thread_id) = thread_id {
-                            debugger.thread_states.insert(thread_id, reason.clone()); // TODO: dap uses "type" || "reason" here
-
-                            fetch_stack_trace(debugger, thread_id).await;
-                            // whichever thread stops is made "current" (if no previously selected thread).
-                            select_thread_id(self, thread_id, false).await;
+                        let selected = if debugger.is_resuming() {
+                            thread_id.or(debugger.thread_id)
+                        } else {
+                            debugger.thread_id.or(thread_id)
+                        };
+                        debugger.begin_stop();
+                        if let Some(thread) = thread_id {
+                            debugger.thread_states.insert(thread, reason.clone());
+                        }
+                        if let Some(thread) = selected {
+                            debugger.select_thread(thread);
+                        }
+                        // Fetch the selected stack first; other stacks are loaded on demand
+                        // when switching threads rather than delaying the stop event.
+                        let threads_request = all_threads_stopped
+                            .then(|| (debugger.requester(), debugger.stop_guard()));
+                        if let Some(thread) = selected {
+                            self.request_stack_trace(id, thread);
+                        }
+                        if let Some((requester, guard)) = threads_request {
+                            let reason = reason.clone();
+                            self.dap_tasks.push(tokio::spawn(async move {
+                                let threads = tokio::select! {
+                                    biased;
+                                    _ = guard.canceled() => return None,
+                                    result = requester.request::<dap::requests::Threads>(Some(ThreadsArguments {})) => result,
+                                };
+                                Some(PreparedDap::Threads { id, guard, reason, threads })
+                            }));
                         }
 
                         let scope = match thread_id {
@@ -216,7 +355,10 @@ impl Editor {
 
                         self.set_status(status);
                     }
-                    Event::Continued(events::ContinuedBody { thread_id, .. }) => {
+                    Event::Continued(events::ContinuedBody {
+                        thread_id,
+                        all_threads_continued,
+                    }) => {
                         let debugger = match self.debug_adapters.get_client_mut(id) {
                             Some(debugger) => debugger,
                             None => return false,
@@ -225,7 +367,10 @@ impl Editor {
                         debugger
                             .thread_states
                             .insert(thread_id, "running".to_owned());
-                        if debugger.thread_id == Some(thread_id) {
+                        debugger.invalidate_thread_stack(thread_id);
+                        if all_threads_continued.unwrap_or(true)
+                            || debugger.thread_id == Some(thread_id)
+                        {
                             debugger.resume_application();
                         }
                     }
@@ -236,8 +381,12 @@ impl Editor {
                             None => return false,
                         };
 
-                        debugger.thread_id = Some(thread.thread_id);
-                        // set the stack frame for the thread
+                        if thread.reason == "exited" {
+                            debugger.invalidate_thread_stack(thread.thread_id);
+                            if debugger.thread_id == Some(thread.thread_id) {
+                                debugger.resume_application();
+                            }
+                        }
                     }
                     Event::Breakpoint(events::BreakpointBody { reason, breakpoint }) => {
                         match &reason[..] {
@@ -467,6 +616,9 @@ impl Editor {
                         }
                     }
                     Event::Exited(resp) => {
+                        if let Some(debugger) = self.debug_adapters.get_client_mut(id) {
+                            debugger.resume_application();
+                        }
                         let exit_code = resp.exit_code;
                         if exit_code != 0 {
                             self.set_error(format!(
@@ -484,31 +636,11 @@ impl Editor {
             Payload::Request(request) => {
                 let reply = match Request::parse(&request.command, request.arguments) {
                     Ok(Request::RunInTerminal(arguments)) => {
-                        let config = self.config();
-                        let Some(config) = config.terminal.as_ref() else {
-                            self.set_error("No external terminal defined");
-                            return true;
-                        };
-
-                        let process = match std::process::Command::new(&config.command)
-                            .args(&config.args)
-                            .args(&arguments.args)
-                            .spawn()
-                        {
-                            Ok(process) => process,
-                            Err(err) => {
-                                self.set_error(format!(
-                                    "Error starting external terminal: {}",
-                                    err
-                                ));
-                                return true;
-                            }
-                        };
-
-                        Ok(json!(dap::requests::RunInTerminalResponse {
-                            process_id: Some(process.id()),
-                            shell_process_id: None,
-                        }))
+                        let reply = run_in_terminal(self.config().terminal.as_ref(), &arguments);
+                        if let Err(err) = &reply {
+                            self.set_error(err.to_string());
+                        }
+                        reply.map(|response| json!(response))
                     }
                     Ok(Request::StartDebugging(arguments)) => {
                         let debugger = match self.debug_adapters.get_client_mut(id) {
@@ -535,7 +667,12 @@ impl Editor {
                             }
                         };
 
-                        let result = self.debug_adapters.start_client(Some(socket), &config);
+                        let supports_run_in_terminal = self.config().terminal.is_some();
+                        let result = self.debug_adapters.start_client(
+                            Some(socket),
+                            &config,
+                            supports_run_in_terminal,
+                        );
 
                         let client_id = match result {
                             Ok(child) => child,
@@ -582,5 +719,49 @@ impl Editor {
             }
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn terminal_arguments() -> dap::requests::RunInTerminalArguments {
+        dap::requests::RunInTerminalArguments {
+            kind: Some("external".into()),
+            title: None,
+            cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+            args: vec!["debuggee".into()],
+            env: None,
+        }
+    }
+
+    #[test]
+    fn missing_terminal_returns_an_error_for_the_adapter() {
+        let result = run_in_terminal(None, &terminal_arguments());
+
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "No external terminal defined"
+        );
+    }
+
+    #[test]
+    fn terminal_spawn_failure_returns_an_error_for_the_adapter() {
+        let directory = tempfile::tempdir().unwrap();
+        let terminal = TerminalConfig {
+            command: directory
+                .path()
+                .join("missing-terminal")
+                .to_string_lossy()
+                .into_owned(),
+            args: Vec::new(),
+        };
+        let result = run_in_terminal(Some(&terminal), &terminal_arguments());
+
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .starts_with("Error starting external terminal:"));
     }
 }

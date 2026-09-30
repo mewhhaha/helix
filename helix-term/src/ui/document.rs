@@ -3,7 +3,7 @@ use std::cmp::min;
 use helix_core::doc_formatter::{DocumentFormatter, FormattedGrapheme, GraphemeSource, TextFormat};
 use helix_core::graphemes::Grapheme;
 use helix_core::str_utils::char_to_byte_idx;
-use helix_core::syntax::{self, HighlightEvent, Highlighter, OverlayHighlights};
+use helix_core::syntax::{self, DisplayHighlighter, HighlightEvent, OverlayHighlights};
 use helix_core::text_annotations::TextAnnotations;
 use helix_core::{visual_offset_from_block, Position, RopeSlice};
 use helix_stdx::rope::RopeSliceExt;
@@ -34,7 +34,7 @@ pub fn render_document(
     doc: &Document,
     offset: ViewPosition,
     doc_annotations: &TextAnnotations,
-    syntax_highlighter: Option<Highlighter<'_>>,
+    syntax_highlighter: Option<DisplayHighlighter<'_>>,
     overlay_highlights: Vec<syntax::OverlayHighlights>,
     theme: &Theme,
     decorations: DecorationManager,
@@ -66,7 +66,7 @@ pub fn render_text(
     anchor: usize,
     text_fmt: &TextFormat,
     text_annotations: &TextAnnotations,
-    syntax_highlighter: Option<Highlighter<'_>>,
+    syntax_highlighter: Option<DisplayHighlighter<'_>>,
     overlay_highlights: Vec<syntax::OverlayHighlights>,
     theme: &Theme,
     mut decorations: DecorationManager,
@@ -75,8 +75,20 @@ pub fn render_text(
         .0
         .row;
 
-    let mut formatter =
-        DocumentFormatter::new_at_prev_checkpoint(text, text_fmt, text_annotations, anchor);
+    let mut formatter = DocumentFormatter::new_at_visual_checkpoint(
+        text,
+        text_fmt,
+        text_annotations,
+        anchor,
+        Position::new(
+            row_off,
+            if text_fmt.soft_wrap {
+                0
+            } else {
+                renderer.offset.col
+            },
+        ),
+    );
     let mut syntax_highlighter =
         SyntaxHighlighter::new(syntax_highlighter, text, theme, renderer.text_style);
     let mut overlay_highlighter = OverlayHighlighter::new(overlay_highlights, theme);
@@ -87,9 +99,15 @@ pub fn render_text(
         visual_line: u16::MAX,
     };
     let mut last_line_end = 0;
-    let mut is_in_indent_area = true;
-    let mut last_line_indent_level = 0;
+    let resumed_indent = if text_fmt.soft_wrap {
+        None
+    } else {
+        formatter.rendered_indent()
+    };
+    let mut is_in_indent_area = resumed_indent.is_none();
+    let mut last_line_indent_level = resumed_indent.unwrap_or(0);
     let mut reached_view_top = false;
+    let mut tail_checked_line = usize::MAX;
 
     loop {
         let Some(mut grapheme) = formatter.next() else {
@@ -132,8 +150,8 @@ pub fn render_text(
         }
 
         // acquire the correct grapheme style
-        while grapheme.char_idx >= syntax_highlighter.pos {
-            syntax_highlighter.advance();
+        if grapheme.char_idx >= syntax_highlighter.pos {
+            syntax_highlighter.seek_to(grapheme.char_idx);
         }
         while grapheme.char_idx >= overlay_highlighter.pos {
             overlay_highlighter.advance();
@@ -166,6 +184,24 @@ pub fn render_text(
             grapheme.visual_pos,
         );
         last_line_end = grapheme.visual_pos.col + grapheme_width;
+        if !text_fmt.soft_wrap
+            && tail_checked_line != grapheme.line_idx
+            && grapheme.visual_pos.col >= renderer.offset.col + renderer.viewport.width as usize
+            && grapheme.raw != Grapheme::Newline
+        {
+            tail_checked_line = grapheme.line_idx;
+            if let Some(end) = formatter.cached_line_end() {
+                let callback_end = end.char_idx + usize::from(end.includes_eof);
+                if decorations.can_skip_graphemes_until(callback_end)
+                    && formatter.skip_to_line_end()
+                {
+                    last_line_end = end.width;
+                    if let Some(indent) = end.indent_level {
+                        last_line_indent_level = indent;
+                    }
+                }
+            }
+        }
     }
 
     renderer.draw_indent_guides(last_line_indent_level, last_line_pos.visual_line);
@@ -280,7 +316,11 @@ impl<'a> TextRenderer<'a> {
         col: u16,
     ) -> bool {
         if (row as usize) < self.offset.row
-            || row >= self.viewport.height
+            || row as usize
+                >= self
+                    .offset
+                    .row
+                    .saturating_add(self.viewport.height as usize)
             || col >= self.viewport.width
         {
             return false;
@@ -480,7 +520,7 @@ impl<'a> TextRenderer<'a> {
 }
 
 struct SyntaxHighlighter<'h, 'r, 't> {
-    inner: Option<Highlighter<'h>>,
+    inner: Option<DisplayHighlighter<'h>>,
     text: RopeSlice<'r>,
     /// The character index of the next highlight event, or `usize::MAX` if the highlighter is
     /// finished.
@@ -492,7 +532,7 @@ struct SyntaxHighlighter<'h, 'r, 't> {
 
 impl<'h, 'r, 't> SyntaxHighlighter<'h, 'r, 't> {
     fn new(
-        inner: Option<Highlighter<'h>>,
+        inner: Option<DisplayHighlighter<'h>>,
         text: RopeSlice<'r>,
         theme: &'t Theme,
         text_style: Style,
@@ -525,20 +565,18 @@ impl<'h, 'r, 't> SyntaxHighlighter<'h, 'r, 't> {
             .unwrap_or(usize::MAX);
     }
 
-    fn advance(&mut self) {
+    fn seek_to(&mut self, char_idx: usize) {
         let Some(highlighter) = self.inner.as_mut() else {
             return;
         };
 
-        let (event, highlights) = highlighter.advance();
-        let base = match event {
-            HighlightEvent::Refresh => self.text_style,
-            HighlightEvent::Push => self.style,
-        };
-
-        self.style = highlights.fold(base, |acc, highlight| {
-            acc.patch(self.theme.highlight(highlight))
-        });
+        let highlights = highlighter.seek_to(self.text.char_to_byte(char_idx) as u32);
+        self.style = highlights
+            .iter()
+            .copied()
+            .fold(self.text_style, |acc, highlight| {
+                acc.patch(self.theme.highlight(highlight))
+            });
         self.update_pos();
     }
 }
@@ -578,5 +616,155 @@ impl<'t> OverlayHighlighter<'t> {
             acc.patch(self.theme.highlight(highlight))
         });
         self.update_pos();
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use arc_swap::ArcSwap;
+    use helix_core::doc_formatter::FormatterCache;
+    use helix_core::text_annotations::InlineAnnotation;
+    use helix_core::Rope;
+    use helix_view::editor::Config;
+    use std::{cell::Cell, rc::Rc, sync::Arc};
+
+    fn document(text: Rope) -> Document {
+        let mut config = Config::default();
+        config.indent_guides.render = true;
+        Document::from(
+            text,
+            None,
+            Arc::new(ArcSwap::from_pointee(config)),
+            Arc::new(ArcSwap::from_pointee(syntax::Loader::default())),
+        )
+    }
+
+    fn render(
+        doc: &Document,
+        format: &TextFormat,
+        annotations: &TextAnnotations,
+        anchor: usize,
+        offset: Position,
+        decorations: DecorationManager,
+    ) -> Surface {
+        let viewport = Rect::new(0, 0, 80, 4);
+        let mut surface = Surface::empty(viewport);
+        let theme = Theme::default();
+        let mut renderer = TextRenderer::new(&mut surface, doc, &theme, offset, viewport);
+        render_text(
+            &mut renderer,
+            doc.text().slice(..),
+            anchor,
+            format,
+            annotations,
+            None,
+            Vec::new(),
+            &theme,
+            decorations,
+        );
+        surface
+    }
+
+    #[test]
+    fn warm_checkpoints_preserve_rendered_tabs_indent_guides_and_inline_rows() {
+        let doc = document(Rope::from_str(&format!(
+            "{}{}\n{}\nend",
+            "\t ".repeat(700),
+            "界e\u{301}\tword ".repeat(800),
+            "next ".repeat(700)
+        )));
+        let inline = [InlineAnnotation::new(3000, "\nvisible virtual text\n")];
+        let mut annotations = TextAnnotations::default();
+        annotations.add_inline_annotations(&inline, None);
+        for wrapped in [false, true] {
+            let plain = TextFormat {
+                soft_wrap: wrapped,
+                viewport_width: 80,
+                ..TextFormat::default()
+            };
+            let mut cached = plain.clone();
+            cached.checkpoint_cache = Some(Arc::new(FormatterCache::default()));
+            DocumentFormatter::new_at_prev_checkpoint(
+                doc.text().slice(..),
+                &cached,
+                &annotations,
+                0,
+            )
+            .for_each(drop);
+            for (anchor, offset) in [
+                (0, Position::new(0, 0)),
+                (0, Position::new(0, if wrapped { 0 } else { 4190 })),
+                (5000, Position::new(1, 0)),
+            ] {
+                assert_eq!(
+                    render(
+                        &doc,
+                        &cached,
+                        &annotations,
+                        anchor,
+                        offset,
+                        DecorationManager::default()
+                    ),
+                    render(
+                        &doc,
+                        &plain,
+                        &annotations,
+                        anchor,
+                        offset,
+                        DecorationManager::default()
+                    ),
+                    "wrapped={wrapped}, anchor={anchor}, offset={offset:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cached_tail_keeps_pending_decoration_at_synthetic_eof() {
+        struct AtEof {
+            anchor: usize,
+            calls: Rc<Cell<usize>>,
+        }
+        impl crate::ui::text_decorations::Decoration for AtEof {
+            fn reset_pos(&mut self, pos: usize) -> usize {
+                if pos <= self.anchor {
+                    self.anchor
+                } else {
+                    usize::MAX
+                }
+            }
+            fn decorate_grapheme(
+                &mut self,
+                _renderer: &mut TextRenderer,
+                _grapheme: &FormattedGrapheme,
+            ) -> usize {
+                self.calls.set(self.calls.get() + 1);
+                usize::MAX
+            }
+        }
+        let doc = document(Rope::from_str(&"x".repeat(5000)));
+        let annotations = TextAnnotations::default();
+        let format = TextFormat {
+            checkpoint_cache: Some(Arc::new(FormatterCache::default())),
+            ..TextFormat::default()
+        };
+        DocumentFormatter::new_at_prev_checkpoint(doc.text().slice(..), &format, &annotations, 0)
+            .for_each(drop);
+        let calls = Rc::new(Cell::new(0));
+        let mut decorations = DecorationManager::default();
+        decorations.add_decoration(AtEof {
+            anchor: doc.text().len_chars(),
+            calls: calls.clone(),
+        });
+        render(
+            &doc,
+            &format,
+            &annotations,
+            0,
+            Position::default(),
+            decorations,
+        );
+        assert_eq!(calls.get(), 1);
     }
 }

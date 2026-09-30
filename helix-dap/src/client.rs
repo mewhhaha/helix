@@ -7,6 +7,7 @@ use crate::{
 use helix_core::syntax::config::{DebugAdapterConfig, DebuggerQuirks};
 use helix_dap_types::*;
 
+use futures_util::StreamExt;
 use serde_json::Value;
 
 use anyhow::anyhow;
@@ -16,7 +17,10 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
     process::Stdio,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
 use tokio::{
     io::{AsyncBufRead, AsyncWrite, BufReader, BufWriter},
@@ -26,12 +30,133 @@ use tokio::{
     time,
 };
 
+#[derive(Debug, Default)]
+struct RequestEpoch {
+    generation: AtomicU64,
+    changed: tokio::sync::Notify,
+}
+
+/// A result may update debugger UI only while its captured state is current.
+#[derive(Clone, Debug)]
+pub struct RequestGuard {
+    epoch: Arc<RequestEpoch>,
+    generation: u64,
+}
+
+impl RequestGuard {
+    pub fn is_current(&self) -> bool {
+        self.epoch.generation.load(Ordering::Relaxed) == self.generation
+    }
+
+    pub async fn canceled(&self) {
+        loop {
+            let changed = self.epoch.changed.notified();
+            if !self.is_current() {
+                return;
+            }
+            changed.await;
+        }
+    }
+}
+
+impl RequestEpoch {
+    fn invalidate(&self) {
+        self.generation.fetch_add(1, Ordering::Relaxed);
+        self.changed.notify_waiters();
+    }
+    fn guard(self: &Arc<Self>) -> RequestGuard {
+        RequestGuard {
+            epoch: self.clone(),
+            generation: self.generation.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Owned request sender for background workflows without borrowing the editor.
+#[derive(Clone, Debug)]
+pub struct Requester {
+    server_tx: UnboundedSender<Payload>,
+    request_counter: Arc<AtomicU64>,
+}
+
+impl Requester {
+    pub async fn request<R: helix_dap_types::Request>(
+        &self,
+        params: R::Arguments,
+    ) -> Result<R::Result>
+    where
+        R::Arguments: serde::Serialize,
+    {
+        let id = self.request_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        let json = call::<R>(self.server_tx.clone(), id, params).await?;
+        Ok(serde_json::from_value(json)?)
+    }
+    pub async fn stack_trace(
+        &self,
+        thread: ThreadId,
+        guard: &RequestGuard,
+    ) -> Option<Result<requests::StackTraceResponse>> {
+        tokio::select! {
+            biased;
+            _ = guard.canceled() => None,
+            result = self.request::<requests::StackTrace>(requests::StackTraceArguments {
+                thread_id: thread, start_frame: None, levels: None, format: None,
+            }) => Some(result),
+        }
+    }
+
+    pub async fn variables_for_frame(
+        &self,
+        frame: usize,
+        stop: &RequestGuard,
+        selection: &RequestGuard,
+        variables: &RequestGuard,
+    ) -> Option<Result<Vec<(Scope, Result<requests::VariablesResponse>)>>> {
+        let load = async {
+            let scopes = self
+                .request::<requests::Scopes>(requests::ScopesArguments { frame_id: frame })
+                .await?
+                .scopes;
+            Ok(
+                futures_util::stream::iter(scopes.into_iter().map(|scope| async move {
+                    let response = self
+                        .request::<requests::Variables>(requests::VariablesArguments {
+                            variables_reference: scope.variables_reference,
+                            filter: None,
+                            start: None,
+                            count: None,
+                            format: None,
+                        })
+                        .await;
+                    (scope, response)
+                }))
+                .buffered(4)
+                .collect()
+                .await,
+            )
+        };
+        tokio::select! {
+            biased;
+            _ = stop.canceled() => None,
+            _ = selection.canceled() => None,
+            _ = variables.canceled() => None,
+            result = load => Some(result),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Client {
     id: DebugAdapterId,
     _process: Option<Child>,
     server_tx: UnboundedSender<Payload>,
-    request_counter: AtomicU64,
+    request_counter: Arc<AtomicU64>,
+    stop_epoch: Arc<RequestEpoch>,
+    selection_epoch: Arc<RequestEpoch>,
+    variables_epoch: Arc<RequestEpoch>,
+    resume_pending: bool,
+    stack_request_counter: u64,
+    pending_stack_traces: HashMap<ThreadId, u64>,
     connection_type: Option<ConnectionType>,
     starting_request_args: Option<Value>,
     /// The socket address of the debugger, if using TCP transport.
@@ -47,6 +172,55 @@ pub struct Client {
     pub quirks: DebuggerQuirks,
     /// The config which was used to start this debugger.
     pub config: Option<DebugAdapterConfig>,
+}
+
+async fn call<R: helix_dap_types::Request>(
+    server_tx: UnboundedSender<Payload>,
+    id: u64,
+    arguments: R::Arguments,
+) -> Result<Value>
+where
+    R::Arguments: serde::Serialize,
+{
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    let arguments = Some(serde_json::to_value(arguments)?);
+
+    let (callback_tx, mut callback_rx) = channel(1);
+
+    let req = Request {
+        back_ch: Some(callback_tx),
+        seq: id,
+        command: R::COMMAND.to_string(),
+        arguments,
+    };
+
+    server_tx
+        .send(Payload::Request(req))
+        .map_err(|e| Error::Other(e.into()))?;
+
+    // TODO: specifiable timeout, delay other calls until initialize success
+    let response = timeout(Duration::from_secs(20), callback_rx.recv())
+        .await
+        .map_err(|_| Error::Timeout(id))? // return Timeout
+        .ok_or(Error::StreamClosed)??;
+
+    if !response.success {
+        let message = response
+            .message
+            .clone()
+            .unwrap_or_else(|| "DAP request failed".to_string());
+        return Err(Error::Other(anyhow!(message)));
+    }
+
+    Ok(response.body.unwrap_or_default())
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        self.invalidate_stop_requests();
+    }
 }
 
 impl Client {
@@ -83,7 +257,13 @@ impl Client {
             id,
             _process: process,
             server_tx,
-            request_counter: AtomicU64::new(0),
+            request_counter: Arc::new(AtomicU64::new(0)),
+            stop_epoch: Arc::default(),
+            selection_epoch: Arc::default(),
+            variables_epoch: Arc::default(),
+            resume_pending: false,
+            stack_request_counter: 0,
+            pending_stack_traces: HashMap::new(),
             caps: None,
             connection_type: None,
             starting_request_args: None,
@@ -240,11 +420,91 @@ impl Client {
         self.request_counter.fetch_add(1, Ordering::Relaxed) + 1
     }
 
+    pub fn requester(&self) -> Requester {
+        Requester {
+            server_tx: self.server_tx.clone(),
+            request_counter: self.request_counter.clone(),
+        }
+    }
+    pub fn begin_stack_trace(
+        &mut self,
+        thread: ThreadId,
+    ) -> Option<(Requester, RequestGuard, u64)> {
+        if self.stack_frames.contains_key(&thread)
+            || self.pending_stack_traces.contains_key(&thread)
+        {
+            return None;
+        }
+        self.stack_request_counter += 1;
+        let request = self.stack_request_counter;
+        self.pending_stack_traces.insert(thread, request);
+        Some((self.requester(), self.stop_guard(), request))
+    }
+    pub fn finish_stack_trace(&mut self, thread: ThreadId, request: u64) -> bool {
+        if self.pending_stack_traces.get(&thread) != Some(&request) {
+            return false;
+        }
+        self.pending_stack_traces.remove(&thread);
+        true
+    }
+    pub fn invalidate_thread_stack(&mut self, thread: ThreadId) {
+        self.stack_frames.remove(&thread);
+        self.pending_stack_traces.remove(&thread);
+    }
+    pub fn stop_guard(&self) -> RequestGuard {
+        self.stop_epoch.guard()
+    }
+    pub fn selection_guard(&self) -> RequestGuard {
+        self.selection_epoch.guard()
+    }
+    pub fn variables_guard(&mut self) -> RequestGuard {
+        self.variables_epoch.invalidate();
+        self.variables_epoch.guard()
+    }
+    pub fn is_resuming(&self) -> bool {
+        self.resume_pending
+    }
+    pub fn begin_resume(&mut self) {
+        self.invalidate_stop_requests();
+        self.resume_pending = true;
+    }
+    pub fn cancel_resume(&mut self) {
+        self.resume_pending = false;
+    }
+    pub fn invalidate_stop_requests(&mut self) {
+        self.resume_pending = false;
+        self.stop_epoch.invalidate();
+        self.selection_epoch.invalidate();
+        self.variables_epoch.invalidate();
+        self.pending_stack_traces.clear();
+    }
+    pub fn begin_stop(&mut self) {
+        self.invalidate_stop_requests();
+        self.stack_frames.clear();
+        self.active_frame = None;
+    }
+    pub fn invalidate_selection_requests(&mut self) {
+        self.selection_epoch.invalidate();
+        self.variables_epoch.invalidate();
+    }
+    pub fn select_thread(&mut self, id: ThreadId) {
+        self.invalidate_selection_requests();
+        self.thread_id = Some(id);
+        self.active_frame = None;
+    }
+    pub fn select_frame(&mut self, frame: usize) {
+        self.invalidate_selection_requests();
+        self.active_frame = Some(frame);
+    }
+
     // Internal, called by specific DAP commands when resuming
     pub fn resume_application(&mut self) {
+        self.invalidate_stop_requests();
+        // A continue may resume every thread. Results from the previous stop
+        // must not be reused when selecting another thread afterward.
+        self.stack_frames.clear();
         if let Some(thread_id) = self.thread_id {
             self.thread_states.insert(thread_id, "running".to_string());
-            self.stack_frames.remove(&thread_id);
         }
         self.active_frame = None;
         self.thread_id = None;
@@ -258,44 +518,7 @@ impl Client {
     where
         R::Arguments: serde::Serialize,
     {
-        let server_tx = self.server_tx.clone();
-        let id = self.next_request_id();
-
-        async move {
-            use std::time::Duration;
-            use tokio::time::timeout;
-
-            let arguments = Some(serde_json::to_value(arguments)?);
-
-            let (callback_tx, mut callback_rx) = channel(1);
-
-            let req = Request {
-                back_ch: Some(callback_tx),
-                seq: id,
-                command: R::COMMAND.to_string(),
-                arguments,
-            };
-
-            server_tx
-                .send(Payload::Request(req))
-                .map_err(|e| Error::Other(e.into()))?;
-
-            // TODO: specifiable timeout, delay other calls until initialize success
-            let response = timeout(Duration::from_secs(20), callback_rx.recv())
-                .await
-                .map_err(|_| Error::Timeout(id))? // return Timeout
-                .ok_or(Error::StreamClosed)??;
-
-            if !response.success {
-                let message = response
-                    .message
-                    .clone()
-                    .unwrap_or_else(|| "DAP request failed".to_string());
-                return Err(Error::Other(anyhow!(message)));
-            }
-
-            Ok(response.body.unwrap_or_default())
-        }
+        call::<R>(self.server_tx.clone(), self.next_request_id(), arguments)
     }
 
     pub async fn request<R: helix_dap_types::Request>(
@@ -368,7 +591,11 @@ impl Client {
         Some(status.end_status_line(event.message.as_deref()))
     }
 
-    pub async fn initialize(&mut self, adapter_id: String) -> Result<()> {
+    pub async fn initialize(
+        &mut self,
+        adapter_id: String,
+        supports_run_in_terminal: bool,
+    ) -> Result<()> {
         let args = requests::InitializeArguments {
             client_id: Some("hx".to_owned()),
             client_name: Some("helix".to_owned()),
@@ -379,7 +606,7 @@ impl Client {
             path_format: Some("path".to_owned()),
             supports_variable_type: Some(true),
             supports_variable_paging: Some(false),
-            supports_run_in_terminal_request: Some(true),
+            supports_run_in_terminal_request: Some(supports_run_in_terminal),
             supports_memory_references: Some(false),
             supports_progress_reporting: Some(true),
             supports_invalidated_event: Some(false),
@@ -395,6 +622,7 @@ impl Client {
         &mut self,
         args: Option<DisconnectArguments>,
     ) -> impl Future<Output = Result<Value>> {
+        self.invalidate_stop_requests();
         self.connection_type = None;
         self.call::<requests::Disconnect>(args)
     }
@@ -403,23 +631,27 @@ impl Client {
         &mut self,
         args: Option<TerminateArguments>,
     ) -> impl Future<Output = Result<Value>> {
+        self.invalidate_stop_requests();
         self.connection_type = None;
         self.call::<requests::Terminate>(args)
     }
 
     pub fn launch(&mut self, args: serde_json::Value) -> impl Future<Output = Result<Value>> {
+        self.invalidate_stop_requests();
         self.connection_type = Some(ConnectionType::Launch);
         self.starting_request_args = Some(args.clone());
         self.call::<requests::Launch>(args)
     }
 
     pub fn attach(&mut self, args: serde_json::Value) -> impl Future<Output = Result<Value>> {
+        self.invalidate_stop_requests();
         self.connection_type = Some(ConnectionType::Attach);
         self.starting_request_args = Some(args.clone());
         self.call::<requests::Attach>(args)
     }
 
-    pub fn restart(&self) -> impl Future<Output = Result<Value>> {
+    pub fn restart(&mut self) -> impl Future<Output = Result<Value>> {
+        self.invalidate_stop_requests();
         let args = if let Some(args) = &self.starting_request_args {
             args.clone()
         } else {
@@ -576,5 +808,314 @@ impl Client {
         self.stack_frames
             .get(&self.thread_id?)?
             .get(self.active_frame?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, DuplexStream};
+
+    fn thread_id(value: isize) -> ThreadId {
+        serde_json::from_value(serde_json::json!(value)).unwrap()
+    }
+
+    fn client_streams() -> (
+        Client,
+        UnboundedReceiver<(DebugAdapterId, Payload)>,
+        BufReader<DuplexStream>,
+    ) {
+        let (client, adapter) = tokio::io::duplex(4096);
+        let (rx, tx) = tokio::io::split(client);
+        let (client, incoming) = Client::streams(
+            Box::new(BufReader::new(rx)),
+            Box::new(tx),
+            None,
+            DebugAdapterId::default(),
+            None,
+        )
+        .unwrap();
+        (client, incoming, BufReader::new(adapter))
+    }
+
+    async fn read_message(reader: &mut BufReader<DuplexStream>) -> Value {
+        let mut line = String::new();
+        let mut content_length = None;
+        loop {
+            line.clear();
+            assert_ne!(reader.read_line(&mut line).await.unwrap(), 0);
+            if line == "\r\n" {
+                break;
+            }
+            if let Some(length) = line.strip_prefix("Content-Length: ") {
+                content_length = Some(length.trim().parse::<usize>().unwrap());
+            }
+        }
+        let mut body = vec![0; content_length.unwrap()];
+        reader.read_exact(&mut body).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    async fn reply_message(adapter: &mut BufReader<DuplexStream>, request: &Value, body: Value) {
+        use tokio::io::AsyncWriteExt;
+        let response = serde_json::json!({
+            "type": "response", "seq": 1, "request_seq": request["seq"],
+            "success": true, "command": request["command"], "body": body,
+        })
+        .to_string();
+        adapter
+            .get_mut()
+            .write_all(format!("Content-Length: {}\r\n\r\n{response}", response.len()).as_bytes())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn slow_stack_request_deduplicates_and_new_stop_discards_late_response() {
+        let (mut client, _incoming, mut adapter) = client_streams();
+        client.begin_stop();
+        client.select_thread(thread_id(7));
+        let (requester, guard, _) = client.begin_stack_trace(thread_id(7)).unwrap();
+        assert!(client.begin_stack_trace(thread_id(7)).is_none());
+        let old = tokio::spawn(async move { requester.stack_trace(thread_id(7), &guard).await });
+        let request = tokio::time::timeout(Duration::from_secs(1), read_message(&mut adapter))
+            .await
+            .unwrap();
+        assert_eq!(request["command"], "stackTrace");
+        client.begin_stop();
+        assert!(tokio::time::timeout(Duration::from_secs(1), old)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_none());
+        reply_message(
+            &mut adapter,
+            &request,
+            serde_json::json!({"stackFrames": []}),
+        )
+        .await;
+        let (requester, guard, _) = client.begin_stack_trace(thread_id(7)).unwrap();
+        let current =
+            tokio::spawn(async move { requester.stack_trace(thread_id(7), &guard).await });
+        let request = tokio::time::timeout(Duration::from_secs(1), read_message(&mut adapter))
+            .await
+            .unwrap();
+        reply_message(
+            &mut adapter,
+            &request,
+            serde_json::json!({"stackFrames": []}),
+        )
+        .await;
+        assert!(tokio::time::timeout(Duration::from_secs(1), current)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn changed_frame_cancels_scopes_before_variable_requests() {
+        let (mut client, _incoming, mut adapter) = client_streams();
+        client.begin_stop();
+        client.select_thread(thread_id(7));
+        client.select_frame(0);
+        let requester = client.requester();
+        let stop = client.stop_guard();
+        let selection = client.selection_guard();
+        let variables = client.variables_guard();
+        let load = tokio::spawn(async move {
+            requester
+                .variables_for_frame(3, &stop, &selection, &variables)
+                .await
+        });
+        let request = tokio::time::timeout(Duration::from_secs(1), read_message(&mut adapter))
+            .await
+            .unwrap();
+        assert_eq!(request["command"], "scopes");
+        client.select_frame(1);
+        assert!(tokio::time::timeout(Duration::from_secs(1), load)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_none());
+        reply_message(&mut adapter, &request, serde_json::json!({"scopes": [{"name":"locals", "variablesReference":9, "expensive":false}]})).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), read_message(&mut adapter))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn variables_requests_are_bounded_and_results_preserve_scope_order() {
+        let (mut client, _incoming, mut adapter) = client_streams();
+        client.begin_stop();
+        client.select_thread(thread_id(7));
+        client.select_frame(0);
+        let requester = client.requester();
+        let stop = client.stop_guard();
+        let selection = client.selection_guard();
+        let variables = client.variables_guard();
+        let load = tokio::spawn(async move {
+            requester
+                .variables_for_frame(3, &stop, &selection, &variables)
+                .await
+        });
+        let request = tokio::time::timeout(Duration::from_secs(1), read_message(&mut adapter))
+            .await
+            .unwrap();
+        let scopes: Vec<_> = (1..=9).map(|i| serde_json::json!({"name":format!("scope{i}"), "variablesReference":i, "expensive":false})).collect();
+        reply_message(&mut adapter, &request, serde_json::json!({"scopes":scopes})).await;
+        for batch_size in [4, 4, 1] {
+            let mut batch = Vec::new();
+            for _ in 0..batch_size {
+                let request =
+                    tokio::time::timeout(Duration::from_secs(1), read_message(&mut adapter))
+                        .await
+                        .unwrap();
+                assert_eq!(request["command"], "variables");
+                batch.push(request);
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(25), read_message(&mut adapter))
+                    .await
+                    .is_err(),
+                "more than four requests were outstanding"
+            );
+            for request in batch.iter().rev() {
+                reply_message(&mut adapter, request, serde_json::json!({"variables":[]})).await;
+            }
+        }
+        let loaded = tokio::time::timeout(Duration::from_secs(1), load)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            loaded
+                .iter()
+                .map(|(scope, _)| scope.name.as_str())
+                .collect::<Vec<_>>(),
+            (1..=9).map(|i| format!("scope{i}")).collect::<Vec<_>>()
+        );
+        assert!(loaded.into_iter().all(|(_, variables)| variables.is_ok()));
+    }
+
+    #[tokio::test]
+    async fn continued_thread_old_stack_response_cannot_consume_a_new_pending_request() {
+        let (mut client, _incoming, _adapter) = client_streams();
+        client.begin_stop();
+        let (_, stopped, old) = client.begin_stack_trace(thread_id(7)).unwrap();
+        client.invalidate_thread_stack(thread_id(7));
+        let (_, still_stopped, new) = client.begin_stack_trace(thread_id(7)).unwrap();
+        assert!(stopped.is_current() && still_stopped.is_current());
+        assert!(
+            !client.finish_stack_trace(thread_id(7), old),
+            "old response must not remove the replacement request"
+        );
+        assert!(
+            client.begin_stack_trace(thread_id(7)).is_none(),
+            "replacement remains pending"
+        );
+        assert!(client.finish_stack_trace(thread_id(7), new));
+    }
+
+    #[tokio::test]
+    async fn stop_selection_resume_and_session_changes_invalidate_guards() {
+        let (mut client, _incoming, _adapter) = client_streams();
+        let stop = client.stop_guard();
+        client.select_thread(thread_id(3));
+        assert!(stop.is_current());
+        let selected = client.selection_guard();
+        client.select_frame(0);
+        assert!(!selected.is_current());
+        let selected = client.selection_guard();
+        let variables = client.variables_guard();
+        client.select_thread(thread_id(4));
+        assert!(!selected.is_current());
+        assert!(!variables.is_current());
+        let stop = client.stop_guard();
+        client.stack_frames.insert(thread_id(3), Vec::new());
+        client.stack_frames.insert(thread_id(4), Vec::new());
+        client.resume_application();
+        assert!(
+            client.stack_frames.is_empty(),
+            "other resumed threads must not retain cached frames"
+        );
+        assert!(!stop.is_current());
+        let stop = client.stop_guard();
+        client.begin_stop();
+        assert!(!stop.is_current());
+        let stop = client.stop_guard();
+        drop(client);
+        assert!(!stop.is_current());
+    }
+
+    #[tokio::test]
+    async fn initialize_advertises_terminal_support_only_when_available() {
+        for supported in [false, true] {
+            let (mut client, _incoming, mut adapter) = client_streams();
+            let exchange = async {
+                let adapter_reply = async {
+                    let request = read_message(&mut adapter).await;
+                    assert_eq!(request["command"], "initialize");
+                    assert_eq!(
+                        request["arguments"]["supportsRunInTerminalRequest"],
+                        supported
+                    );
+
+                    let response = serde_json::json!({
+                        "type": "response",
+                        "seq": 1,
+                        "request_seq": request["seq"],
+                        "success": true,
+                        "command": "initialize",
+                        "body": {},
+                    })
+                    .to_string();
+                    adapter
+                        .get_mut()
+                        .write_all(
+                            format!("Content-Length: {}\r\n\r\n{response}", response.len())
+                                .as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                };
+                let (initialized, ()) = tokio::join!(
+                    client.initialize("test-adapter".into(), supported),
+                    adapter_reply,
+                );
+                initialized.unwrap();
+            };
+            tokio::time::timeout(Duration::from_secs(1), exchange)
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_reverse_requests_send_error_responses() {
+        let (client, _incoming, mut adapter) = client_streams();
+        client
+            .reply(
+                7,
+                "runInTerminal",
+                Err(Error::Other(anyhow!("No external terminal defined"))),
+            )
+            .await
+            .unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(1), read_message(&mut adapter))
+            .await
+            .unwrap();
+
+        assert_eq!(response["type"], "response");
+        assert_eq!(response["request_seq"], 7);
+        assert_eq!(response["command"], "runInTerminal");
+        assert_eq!(response["success"], false);
+        assert_eq!(response["message"], "No external terminal defined");
     }
 }

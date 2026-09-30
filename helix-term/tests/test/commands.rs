@@ -4,8 +4,11 @@ use super::*;
 
 mod insert;
 mod movement;
+mod queued_save_paths;
+mod reverse_search;
 mod reverse_selection_contents;
 mod rotate_selection_contents;
+mod workspace_edit;
 mod write;
 
 #[tokio::test(flavor = "multi_thread")]

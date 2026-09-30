@@ -1,17 +1,16 @@
 use std::{borrow::Cow, sync::Arc};
 
-use helix_core::{
-    self as core, chars::char_is_word, completion::CompletionProvider, movement, Transaction,
-};
+use helix_core::{self as core, chars::char_is_word, completion::CompletionProvider, movement};
 use helix_event::TaskHandle;
 use helix_stdx::rope::RopeSliceExt as _;
 use helix_view::{
     document::SavePoint, handlers::completion::ResponseContext, Document, Editor, ViewId,
 };
 
-use super::{request::TriggerKind, CompletionItem, CompletionItems, CompletionResponse, Trigger};
-
-const COMPLETION_KIND: &str = "word";
+use super::{
+    request::TriggerKind, CompletionItem, CompletionItems, CompletionResponse, Trigger,
+    WordCompletionItem, WordEditContext,
+};
 
 pub(super) fn completion(
     editor: &Editor,
@@ -72,21 +71,22 @@ pub(super) fn completion(
     let future = move || {
         let text = rope.slice(..);
         let typed_word: Cow<_> = text.slice(typed_word_range).into();
+        let typed_word = typed_word.into_owned();
+        let context = Arc::new(WordEditContext {
+            rope,
+            selection,
+            edit_diff,
+        });
         let items = word_index
-            .matches(&typed_word)
+            .matches_cancelable(&typed_word, &handle)
             .into_iter()
-            .filter(|word| word.as_str() != typed_word.as_ref())
-            .map(|word| {
-                let transaction = Transaction::change_by_selection(&rope, &selection, |range| {
-                    let cursor = range.cursor(text);
-                    (cursor - edit_diff, cursor, Some((&word).into()))
-                });
-                CompletionItem::Other(core::CompletionItem {
-                    transaction,
-                    label: word.into(),
-                    kind: Cow::Borrowed(COMPLETION_KIND),
-                    documentation: None,
-                    provider: CompletionProvider::Word,
+            .filter(|word| word.as_str() != typed_word.as_str())
+            .enumerate()
+            .take_while(|(index, _)| index % 64 != 0 || !handle.is_canceled())
+            .map(|(_, word)| {
+                CompletionItem::Word(WordCompletionItem {
+                    label: word,
+                    context: context.clone(),
                 })
             })
             .collect();
@@ -121,14 +121,6 @@ pub(super) fn retain_valid_completions(
         .get_char(cursor.saturating_sub(1))
         .is_some_and(|ch| ch.is_whitespace())
     {
-        items.retain(|item| {
-            !matches!(
-                item,
-                CompletionItem::Other(core::CompletionItem {
-                    provider: CompletionProvider::Word,
-                    ..
-                })
-            )
-        });
+        items.retain(|item| item.provider() != CompletionProvider::Word);
     }
 }

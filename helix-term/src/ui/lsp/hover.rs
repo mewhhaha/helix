@@ -3,6 +3,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use helix_core::syntax;
 use helix_lsp::lsp;
+use helix_view::editor::LspConfig;
 use helix_view::graphics::{Margin, Rect, Style};
 use helix_view::input::Event;
 use tui::buffer::Buffer;
@@ -24,6 +25,7 @@ impl Hover {
     pub fn new(
         hovers: Vec<(String, lsp::Hover)>,
         config_loader: Arc<ArcSwap<syntax::Loader>>,
+        config: &LspConfig,
     ) -> Self {
         let n_hovers = hovers.len();
         let contents = hovers
@@ -39,7 +41,8 @@ impl Hover {
                 let body = Markdown::new(
                     hover_contents_to_string(hover.contents),
                     config_loader.clone(),
-                );
+                )
+                .with_color_previews(config.display_color_swatches, config.display_color_values);
                 (header, body)
             })
             .collect();
@@ -115,15 +118,12 @@ impl Component for Hover {
         let header_width = header
             .as_ref()
             .map(|header| {
-                let header = header.parse(None);
-                let (width, _height) = crate::ui::text::required_size(&header, max_text_width);
+                let (width, _height) = header.dimensions(max_text_width);
                 width
             })
             .unwrap_or_default();
 
-        let contents = contents.parse(None);
-        let (content_width, content_height) =
-            crate::ui::text::required_size(&contents, max_text_width);
+        let (content_width, content_height) = contents.dimensions(max_text_width);
 
         let width = PADDING_HORIZONTAL + header_width.max(content_width);
         let height = if self.has_header() {
@@ -179,5 +179,109 @@ fn hover_contents_to_string(contents: lsp::HoverContents) -> String {
             .collect::<Vec<_>>()
             .join("\n\n"),
         lsp::HoverContents::Markup(contents) => contents.value,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use helix_view::{graphics::Color, Theme};
+
+    fn make_hover(contents: lsp::HoverContents, config: &LspConfig) -> Hover {
+        Hover::new(
+            vec![(
+                "tailwindcss-ls".into(),
+                lsp::Hover {
+                    contents,
+                    range: None,
+                },
+            )],
+            Arc::new(ArcSwap::from_pointee(syntax::Loader::default())),
+            config,
+        )
+    }
+
+    #[test]
+    fn language_string_hovers_respect_independent_color_settings() {
+        for display_color_swatches in [false, true] {
+            for display_color_values in [false, true] {
+                let config = LspConfig {
+                    display_color_swatches,
+                    display_color_values,
+                    ..LspConfig::default()
+                };
+                let hover = make_hover(
+                    lsp::HoverContents::Scalar(lsp::MarkedString::LanguageString(
+                        lsp::LanguageString {
+                            language: "css".into(),
+                            value: ".bg-red-500 {\n  background-color: #ef4444;\n}".into(),
+                        },
+                    )),
+                    &config,
+                );
+                let theme = Theme::default();
+                let contents = hover.content().1.parse(Some(&theme));
+                let spans: Vec<_> = contents.lines.iter().flat_map(|line| &line.0).collect();
+
+                assert_eq!(
+                    spans.iter().any(|span| span.content.contains('■')),
+                    display_color_swatches
+                );
+                let value_spans: Vec<_> = spans
+                    .iter()
+                    .filter(|span| span.content.contains("#ef4444"))
+                    .collect();
+                assert_eq!(value_spans.len(), 1);
+                assert_eq!(
+                    value_spans[0].style.fg == Some(Color::Rgb(239, 68, 68)),
+                    display_color_values
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hover_size_includes_inline_swatches() {
+        let contents = || {
+            lsp::HoverContents::Markup(lsp::MarkupContent {
+                kind: lsp::MarkupKind::Markdown,
+                value: "`#f00`".into(),
+            })
+        };
+        let mut plain = make_hover(
+            contents(),
+            &LspConfig {
+                display_color_swatches: false,
+                display_color_values: false,
+                ..LspConfig::default()
+            },
+        );
+        let mut colored = make_hover(contents(), &LspConfig::default());
+
+        let plain_size = plain.required_size((200, 100)).unwrap();
+        let colored_size = colored.required_size((200, 100)).unwrap();
+        assert_eq!(colored_size, (plain_size.0 + 2, plain_size.1));
+    }
+
+    #[test]
+    fn tailwind_v4_resolved_color_comments_get_previews() {
+        let hover = make_hover(
+            lsp::HoverContents::Scalar(lsp::MarkedString::LanguageString(lsp::LanguageString {
+                language: "css".into(),
+                value: ".bg-red-500 {\n  background-color: var(--color-red-500) /* oklch(63.7% 0.237 25.331) = #fb2c36 */;\n}".into(),
+            })),
+            &LspConfig::default(),
+        );
+        let theme = Theme::default();
+        let contents = hover.content().1.parse(Some(&theme));
+        let spans: Vec<_> = contents.lines.iter().flat_map(|line| &line.0).collect();
+
+        assert!(spans.iter().any(|span| {
+            span.content == "#fb2c36" && span.style.fg == Some(Color::Rgb(251, 44, 54))
+        }));
+        assert!(spans.iter().any(|span| {
+            span.content.starts_with("oklch(") && matches!(span.style.fg, Some(Color::Rgb(..)))
+        }));
+        assert!(spans.iter().any(|span| span.content.contains('■')));
     }
 }

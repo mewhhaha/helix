@@ -74,6 +74,7 @@ grep-searcher = "0.1"
 grep-matcher = "0.1"
 # markdown doc rendering
 pulldown-cmark = { version = "0.13", default-features = false }
+csscolorparser = "0.8"
 thiserror.workspace = true
 
 # opening URLs

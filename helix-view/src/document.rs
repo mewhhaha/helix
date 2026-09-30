@@ -7,11 +7,11 @@ use helix_core::auto_pairs::AutoPairs;
 use helix_core::chars::char_is_word;
 use helix_core::command_line::Token;
 use helix_core::diagnostic::DiagnosticProvider;
-use helix_core::doc_formatter::TextFormat;
+use helix_core::doc_formatter::{FormatterCache, TextFormat};
 use helix_core::encoding::Encoding;
 use helix_core::snippets::{ActiveSnippet, SnippetRenderCtx};
 use helix_core::syntax::config::LanguageServerFeature;
-use helix_core::text_annotations::{InlineAnnotation, Overlay};
+use helix_core::text_annotations::{InlineAnnotation, Overlay, TextAnnotations};
 use helix_event::TaskController;
 use helix_lsp::util::lsp_pos_to_pos;
 use helix_stdx::faccess::{copy_metadata, readonly};
@@ -50,6 +50,98 @@ use crate::{
     view::ViewPosition,
     DocumentId, Editor, Theme, View, ViewId,
 };
+
+const MAX_DIAGNOSTIC_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_DIAGNOSTIC_MESSAGES: usize = 128;
+
+#[derive(Default)]
+struct DiagnosticMessageDimensionsCache {
+    entries: HashMap<Box<str>, DiagnosticMessageDimensions>,
+    bytes: usize,
+    clock: u64,
+}
+
+struct DiagnosticMessageDimensions {
+    layouts: Vec<DiagnosticMessageLayout>,
+    used: u64,
+}
+
+struct DiagnosticMessageLayout {
+    soft_wrap: bool,
+    tab_width: u16,
+    max_wrap: u16,
+    max_indent_retain: u16,
+    wrap_indicator: Box<str>,
+    width: u16,
+    soft_wrap_at_text_width: bool,
+    dimensions: (usize, u16),
+}
+
+impl DiagnosticMessageLayout {
+    fn matches(&self, format: &TextFormat) -> bool {
+        self.soft_wrap == format.soft_wrap
+            && self.tab_width == format.tab_width
+            && self.max_wrap == format.max_wrap
+            && self.max_indent_retain == format.max_indent_retain
+            && self.wrap_indicator == format.wrap_indicator
+            && self.width == format.viewport_width
+            && self.soft_wrap_at_text_width == format.soft_wrap_at_text_width
+    }
+}
+
+impl DiagnosticMessageDimensionsCache {
+    fn get(&mut self, message: &str, format: &TextFormat) -> (usize, u16) {
+        self.clock = self.clock.wrapping_add(1);
+        let used = self.clock;
+        if let Some(entry) = self.entries.get_mut(message) {
+            entry.used = used;
+            if let Some(layout) = entry.layouts.iter().find(|layout| layout.matches(format)) {
+                return layout.dimensions;
+            }
+        }
+        let dimensions = helix_core::softwrapped_dimensions(message.into(), format);
+        if message.len() > MAX_DIAGNOSTIC_MESSAGE_BYTES {
+            return dimensions;
+        }
+        if !self.entries.contains_key(message) {
+            while self.entries.len() >= MAX_DIAGNOSTIC_MESSAGES
+                || self.bytes + message.len() > MAX_DIAGNOSTIC_MESSAGE_BYTES
+            {
+                let oldest = self
+                    .entries
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.used)
+                    .map(|(message, _)| message.clone())
+                    .unwrap();
+                self.bytes -= oldest.len();
+                self.entries.remove(&oldest);
+            }
+            self.bytes += message.len();
+            self.entries.insert(
+                message.into(),
+                DiagnosticMessageDimensions {
+                    layouts: Vec::new(),
+                    used,
+                },
+            );
+        }
+        let entry = self.entries.get_mut(message).unwrap();
+        if entry.layouts.len() >= 4 {
+            entry.layouts.remove(0);
+        }
+        entry.layouts.push(DiagnosticMessageLayout {
+            soft_wrap: format.soft_wrap,
+            tab_width: format.tab_width,
+            max_wrap: format.max_wrap,
+            max_indent_retain: format.max_indent_retain,
+            wrap_indicator: format.wrap_indicator.clone(),
+            width: format.viewport_width,
+            soft_wrap_at_text_width: format.soft_wrap_at_text_width,
+            dimensions,
+        });
+        dimensions
+    }
+}
 
 /// 8kB of buffer space for encoding and decoding `Rope`s.
 const BUF_SIZE: usize = 8192;
@@ -138,9 +230,238 @@ pub enum DocumentOpenError {
     IoError(#[from] io::Error),
 }
 
+/// Diagnostic counts refreshed with their document's diagnostic ranges.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DiagnosticCounts {
+    pub hints: usize,
+    pub info: usize,
+    pub warnings: usize,
+    pub errors: usize,
+}
+
+impl DiagnosticCounts {
+    pub fn as_tuple(self) -> (usize, usize, usize, usize) {
+        (self.hints, self.info, self.warnings, self.errors)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum DiagnosticHighlightKind {
+    Default,
+    Unnecessary,
+    Deprecated,
+    Info,
+    Hint,
+    Warning,
+    Error,
+}
+
+pub struct DiagnosticSnapshot {
+    pub counts: DiagnosticCounts,
+    ranges: [Arc<Vec<std::ops::Range<usize>>>; 7],
+}
+
+#[cfg(test)]
+mod diagnostic_snapshot_tests {
+    use helix_core::diagnostic::{DiagnosticTag, Severity};
+
+    use super::*;
+
+    fn document() -> Document {
+        Document::from(
+            Rope::from_str("abcdefghij\nabcdefghij\n"),
+            None,
+            Arc::new(ArcSwap::from_pointee(Config::default())),
+            Arc::new(ArcSwap::from_pointee(syntax::Loader::default())),
+        )
+    }
+
+    fn provider(identifier: &str) -> DiagnosticProvider {
+        DiagnosticProvider::Lsp {
+            server_id: LanguageServerId::default(),
+            identifier: Some(identifier.into()),
+        }
+    }
+
+    fn diagnostic(start: usize, end: usize, severity: Option<Severity>) -> Diagnostic {
+        Diagnostic {
+            range: helix_core::diagnostic::Range { start, end },
+            ends_at_word: false,
+            starts_at_word: false,
+            zero_width: start == end,
+            line: 0,
+            message: String::new(),
+            severity,
+            code: None,
+            provider: provider("push"),
+            tags: Vec::new(),
+            source: None,
+            data: None,
+        }
+    }
+
+    #[test]
+    fn snapshots_merge_ranges_preserve_tag_rules_and_count_missing_severity() {
+        let mut doc = document();
+        let mut tagged_hint = diagnostic(4, 8, Some(Severity::Hint));
+        tagged_hint.tags = vec![DiagnosticTag::Unnecessary];
+        let mut tagged_error = diagnostic(7, 12, Some(Severity::Error));
+        tagged_error.tags = vec![DiagnosticTag::Unnecessary, DiagnosticTag::Deprecated];
+        doc.replace_diagnostics(
+            [
+                tagged_error,
+                diagnostic(2, 6, Some(Severity::Warning)),
+                tagged_hint,
+                diagnostic(0, 3, Some(Severity::Warning)),
+                diagnostic(13, 15, None),
+                diagnostic(16, 18, Some(Severity::Info)),
+            ],
+            &[],
+            None,
+        );
+        let snapshot = doc.diagnostic_snapshot();
+        assert_eq!(snapshot.counts.as_tuple(), (2, 1, 2, 1));
+        assert_eq!(
+            snapshot.ranges(DiagnosticHighlightKind::Warning).as_slice(),
+            std::slice::from_ref(&(0..6))
+        );
+        assert!(snapshot.ranges(DiagnosticHighlightKind::Hint).is_empty());
+        assert_eq!(
+            snapshot.ranges(DiagnosticHighlightKind::Default).as_slice(),
+            std::slice::from_ref(&(13..15))
+        );
+        assert_eq!(
+            snapshot
+                .ranges(DiagnosticHighlightKind::Unnecessary)
+                .as_slice(),
+            std::slice::from_ref(&(4..12))
+        );
+        assert_eq!(
+            snapshot
+                .ranges(DiagnosticHighlightKind::Deprecated)
+                .as_slice(),
+            std::slice::from_ref(&(7..12))
+        );
+        assert_eq!(
+            snapshot.ranges(DiagnosticHighlightKind::Error).as_slice(),
+            std::slice::from_ref(&(7..12))
+        );
+        let ranges = snapshot.ranges(DiagnosticHighlightKind::Warning).clone();
+        assert!(Arc::ptr_eq(
+            &ranges,
+            doc.diagnostic_snapshot()
+                .ranges(DiagnosticHighlightKind::Warning)
+        ));
+        let generation = doc.diagnostics_generation();
+        doc.replace_diagnostics([], &[], None);
+        assert_ne!(generation, doc.diagnostics_generation());
+        assert_eq!(ranges.as_slice(), std::slice::from_ref(&(0..6)));
+        assert!(doc
+            .diagnostic_snapshot()
+            .ranges(DiagnosticHighlightKind::Warning)
+            .is_empty());
+        assert_eq!(
+            doc.diagnostic_snapshot().counts,
+            DiagnosticCounts::default()
+        );
+    }
+
+    #[test]
+    fn partial_provider_updates_and_cleanup_refresh_the_snapshot() {
+        let mut doc = document();
+        let mut preserved = diagnostic(0, 2, Some(Severity::Warning));
+        preserved.source = Some("unchanged".into());
+        let mut other = diagnostic(4, 6, Some(Severity::Error));
+        other.provider = provider("pull");
+        doc.replace_diagnostics([preserved, other], &[], None);
+        let generation = doc.diagnostics_generation();
+        doc.replace_diagnostics(
+            [diagnostic(8, 10, Some(Severity::Hint))],
+            &["unchanged".into()],
+            Some(&provider("push")),
+        );
+        assert_ne!(doc.diagnostics_generation(), generation);
+        assert_eq!(doc.diagnostic_snapshot().counts.as_tuple(), (1, 0, 1, 1));
+        doc.replace_diagnostics([], &[], Some(&provider("pull")));
+        assert_eq!(doc.diagnostic_snapshot().counts.as_tuple(), (1, 0, 1, 0));
+        doc.clear_diagnostics_for_language_server(LanguageServerId::default());
+        assert_eq!(
+            doc.diagnostic_snapshot().counts,
+            DiagnosticCounts::default()
+        );
+        assert!(doc.diagnostics().is_empty());
+    }
+
+    #[tokio::test]
+    async fn remapping_diagnostics_refreshes_ranges_and_removes_deleted_entries() {
+        let mut doc = document();
+        let view = View::new(doc.id(), Config::default().gutters);
+        doc.set_selection(view.id, Selection::single(0, 0));
+        doc.replace_diagnostics(
+            [
+                diagnostic(2, 4, Some(Severity::Error)),
+                diagnostic(12, 14, Some(Severity::Warning)),
+            ],
+            &[],
+            None,
+        );
+        let previous = doc
+            .diagnostic_snapshot()
+            .ranges(DiagnosticHighlightKind::Warning)
+            .clone();
+        let generation = doc.diagnostics_generation();
+        let transaction = Transaction::change(doc.text(), [(0, 6, None)].into_iter());
+        assert!(doc.apply(&transaction, view.id));
+        assert_ne!(doc.diagnostics_generation(), generation);
+        assert_eq!(doc.diagnostic_snapshot().counts.as_tuple(), (0, 0, 1, 0));
+        assert_eq!(previous.as_slice(), std::slice::from_ref(&(12..14)));
+        assert_eq!(
+            doc.diagnostic_snapshot()
+                .ranges(DiagnosticHighlightKind::Warning)
+                .as_slice(),
+            std::slice::from_ref(&(6..8))
+        );
+    }
+}
+
+impl Default for DiagnosticSnapshot {
+    fn default() -> Self {
+        let empty = Arc::new(Vec::new());
+        Self {
+            counts: DiagnosticCounts::default(),
+            ranges: std::array::from_fn(|_| empty.clone()),
+        }
+    }
+}
+
+impl DiagnosticSnapshot {
+    pub fn ranges(&self, kind: DiagnosticHighlightKind) -> &Arc<Vec<std::ops::Range<usize>>> {
+        &self.ranges[kind as usize]
+    }
+}
+
+/// File contents and metadata prepared off the UI thread for a picker preview.
+/// Unlike `Document`, this excludes editor-owned configuration and view state.
+pub struct LoadedDocument {
+    text: Rope,
+    path: Option<PathBuf>,
+    encoding: &'static Encoding,
+    has_bom: bool,
+    indent_style: IndentStyle,
+    editor_config: EditorConfig,
+    line_ending: LineEnding,
+    syntax: Option<Syntax>,
+    language: Option<Arc<LanguageConfiguration>>,
+    last_saved_time: SystemTime,
+    saved_file_times: HashMap<PathBuf, Arc<Mutex<SystemTime>>>,
+    readonly: bool,
+}
+
 pub struct Document {
     pub(crate) id: DocumentId,
     text: Rope,
+    formatter_cache: Arc<FormatterCache>,
+    grapheme_position_cache: helix_core::GraphemePositionCache,
     selections: HashMap<ViewId, Selection>,
     view_data: HashMap<ViewId, ViewData>,
     pub active_snippet: Option<ActiveSnippet>,
@@ -199,15 +520,24 @@ pub struct Document {
     // were no saves.
     last_saved_time: SystemTime,
 
+    /// Expected modification times shared by saves queued for each destination.
+    /// Reloading replaces an entry so earlier saves retain their original baseline.
+    saved_file_times: HashMap<PathBuf, Arc<Mutex<SystemTime>>>,
+
     last_saved_revision: usize,
     version: i32, // should be usize?
     pub(crate) modified_since_accessed: bool,
 
     pub(crate) diagnostics: Vec<Diagnostic>,
+    diagnostic_snapshot: DiagnosticSnapshot,
+    diagnostic_message_dimensions: Mutex<DiagnosticMessageDimensionsCache>,
+    diagnostics_generation: u64,
+    diagnostics_layout_generation: u64,
     pub(crate) language_servers: HashMap<LanguageServerName, Arc<Client>>,
 
     diff_handle: Option<DiffHandle>,
     version_control_head: Option<Arc<ArcSwap<Box<str>>>>,
+    pub(crate) vcs_controller: TaskController,
 
     // when document was used for most-recent-used buffer picker
     pub focused_at: std::time::Instant,
@@ -241,6 +571,20 @@ pub struct DocumentColorSwatches {
     pub color_swatches: Vec<InlineAnnotation>,
     pub colors: Vec<syntax::Highlight>,
     pub color_swatches_padding: Vec<InlineAnnotation>,
+    /// Sorted, non-overlapping character ranges tinted with their LSP color.
+    pub color_ranges: Arc<Vec<(syntax::Highlight, std::ops::Range<usize>)>>,
+    /// Immutable content/color fingerprints, refreshed when positions change.
+    pub layout_keys: Option<[u64; 3]>,
+}
+
+impl DocumentColorSwatches {
+    pub fn refresh_layout_keys(&mut self) {
+        self.layout_keys = Some([
+            InlineAnnotation::layout_key(&self.color_swatches),
+            InlineAnnotation::layout_key(&self.color_swatches_padding),
+            TextAnnotations::highlights_key(&self.colors),
+        ]);
+    }
 }
 
 /// Highlight ranges returned by LSP `textDocument/documentHighlight` for a view.
@@ -295,6 +639,7 @@ pub struct DocumentInlayHints {
     /// added first, then the regular inlay hints, then the `after` padding.
     pub padding_before_inlay_hints: Vec<InlineAnnotation>,
     pub padding_after_inlay_hints: Vec<InlineAnnotation>,
+    pub layout_keys: Option<[u64; 5]>,
 }
 
 impl DocumentInlayHints {
@@ -307,7 +652,18 @@ impl DocumentInlayHints {
             other_inlay_hints: Vec::new(),
             padding_before_inlay_hints: Vec::new(),
             padding_after_inlay_hints: Vec::new(),
+            layout_keys: None,
         }
+    }
+
+    pub fn refresh_layout_keys(&mut self) {
+        self.layout_keys = Some([
+            InlineAnnotation::layout_key(&self.padding_before_inlay_hints),
+            InlineAnnotation::layout_key(&self.type_inlay_hints),
+            InlineAnnotation::layout_key(&self.parameter_inlay_hints),
+            InlineAnnotation::layout_key(&self.other_inlay_hints),
+            InlineAnnotation::layout_key(&self.padding_after_inlay_hints),
+        ]);
     }
 }
 
@@ -719,6 +1075,50 @@ use helix_lsp::{lsp, Client, LanguageServerId, LanguageServerName};
 use helix_stdx::Url;
 
 impl Document {
+    /// Transfer a freshly loaded preview without retaining configuration guards
+    /// or editor state in the background result.
+    pub fn into_preview(self) -> LoadedDocument {
+        LoadedDocument {
+            text: self.text,
+            path: self.path,
+            encoding: self.encoding,
+            has_bom: self.has_bom,
+            indent_style: self.indent_style,
+            editor_config: self.editor_config,
+            line_ending: self.line_ending,
+            syntax: self.syntax,
+            language: self.language,
+            last_saved_time: self.last_saved_time,
+            saved_file_times: self.saved_file_times,
+            readonly: self.readonly,
+        }
+    }
+
+    /// Attach a prepared preview to UI configuration without reading the file
+    /// or repeating path, permission, encoding, or indentation detection.
+    pub fn from_preview(
+        loaded: LoadedDocument,
+        config: Arc<dyn DynAccess<Config>>,
+        syn_loader: Arc<ArcSwap<syntax::Loader>>,
+    ) -> Self {
+        let mut doc = Self::from(
+            loaded.text,
+            Some((loaded.encoding, loaded.has_bom)),
+            config,
+            syn_loader,
+        );
+        doc.path = loaded.path;
+        doc.indent_style = loaded.indent_style;
+        doc.editor_config = loaded.editor_config;
+        doc.line_ending = loaded.line_ending;
+        doc.syntax = loaded.syntax;
+        doc.language = loaded.language;
+        doc.last_saved_time = loaded.last_saved_time;
+        doc.saved_file_times = loaded.saved_file_times;
+        doc.readonly = loaded.readonly;
+        doc
+    }
+
     pub fn from(
         text: Rope,
         encoding_with_bom_info: Option<(&'static Encoding, bool)>,
@@ -739,6 +1139,8 @@ impl Document {
             encoding,
             has_bom,
             text,
+            formatter_cache: Arc::new(FormatterCache::default()),
+            grapheme_position_cache: helix_core::GraphemePositionCache::default(),
             selections: HashMap::default(),
             inlay_hints: HashMap::default(),
             inlay_hints_oudated: false,
@@ -752,16 +1154,22 @@ impl Document {
             changes,
             old_state,
             diagnostics: Vec::new(),
+            diagnostic_snapshot: DiagnosticSnapshot::default(),
+            diagnostic_message_dimensions: Mutex::default(),
+            diagnostics_generation: 0,
+            diagnostics_layout_generation: 0,
             version: 0,
             history: Cell::new(History::default()),
             savepoints: Vec::new(),
             last_saved_time: SystemTime::now(),
+            saved_file_times: HashMap::default(),
             last_saved_revision: 0,
             modified_since_accessed: false,
             language_servers: HashMap::new(),
             diff_handle: None,
             config,
             version_control_head: None,
+            vcs_controller: TaskController::new(),
             focused_at: std::time::Instant::now(),
             readonly: false,
             jump_labels: HashMap::new(),
@@ -1032,6 +1440,11 @@ impl Document {
 
         let encoding_with_bom_info = (self.encoding, self.has_bom);
         let last_saved_time = self.last_saved_time;
+        let saved_file_time = self
+            .saved_file_times
+            .entry(path.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(last_saved_time)))
+            .clone();
 
         // We encode the file according to the `Document`'s encoding.
         let future = async move {
@@ -1051,6 +1464,7 @@ impl Document {
             if !force {
                 if let Ok(metadata) = fs::metadata(&path).await {
                     if let Ok(mtime) = metadata.modified() {
+                        let last_saved_time = *saved_file_time.lock();
                         if last_saved_time < mtime {
                             bail!("file modified by an external process, use :w! to overwrite");
                         }
@@ -1179,6 +1593,7 @@ impl Document {
             }
 
             write_result?;
+            *saved_file_time.lock() = save_time;
 
             let event = DocumentSavedEvent {
                 revision: current_rev,
@@ -1267,6 +1682,10 @@ impl Document {
             },
             None => SystemTime::now(),
         };
+        if let Some(path) = self.path() {
+            self.saved_file_times
+                .insert(path.to_owned(), Arc::new(Mutex::new(self.last_saved_time)));
+        }
     }
 
     // Detect if the file is readonly and change the readonly field if necessary (unix only)
@@ -1285,6 +1704,22 @@ impl Document {
         provider_registry: &DiffProviderRegistry,
         trust_full: bool,
     ) -> Result<(), Error> {
+        self.reload_text(view)?;
+        let Some(path) = self.path().map(Path::to_owned) else {
+            return Ok(());
+        };
+        match provider_registry.get_diff_base(&path, trust_full) {
+            Some(diff_base) => self.set_diff_base(diff_base),
+            None => self.diff_handle = None,
+        }
+        self.version_control_head = provider_registry.get_current_head_name(&path, trust_full);
+        Ok(())
+    }
+
+    /// Reload text synchronously for commands that immediately consume it;
+    /// the editor schedules VCS metadata separately in its bounded worker.
+    pub fn reload_text(&mut self, view: &mut View) -> Result<(), Error> {
+        self.vcs_controller.cancel();
         let encoding = self.encoding;
         let path = match self.path() {
             None => return Ok(()),
@@ -1310,13 +1745,6 @@ impl Document {
         self.pickup_last_saved_time();
         self.detect_indent_and_line_ending();
 
-        match provider_registry.get_diff_base(&path, trust_full) {
-            Some(diff_base) => self.set_diff_base(diff_base),
-            None => self.diff_handle = None,
-        }
-
-        self.version_control_head = provider_registry.get_current_head_name(&path, trust_full);
-
         Ok(())
     }
 
@@ -1339,7 +1767,23 @@ impl Document {
     /// observers (like LSP), in most cases `Editor::set_doc_path`
     /// should be used instead
     pub fn set_path(&mut self, path: Option<&Path>) {
+        self.set_path_impl(path, false);
+    }
+
+    pub(crate) fn set_path_after_save(&mut self, path: &Path) {
+        self.set_path_impl(Some(path), true);
+    }
+
+    fn set_path_impl(&mut self, path: Option<&Path>, after_save: bool) {
         let path = path.map(helix_stdx::path::canonicalize);
+
+        if self.path != path {
+            self.color_swatch_controller.cancel();
+            self.color_swatches = None;
+            self.vcs_controller.cancel();
+            self.diff_handle = None;
+            self.version_control_head = None;
+        }
 
         // `take` to remove any prior relative path that may have existed.
         // This will get set in `relative_path()`.
@@ -1352,7 +1796,9 @@ impl Document {
         self.path = path;
 
         self.detect_readonly();
-        self.pickup_last_saved_time();
+        if !after_save {
+            self.pickup_last_saved_time();
+        }
     }
 
     /// Set the programming language for the file and load associated data (e.g. highlighting)
@@ -1362,6 +1808,8 @@ impl Document {
         language_config: Option<Arc<syntax::config::LanguageConfiguration>>,
         loader: &syntax::Loader,
     ) {
+        self.color_swatch_controller.cancel();
+        self.color_swatches = None;
         self.language = language_config;
         self.syntax = self.language.as_ref().and_then(|config| {
             Syntax::new(self.text.slice(..), config.language(), loader)
@@ -1477,6 +1925,22 @@ impl Document {
             return true;
         }
 
+        self.formatter_cache.invalidate_after_change(
+            old_doc.slice(..),
+            self.text.slice(..),
+            changes,
+        );
+        let first_change = changes
+            .changes()
+            .iter()
+            .take_while(|operation| matches!(operation, helix_core::Operation::Retain(_)))
+            .map(helix_core::Operation::len_chars)
+            .sum();
+        self.grapheme_position_cache.invalidate_after_change(
+            old_doc.slice(..),
+            first_change,
+            self.text.len_chars(),
+        );
         self.modified_since_accessed = true;
         self.version += 1;
 
@@ -1552,23 +2016,35 @@ impl Document {
             };
             Some((&mut diagnostic.range.end, assoc))
         }));
+        let mut removed_diagnostic_start = usize::MAX;
         self.diagnostics.retain_mut(|diagnostic| {
             if diagnostic.zero_width {
                 diagnostic.range.end = diagnostic.range.start
             } else if diagnostic.range.start >= diagnostic.range.end {
+                removed_diagnostic_start = removed_diagnostic_start.min(diagnostic.range.start);
                 return false;
             }
             diagnostic.line = self.text.char_to_line(diagnostic.range.start);
             true
         });
 
-        self.diagnostics.sort_by_key(|diagnostic| {
-            (
-                diagnostic.range,
-                diagnostic.severity,
-                diagnostic.provider.clone(),
-            )
+        for pair in self.diagnostics.windows(2) {
+            let (a, b) = (&pair[0], &pair[1]);
+            if (a.range, a.severity, &a.provider) > (b.range, b.severity, &b.provider) {
+                removed_diagnostic_start =
+                    removed_diagnostic_start.min(a.range.start.min(b.range.start));
+            }
+        }
+        self.diagnostics.sort_by(|a, b| {
+            (a.range, a.severity, &a.provider).cmp(&(b.range, b.severity, &b.provider))
         });
+
+        if removed_diagnostic_start != usize::MAX {
+            self.formatter_cache
+                .invalidate_annotations_from(self.text.slice(..), removed_diagnostic_start);
+        }
+
+        self.refresh_diagnostic_snapshot();
 
         // Update the inlay hint annotations' positions, helping ensure they are displayed in the proper place
         let apply_inlay_hint_changes = |annotations: &mut Vec<InlineAnnotation>| {
@@ -1588,6 +2064,7 @@ impl Document {
                 other_inlay_hints,
                 padding_before_inlay_hints,
                 padding_after_inlay_hints,
+                ..
             } = text_annotation;
 
             apply_inlay_hint_changes(padding_before_inlay_hints);
@@ -1595,28 +2072,26 @@ impl Document {
             apply_inlay_hint_changes(parameter_inlay_hints);
             apply_inlay_hint_changes(other_inlay_hints);
             apply_inlay_hint_changes(padding_after_inlay_hints);
+            text_annotation.refresh_layout_keys();
         }
 
         for highlights in self.document_highlights.values_mut() {
             let text_len = self.text.len_chars();
-            let mut updated = Vec::with_capacity(highlights.ranges.len());
-            for mut range in highlights.ranges.drain(..) {
-                changes.update_positions(
-                    [
-                        (&mut range.start, Assoc::After),
-                        (&mut range.end, Assoc::After),
-                    ]
-                    .into_iter(),
-                );
+            // Server ranges are sorted and merged. Map their endpoints together
+            // so multicursor edits traverse the changeset once per view.
+            changes.update_positions(highlights.ranges.iter_mut().flat_map(|range| {
+                [
+                    (&mut range.start, Assoc::After),
+                    (&mut range.end, Assoc::After),
+                ]
+            }));
+            highlights.ranges.retain_mut(|range| {
                 if range.start >= text_len {
-                    continue;
+                    return false;
                 }
-                let end = range.end.min(text_len);
-                if range.start < end {
-                    updated.push(range.start..end);
-                }
-            }
-            highlights.ranges = updated;
+                range.end = range.end.min(text_len);
+                range.start < range.end
+            });
         }
 
         helix_event::dispatch(DocumentDidChange {
@@ -1992,14 +2467,51 @@ impl Document {
     /// Intialize/updates the differ for this document with a new base.
     pub fn set_diff_base(&mut self, diff_base: Vec<u8>) {
         if let Ok((diff_base, ..)) = from_reader(&mut diff_base.as_slice(), Some(self.encoding)) {
-            if let Some(differ) = &self.diff_handle {
-                differ.update_diff_base(diff_base);
-                return;
-            }
-            self.diff_handle = Some(DiffHandle::new(diff_base, self.text.clone()))
+            self.set_diff_base_rope(Some(diff_base));
         } else {
             self.diff_handle = None;
         }
+    }
+
+    pub(crate) fn set_diff_base_rope(&mut self, diff_base: Option<Rope>) {
+        match (diff_base, &self.diff_handle) {
+            (Some(diff_base), Some(differ)) => {
+                differ.update_diff_base(diff_base);
+            }
+            (Some(diff_base), None) => {
+                self.diff_handle = Some(DiffHandle::new(diff_base, self.text.clone()));
+            }
+            (None, _) => self.diff_handle = None,
+        }
+    }
+
+    pub(crate) fn decode_diff_base(
+        diff_base: Vec<u8>,
+        encoding: &'static Encoding,
+        cancel: &helix_event::TaskHandle,
+    ) -> Option<Rope> {
+        struct Reader<'a> {
+            bytes: &'a [u8],
+            cancel: &'a helix_event::TaskHandle,
+        }
+        impl std::io::Read for Reader<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                if self.cancel.is_canceled() {
+                    return Err(std::io::Error::other("VCS preparation canceled"));
+                }
+                let len = buffer.len().min(64 * 1024);
+                self.bytes.read(&mut buffer[..len])
+            }
+        }
+        from_reader(
+            &mut Reader {
+                bytes: &diff_base,
+                cancel,
+            },
+            Some(encoding),
+        )
+        .ok()
+        .map(|(rope, ..)| rope)
     }
 
     pub fn version_control_head(&self) -> Option<Arc<Box<str>>> {
@@ -2072,6 +2584,12 @@ impl Document {
     #[inline]
     pub fn text(&self) -> &Rope {
         &self.text
+    }
+
+    /// Raw document coordinates, with reusable grapheme-column checkpoints.
+    pub fn coords_at_pos(&self, pos: usize) -> helix_core::Position {
+        self.grapheme_position_cache
+            .coords_at_pos(self.text.slice(..), pos)
     }
 
     #[inline]
@@ -2255,6 +2773,94 @@ impl Document {
         &self.diagnostics
     }
 
+    /// Reuse message dimensions across redraws and harmless diagnostic remaps.
+    /// Keys own the complete message, so replacements cannot reuse stale layouts.
+    /// Retention is limited to 128 messages, 2 MiB of text, and four layouts each.
+    pub fn diagnostic_message_dimensions(
+        &self,
+        message: &str,
+        format: &TextFormat,
+    ) -> (usize, u16) {
+        self.diagnostic_message_dimensions
+            .lock()
+            .get(message, format)
+    }
+
+    pub fn diagnostic_snapshot(&self) -> &DiagnosticSnapshot {
+        &self.diagnostic_snapshot
+    }
+
+    pub fn diagnostics_generation(&self) -> u64 {
+        self.diagnostics_generation
+    }
+
+    pub(crate) fn diagnostics_layout_generation(&self) -> u64 {
+        self.diagnostics_layout_generation
+    }
+
+    fn refresh_diagnostic_snapshot(&mut self) {
+        use helix_core::diagnostic::{DiagnosticTag, Severity};
+        self.diagnostics_generation = self.diagnostics_generation.wrapping_add(1);
+        if self.diagnostics.is_empty()
+            && self.diagnostic_snapshot.counts == DiagnosticCounts::default()
+        {
+            return;
+        }
+        let mut counts = DiagnosticCounts::default();
+        let mut ranges: [Vec<std::ops::Range<usize>>; 7] = std::array::from_fn(|_| Vec::new());
+        let push = |ranges: &mut Vec<std::ops::Range<usize>>, diagnostic: &Diagnostic| match ranges
+            .last_mut()
+        {
+            Some(previous) if diagnostic.range.start <= previous.end => {
+                previous.end = previous.end.max(diagnostic.range.end);
+            }
+            _ => ranges.push(diagnostic.range.start..diagnostic.range.end),
+        };
+        for diagnostic in &self.diagnostics {
+            let kind = match diagnostic.severity {
+                Some(Severity::Hint) => {
+                    counts.hints += 1;
+                    DiagnosticHighlightKind::Hint
+                }
+                Some(Severity::Info) => {
+                    counts.info += 1;
+                    DiagnosticHighlightKind::Info
+                }
+                Some(Severity::Warning) => {
+                    counts.warnings += 1;
+                    DiagnosticHighlightKind::Warning
+                }
+                Some(Severity::Error) => {
+                    counts.errors += 1;
+                    DiagnosticHighlightKind::Error
+                }
+                None => {
+                    counts.hints += 1;
+                    DiagnosticHighlightKind::Default
+                }
+            };
+            if diagnostic.tags.is_empty()
+                || matches!(
+                    diagnostic.severity,
+                    Some(Severity::Warning | Severity::Error)
+                )
+            {
+                push(&mut ranges[kind as usize], diagnostic);
+            }
+            for tag in &diagnostic.tags {
+                let kind = match tag {
+                    DiagnosticTag::Unnecessary => DiagnosticHighlightKind::Unnecessary,
+                    DiagnosticTag::Deprecated => DiagnosticHighlightKind::Deprecated,
+                };
+                push(&mut ranges[kind as usize], diagnostic);
+            }
+        }
+        self.diagnostic_snapshot = DiagnosticSnapshot {
+            counts,
+            ranges: ranges.map(Arc::new),
+        };
+    }
+
     pub fn replace_diagnostics(
         &mut self,
         diagnostics: impl IntoIterator<Item = Diagnostic>,
@@ -2282,19 +2888,19 @@ impl Document {
             });
         }
         self.diagnostics.extend(diagnostics);
-        self.diagnostics.sort_by_key(|diagnostic| {
-            (
-                diagnostic.range,
-                diagnostic.severity,
-                diagnostic.provider.clone(),
-            )
+        self.diagnostics.sort_by(|a, b| {
+            (a.range, a.severity, &a.provider).cmp(&(b.range, b.severity, &b.provider))
         });
+        self.diagnostics_layout_generation = self.diagnostics_layout_generation.wrapping_add(1);
+        self.refresh_diagnostic_snapshot();
     }
 
     /// clears diagnostics for a given language server id if set, otherwise all diagnostics are cleared
     pub fn clear_diagnostics_for_language_server(&mut self, id: LanguageServerId) {
         self.diagnostics
             .retain(|d| d.provider.language_server_id() != Some(id));
+        self.diagnostics_layout_generation = self.diagnostics_layout_generation.wrapping_add(1);
+        self.refresh_diagnostic_snapshot();
     }
 
     /// Get the document's auto pairs. If the document has a recognized
@@ -2406,11 +3012,13 @@ impl Document {
             wrap_indicator_highlight: theme
                 .and_then(|theme| theme.find_highlight("ui.virtual.wrap")),
             soft_wrap_at_text_width,
+            checkpoint_cache: Some(self.formatter_cache.clone()),
         }
     }
 
     /// Set the inlay hints for this document and `view_id`.
-    pub fn set_inlay_hints(&mut self, view_id: ViewId, inlay_hints: DocumentInlayHints) {
+    pub fn set_inlay_hints(&mut self, view_id: ViewId, mut inlay_hints: DocumentInlayHints) {
+        inlay_hints.refresh_layout_keys();
         self.inlay_hints.insert(view_id, inlay_hints);
     }
 
@@ -2534,6 +3142,289 @@ mod test {
     use arc_swap::ArcSwap;
 
     use super::*;
+
+    fn document_for_save(path: &Path) -> Document {
+        let mut doc = Document::from(
+            Rope::from_str("first\n"),
+            None,
+            Arc::new(ArcSwap::from_pointee(Config::default())),
+            Arc::new(ArcSwap::from_pointee(syntax::Loader::default())),
+        );
+        doc.set_path(Some(path));
+        doc
+    }
+
+    #[test]
+    fn canceled_git_baseline_decoding_returns_no_rope() {
+        let mut controller = TaskController::new();
+        let cancel = controller.restart();
+        assert_eq!(
+            Document::decode_diff_base(
+                "😀 baseline\n".as_bytes().to_vec(),
+                encoding::UTF_8,
+                &cancel
+            )
+            .unwrap()
+            .to_string(),
+            "😀 baseline\n"
+        );
+        controller.cancel();
+        assert!(
+            Document::decode_diff_base(vec![b'x'; 128 * 1024], encoding::UTF_8, &cancel).is_none()
+        );
+    }
+
+    #[test]
+    fn edits_invalidate_raw_coordinates_even_when_length_is_unchanged() {
+        let mut doc = Document::from(
+            Rope::from_str(&"a".repeat(5000)),
+            None,
+            Arc::new(ArcSwap::from_pointee(Config::default())),
+            Arc::new(ArcSwap::from_pointee(syntax::Loader::default())),
+        );
+        let view = ViewId::default();
+        doc.ensure_view_init(view);
+        assert_eq!(doc.coords_at_pos(5000), helix_core::Position::new(0, 5000));
+        let replacement = Transaction::change(
+            doc.text(),
+            [(4096, 4097, Some("\u{301}".into()))].into_iter(),
+        );
+        assert!(doc.apply(&replacement, view));
+        assert_eq!(doc.coords_at_pos(5000), helix_core::Position::new(0, 4999));
+        let newline =
+            Transaction::change(doc.text(), [(4000, 4000, Some("\n".into()))].into_iter());
+        assert!(doc.apply(&newline, view));
+        assert_eq!(doc.coords_at_pos(5001), helix_core::Position::new(1, 999));
+        for pos in [0, 3999, 4000, 4001, 4096, 4097, 4098, 5001] {
+            assert_eq!(
+                doc.coords_at_pos(pos),
+                helix_core::coords_at_pos(doc.text().slice(..), pos)
+            );
+        }
+    }
+
+    #[test]
+    fn document_highlights_batch_multicursor_edits_and_drop_deleted_ranges() {
+        let mut doc = Document::from(
+            Rope::from_str("αβ γδ 😀x\nend"),
+            None,
+            Arc::new(ArcSwap::from_pointee(Config::default())),
+            Arc::new(ArcSwap::from_pointee(syntax::Loader::default())),
+        );
+        let view = ViewId::default();
+        doc.ensure_view_init(view);
+        doc.set_document_highlights(view, vec![0..2, 3..5, 6..8, 9..12]);
+        let transaction = Transaction::change(
+            doc.text(),
+            [
+                (0, 0, Some("界".into())),
+                (3, 5, None),
+                (7, 8, Some("e\u{301}".into())),
+                (9, 12, None),
+            ]
+            .into_iter(),
+        );
+        assert!(doc.apply(&transaction, view));
+        assert_eq!(doc.document_highlights(view), Some([1..3, 5..8].as_slice()));
+    }
+
+    #[test]
+    fn edits_invalidate_visual_layout_checkpoints_even_when_length_is_unchanged() {
+        use helix_core::doc_formatter::DocumentFormatter;
+        use helix_core::text_annotations::TextAnnotations;
+        let mut doc = Document::from(
+            Rope::from_str(&"word ".repeat(1500)),
+            None,
+            Arc::new(ArcSwap::from_pointee(Config::default())),
+            Arc::new(ArcSwap::from_pointee(syntax::Loader::default())),
+        );
+        let view = ViewId::default();
+        doc.ensure_view_init(view);
+        let annotations = TextAnnotations::default();
+        let format = doc.text_format(80, None);
+        DocumentFormatter::new_at_prev_checkpoint(doc.text.slice(..), &format, &annotations, 0)
+            .for_each(drop);
+        assert!(
+            DocumentFormatter::new_at_prev_checkpoint(
+                doc.text.slice(..),
+                &format,
+                &annotations,
+                6000
+            )
+            .next_char_pos()
+                > 0
+        );
+        let transaction =
+            Transaction::change(&doc.text, [(100, 101, Some("\t".into()))].into_iter());
+        assert!(doc.apply(&transaction, view));
+        assert_eq!(
+            DocumentFormatter::new_at_prev_checkpoint(
+                doc.text.slice(..),
+                &doc.text_format(80, None),
+                &annotations,
+                6000
+            )
+            .next_char_pos(),
+            0
+        );
+    }
+
+    #[test]
+    fn prepared_preview_keeps_loaded_contents_and_metadata_without_reopening() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("preview.txt");
+        std::fs::write(&path, "\u{feff}  preview 😀\r\n").unwrap();
+        let worker_path = path.clone();
+        let loaded = std::thread::spawn(move || {
+            let config = Arc::new(ArcSwap::from_pointee(Config {
+                editor_config: false,
+                ..Config::default()
+            }));
+            Document::open(
+                &worker_path,
+                None,
+                false,
+                config,
+                Arc::new(ArcSwap::from_pointee(syntax::Loader::default())),
+            )
+            .unwrap()
+            .into_preview()
+        })
+        .join()
+        .unwrap();
+        let loaded_time = loaded.last_saved_time;
+        std::fs::remove_file(&path).unwrap();
+        let doc = Document::from_preview(
+            loaded,
+            Arc::new(ArcSwap::from_pointee(Config::default())),
+            Arc::new(ArcSwap::from_pointee(syntax::Loader::default())),
+        );
+        assert_eq!(doc.text().to_string(), "  preview 😀\r\n");
+        assert!(doc.has_bom);
+        assert_eq!(doc.line_ending, LineEnding::Crlf);
+        assert_eq!(doc.path(), Some(path.as_path()));
+        assert_eq!(doc.last_saved_time, loaded_time);
+        assert!(!doc.is_modified());
+    }
+
+    fn set_file_modified(path: &Path, modified: SystemTime) {
+        std::fs::File::open(path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn queued_saves_use_latest_file_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.txt");
+        std::fs::write(&path, "initial\n").unwrap();
+        set_file_modified(&path, SystemTime::UNIX_EPOCH);
+        let mut doc = document_for_save(&path);
+
+        let first = doc.save(None::<PathBuf>, false).unwrap();
+        doc.text = Rope::from_str("second\n");
+        let second = doc.save(None::<PathBuf>, false).unwrap();
+        first.await.unwrap();
+        second.await.unwrap();
+
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "second\n");
+    }
+
+    #[tokio::test]
+    async fn queued_save_detects_external_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.txt");
+        std::fs::write(&path, "initial\n").unwrap();
+        let mut doc = document_for_save(&path);
+
+        let first = doc.save(None::<PathBuf>, false).unwrap();
+        let second = doc.save(None::<PathBuf>, false).unwrap();
+        let saved = first.await.unwrap();
+        std::fs::write(&path, "external\n").unwrap();
+        set_file_modified(&path, saved.save_time + std::time::Duration::from_secs(60));
+
+        assert!(second
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("external process"));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "external\n");
+    }
+
+    #[tokio::test]
+    async fn refreshed_baseline_does_not_allow_an_older_queued_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.txt");
+        std::fs::write(&path, "initial\n").unwrap();
+        set_file_modified(&path, SystemTime::UNIX_EPOCH);
+        let mut doc = document_for_save(&path);
+        let old_save = doc.save(None::<PathBuf>, false).unwrap();
+
+        std::fs::write(&path, "external\n").unwrap();
+        set_file_modified(
+            &path,
+            SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(60),
+        );
+        // Reload refreshes both the document contents and its disk baseline.
+        doc.text = Rope::from_str("external\n");
+        doc.pickup_last_saved_time();
+        let new_save = doc.save(None::<PathBuf>, false).unwrap();
+
+        assert!(old_save
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("external process"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "external\n");
+        new_save.await.unwrap();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "external\n");
+    }
+
+    #[tokio::test]
+    async fn forced_save_updates_the_baseline_for_following_queued_saves() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.txt");
+        std::fs::write(&path, "initial\n").unwrap();
+        set_file_modified(&path, SystemTime::UNIX_EPOCH);
+        let mut doc = document_for_save(&path);
+        std::fs::write(&path, "external\n").unwrap();
+        set_file_modified(
+            &path,
+            SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(60),
+        );
+
+        let forced_save = doc.save(None::<PathBuf>, true).unwrap();
+        doc.text = Rope::from_str("second\n");
+        let next_save = doc.save(None::<PathBuf>, false).unwrap();
+        forced_save.await.unwrap();
+        next_save.await.unwrap();
+
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "second\n");
+    }
+
+    #[tokio::test]
+    async fn saving_another_path_does_not_hide_external_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("original.txt");
+        let other = dir.path().join("other.txt");
+        std::fs::write(&path, "initial\n").unwrap();
+        set_file_modified(&path, SystemTime::UNIX_EPOCH);
+        let mut doc = document_for_save(&path);
+
+        let other_save = doc.save(Some(other.clone()), false).unwrap();
+        let original_save = doc.save(None::<PathBuf>, false).unwrap();
+        std::fs::write(&path, "external\n").unwrap();
+        set_file_modified(
+            &path,
+            SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(60),
+        );
+        other_save.await.unwrap();
+
+        assert!(original_save.await.is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "external\n");
+        assert_eq!(std::fs::read_to_string(other).unwrap(), "first\n");
+    }
 
     #[test]
     fn changeset_to_changes_ignore_line_endings() {
@@ -2768,4 +3659,59 @@ mod test {
     decode!(jis0212_decode, "jis0212", "EUC-JP");
     decode!(shift_jis_decode, "shift_jis");
     encode!(shift_jis_encode, "shift_jis");
+}
+
+#[cfg(test)]
+mod diagnostic_message_dimension_tests {
+    use super::*;
+
+    #[test]
+    fn message_dimensions_reuse_and_invalidate_width_text_and_tab_settings() {
+        let mut cache = DiagnosticMessageDimensionsCache::default();
+        let mut format = TextFormat {
+            soft_wrap: true,
+            viewport_width: 12,
+            wrap_indicator: "".into(),
+            ..TextFormat::default()
+        };
+        let message = "界\tseveral words\nnext";
+        let expected = helix_core::softwrapped_dimensions(message.into(), &format);
+        assert_eq!(cache.get(message, &format), expected);
+        assert_eq!(cache.get(message, &format), expected);
+        assert_eq!(cache.entries[message].layouts.len(), 1);
+        format.viewport_width = 6;
+        assert_eq!(
+            cache.get(message, &format),
+            helix_core::softwrapped_dimensions(message.into(), &format)
+        );
+        format.tab_width = 8;
+        assert_eq!(
+            cache.get(message, &format),
+            helix_core::softwrapped_dimensions(message.into(), &format)
+        );
+        assert_eq!(cache.entries[message].layouts.len(), 3);
+        let replacement = "replacement text";
+        assert_eq!(
+            cache.get(replacement, &format),
+            helix_core::softwrapped_dimensions(replacement.into(), &format)
+        );
+        assert_eq!(cache.entries.len(), 2);
+    }
+
+    #[test]
+    fn dimensions_retention_is_bounded_for_messages_and_layouts() {
+        let mut cache = DiagnosticMessageDimensionsCache::default();
+        let mut format = TextFormat::default();
+        for index in 0..MAX_DIAGNOSTIC_MESSAGES + 1 {
+            cache.get(&format!("message {index}"), &format);
+        }
+        assert_eq!(cache.entries.len(), MAX_DIAGNOSTIC_MESSAGES);
+        assert!(!cache.entries.contains_key("message 0"));
+        for width in 1..10 {
+            format.viewport_width = width;
+            cache.get("message 1", &format);
+        }
+        assert_eq!(cache.entries["message 1"].layouts.len(), 4);
+        assert!(cache.bytes <= MAX_DIAGNOSTIC_MESSAGE_BYTES);
+    }
 }

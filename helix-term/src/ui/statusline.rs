@@ -1,6 +1,5 @@
 use helix_core::indent::IndentStyle;
-use helix_core::{coords_at_pos, encoding, unicode::width::UnicodeWidthStr, Position};
-use helix_lsp::lsp::DiagnosticSeverity;
+use helix_core::{encoding, unicode::width::UnicodeWidthStr, Position};
 use helix_view::document::DEFAULT_LANGUAGE_NAME;
 use helix_view::{
     document::{Mode, SCRATCH_BUFFER_NAME},
@@ -217,20 +216,7 @@ where
     F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
 {
     use helix_core::diagnostic::Severity;
-    let (hints, info, warnings, errors) =
-        context
-            .doc
-            .diagnostics()
-            .iter()
-            .fold((0, 0, 0, 0), |mut counts, diag| {
-                match diag.severity {
-                    Some(Severity::Hint) | None => counts.0 += 1,
-                    Some(Severity::Info) => counts.1 += 1,
-                    Some(Severity::Warning) => counts.2 += 1,
-                    Some(Severity::Error) => counts.3 += 1,
-                }
-                counts
-            });
+    let (hints, info, warnings, errors) = context.doc.diagnostic_snapshot().counts.as_tuple();
 
     for sev in &context.editor.config().statusline.diagnostics {
         match sev {
@@ -266,24 +252,7 @@ where
     F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
 {
     use helix_core::diagnostic::Severity;
-    let (hints, info, warnings, errors) = context.editor.diagnostics.values().flatten().fold(
-        (0u32, 0u32, 0u32, 0u32),
-        |mut counts, (diag, _)| {
-            match diag.severity {
-                // PERF: For large workspace diagnostics, this loop can be very tight.
-                //
-                // Most often the diagnostics will be for warnings and errors.
-                // Errors should tend to be fixed fast, leaving warnings as the most common.
-                Some(DiagnosticSeverity::WARNING) => counts.2 += 1,
-                Some(DiagnosticSeverity::ERROR) => counts.3 += 1,
-                Some(DiagnosticSeverity::HINT) => counts.0 += 1,
-                Some(DiagnosticSeverity::INFORMATION) => counts.1 += 1,
-                // Fallback to `hint`.
-                _ => counts.0 += 1,
-            }
-            counts
-        },
-    );
+    let (hints, info, warnings, errors) = context.editor.diagnostics.counts().as_tuple();
 
     let sevs_to_show = &context.editor.config().statusline.workspace_diagnostics;
 
@@ -356,14 +325,12 @@ where
 }
 
 fn get_position(context: &RenderContext) -> Position {
-    coords_at_pos(
-        context.doc.text().slice(..),
-        context
-            .doc
-            .selection(context.view.id)
-            .primary()
-            .cursor(context.doc.text().slice(..)),
-    )
+    let cursor = context
+        .doc
+        .selection(context.view.id)
+        .primary()
+        .cursor(context.doc.text().slice(..));
+    context.doc.coords_at_pos(cursor)
 }
 
 fn render_position<'a, F>(context: &mut RenderContext<'a>, write: F)
@@ -390,12 +357,14 @@ fn render_position_percentage<'a, F>(context: &mut RenderContext<'a>, write: F)
 where
     F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
 {
-    let position = get_position(context);
+    let cursor = context
+        .doc
+        .selection(context.view.id)
+        .primary()
+        .cursor(context.doc.text().slice(..));
+    let row = context.doc.text().char_to_line(cursor);
     let maxrows = context.doc.text().len_lines();
-    write(
-        context,
-        format!("{}%", (position.row + 1) * 100 / maxrows).into(),
-    );
+    write(context, format!("{}%", (row + 1) * 100 / maxrows).into());
 }
 
 fn render_file_encoding<'a, F>(context: &mut RenderContext<'a>, write: F)

@@ -195,14 +195,14 @@ fn serialize_path(out: &mut String, path: &Path) -> Result<(), ()> {
     let mut components = path.components();
     match components.next() {
         Some(Component::Prefix(prefix)) => match prefix.kind() {
-            Prefix::Disk(_) | Prefix::VerbatimDisk(_) => {
+            Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => {
                 // `C:` -> `/C:`
                 out.push('/');
-                out.push_str(&prefix.as_os_str().to_string_lossy());
+                out.push(char::from(drive));
+                out.push(':');
             }
             Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => {
-                // `\\server\share` -> `//server/share` (authority + first seg)
-                out.pop(); // drop one `/` from the `file://` we were appended to
+                // Append the authority and first path segment to `file://`.
                 out.push_str(&server.to_string_lossy());
                 out.push('/');
                 out.extend(percent_encode(share.to_string_lossy().as_bytes(), PATH));
@@ -213,13 +213,19 @@ fn serialize_path(out: &mut String, path: &Path) -> Result<(), ()> {
     }
     for component in components {
         match component {
-            Component::RootDir => {}
+            Component::RootDir => out.push('/'),
             Component::Normal(seg) => {
-                out.push('/');
+                if !out.ends_with('/') {
+                    out.push('/');
+                }
                 out.extend(percent_encode(seg.to_string_lossy().as_bytes(), PATH));
             }
-            Component::CurDir => out.push_str("/."),
-            Component::ParentDir => out.push_str("/.."),
+            Component::CurDir | Component::ParentDir => {
+                if !out.ends_with('/') {
+                    out.push('/');
+                }
+                out.push_str(component.as_os_str().to_str().ok_or(())?);
+            }
             Component::Prefix(_) => return Err(()),
         }
     }
@@ -304,6 +310,49 @@ mod tests {
         ] {
             let url = Url::from_file_path(path).unwrap();
             assert_eq!(url.to_file_path().unwrap(), PathBuf::from(path), "{}", url);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_file_path_round_trip() {
+        for (path, expected_url, expected_path) in [
+            (
+                r"C:\projects\a b.rs",
+                "file:///C:/projects/a%20b.rs",
+                r"C:\projects\a b.rs",
+            ),
+            (
+                r"\\?\C:\projects\a b.rs",
+                "file:///C:/projects/a%20b.rs",
+                r"C:\projects\a b.rs",
+            ),
+            (
+                r"\\server\share\a b.rs",
+                "file://server/share/a%20b.rs",
+                r"\\server\share\a b.rs",
+            ),
+            (
+                r"\\?\UNC\server\share\a b.rs",
+                "file://server/share/a%20b.rs",
+                r"\\server\share\a b.rs",
+            ),
+            (r"C:\", "file:///C:/", r"C:\"),
+            (r"\\?\C:\", "file:///C:/", r"C:\"),
+            (
+                r"\\server\share\",
+                "file://server/share/",
+                r"\\server\share\",
+            ),
+            (
+                r"\\?\UNC\server\share\",
+                "file://server/share/",
+                r"\\server\share\",
+            ),
+        ] {
+            let url = Url::from_file_path(path).unwrap();
+            assert_eq!(url.as_str(), expected_url, "{path}");
+            assert_eq!(url.to_file_path().unwrap(), PathBuf::from(expected_path));
         }
     }
 

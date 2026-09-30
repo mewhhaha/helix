@@ -142,6 +142,78 @@ pub fn canonicalize(path: impl AsRef<Path>) -> PathBuf {
     normalize(path)
 }
 
+/// Rename a file or directory without replacing an existing destination.
+///
+/// The destination check is atomic on Linux, Android, Apple platforms, Redox,
+/// and Windows. Other platforms check for an existing destination before renaming.
+pub fn rename_noreplace(old: &Path, new: &Path) -> std::io::Result<()> {
+    #[cfg(all(
+        unix,
+        any(
+            target_os = "linux",
+            target_os = "android",
+            target_vendor = "apple",
+            target_os = "redox"
+        )
+    ))]
+    {
+        use rustix::fs::{renameat_with, RenameFlags, CWD};
+
+        renameat_with(CWD, old, CWD, new, RenameFlags::NOREPLACE).map_err(Into::into)
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+
+        fn wide_path(path: &Path) -> std::io::Result<Vec<u16>> {
+            let mut path: Vec<_> = path.as_os_str().encode_wide().collect();
+            if path.contains(&0) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "path contains a NUL character",
+                ));
+            }
+            path.push(0);
+            Ok(path)
+        }
+
+        let old = wide_path(old)?;
+        let new = wide_path(new)?;
+        // SAFETY: Both buffers are NUL-terminated and remain valid for this call.
+        // Omitting MOVEFILE_REPLACE_EXISTING prevents replacing the destination.
+        if unsafe { MoveFileExW(old.as_ptr(), new.as_ptr(), 0) } == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    #[cfg(not(any(
+        windows,
+        all(
+            unix,
+            any(
+                target_os = "linux",
+                target_os = "android",
+                target_vendor = "apple",
+                target_os = "redox"
+            )
+        )
+    )))]
+    {
+        match std::fs::symlink_metadata(new) {
+            Ok(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "destination already exists",
+            )),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => std::fs::rename(old, new),
+            Err(err) => Err(err),
+        }
+    }
+}
+
 /// Convert path into a relative path
 pub fn get_relative_path<'a, P>(path: P) -> Cow<'a, Path>
 where
@@ -311,6 +383,85 @@ mod tests {
     use ropey::RopeSlice;
 
     use crate::path::{self, compile_path_regex};
+
+    #[test]
+    fn rename_noreplace_moves_files_and_directories() {
+        let directory = tempfile::tempdir().unwrap();
+        let old = directory.path().join("old.txt");
+        let new = directory.path().join("new.txt");
+        std::fs::write(&old, "file contents").unwrap();
+
+        path::rename_noreplace(&old, &new).unwrap();
+        assert!(!old.exists());
+        assert_eq!(std::fs::read_to_string(&new).unwrap(), "file contents");
+
+        let old = directory.path().join("old-directory");
+        let new = directory.path().join("new-directory");
+        std::fs::create_dir(&old).unwrap();
+        std::fs::write(old.join("child.txt"), "child contents").unwrap();
+
+        path::rename_noreplace(&old, &new).unwrap();
+        assert!(!old.exists());
+        assert_eq!(
+            std::fs::read_to_string(new.join("child.txt")).unwrap(),
+            "child contents"
+        );
+    }
+
+    #[test]
+    fn rename_noreplace_preserves_existing_files_and_directories() {
+        let directory = tempfile::tempdir().unwrap();
+        let old = directory.path().join("old.txt");
+        let new = directory.path().join("new.txt");
+        std::fs::write(&old, "source contents").unwrap();
+        std::fs::write(&new, "destination contents").unwrap();
+
+        assert!(path::rename_noreplace(&old, &new).is_err());
+        assert_eq!(std::fs::read_to_string(&old).unwrap(), "source contents");
+        assert_eq!(
+            std::fs::read_to_string(&new).unwrap(),
+            "destination contents"
+        );
+
+        let old = directory.path().join("old-directory");
+        let new = directory.path().join("new-directory");
+        std::fs::create_dir(&old).unwrap();
+        std::fs::create_dir(&new).unwrap();
+        std::fs::write(old.join("child.txt"), "source child").unwrap();
+
+        // An empty directory is still an existing destination.
+        assert!(path::rename_noreplace(&old, &new).is_err());
+        assert_eq!(
+            std::fs::read_to_string(old.join("child.txt")).unwrap(),
+            "source child"
+        );
+        assert_eq!(std::fs::read_dir(&new).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rename_noreplace_preserves_a_dangling_destination_symlink() {
+        let directory = tempfile::tempdir().unwrap();
+        let old = directory.path().join("old.txt");
+        let new = directory.path().join("new.txt");
+        let target = directory.path().join("missing.txt");
+        std::fs::write(&old, "source contents").unwrap();
+        std::os::unix::fs::symlink(&target, &new).unwrap();
+
+        assert!(path::rename_noreplace(&old, &new).is_err());
+        assert_eq!(std::fs::read_to_string(&old).unwrap(), "source contents");
+        assert!(std::fs::symlink_metadata(&new).unwrap().is_symlink());
+        assert_eq!(std::fs::read_link(new).unwrap(), target);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rename_noreplace_rejects_embedded_nul_in_either_path() {
+        for (old, new) in [("old\0.txt", "new.txt"), ("old.txt", "new\0.txt")] {
+            let error = path::rename_noreplace(Path::new(old), Path::new(new)).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        }
+    }
 
     #[test]
     fn expand_tilde() {

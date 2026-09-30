@@ -31,12 +31,12 @@ use tui::widgets::Widget;
 use std::{
     borrow::Cow,
     collections::HashMap,
-    io::Read,
     path::Path,
     sync::{
         atomic::{self, AtomicUsize},
         Arc,
     },
+    time::{Duration, Instant},
 };
 
 use crate::ui::{Prompt, PromptEvent};
@@ -52,13 +52,45 @@ use helix_view::{
     Document, DocumentId, Editor,
 };
 
-use self::handlers::{DynamicQueryChange, DynamicQueryHandler, PreviewHighlightHandler};
+pub(crate) use self::handlers::LatestBlockingWorker;
+use self::handlers::{
+    DynamicQueryChange, DynamicQueryHandler, PreviewLoadHandler, PreviewLoadStatus, PreviewRequest,
+};
 
 pub const ID: &str = "picker";
 
 pub const MIN_AREA_WIDTH_FOR_PREVIEW: u16 = 72;
 /// Biggest file size to preview in bytes
 pub const MAX_FILE_SIZE_FOR_PREVIEW: u64 = 10 * 1024 * 1024;
+
+const MAX_CACHED_PREVIEWS: usize = 32;
+const MAX_CACHED_PREVIEW_BYTES: usize = 32 * 1024 * 1024;
+const MAX_DIRECTORY_PREVIEW_BYTES: usize = 2 * 1024 * 1024;
+const PREVIEW_RETRY_DELAY: Duration = Duration::from_millis(250);
+const TRUNCATED_DIRECTORY_PREVIEW: &str = "… <directory preview truncated>";
+
+fn bounded_directory_preview(
+    entries: impl IntoIterator<Item = (String, bool)>,
+    max_bytes: usize,
+) -> Vec<(String, bool)> {
+    let entry_bytes = std::mem::size_of::<(String, bool)>();
+    let marker_bytes = TRUNCATED_DIRECTORY_PREVIEW.len() + entry_bytes;
+    let mut retained = 0;
+    let mut bounded = Vec::new();
+    for (name, is_dir) in entries {
+        let bytes = name.capacity() + entry_bytes;
+        if retained + bytes > max_bytes.saturating_sub(marker_bytes) {
+            if marker_bytes <= max_bytes {
+                bounded.push((TRUNCATED_DIRECTORY_PREVIEW.to_owned(), false));
+            }
+            break;
+        }
+        retained += bytes;
+        bounded.push((name, is_dir));
+    }
+    // Do not retain the growth capacity of a much larger directory listing.
+    bounded.into_boxed_slice().into_vec()
+}
 
 #[derive(PartialEq, Eq, Hash)]
 pub enum PathOrId<'a> {
@@ -91,11 +123,102 @@ pub enum CachedPreview {
     NotFound,
 }
 
+impl CachedPreview {
+    fn retained_bytes(&self) -> usize {
+        match self {
+            Self::Document(doc) => doc.text().len_bytes(),
+            Self::Directory(entries) => {
+                entries.capacity() * std::mem::size_of::<(String, bool)>()
+                    + entries
+                        .iter()
+                        .map(|(name, _)| name.capacity())
+                        .sum::<usize>()
+            }
+            _ => std::mem::size_of::<Self>(),
+        }
+    }
+}
+
+struct CachedPreviewEntry {
+    preview: CachedPreview,
+    used: u64,
+    bytes: usize,
+}
+
+/// Bound both retained decoded text and the number of syntax trees / directory
+/// listings. The byte budget excludes opaque tree-sitter allocations.
+#[derive(Default)]
+struct PreviewCache {
+    entries: HashMap<Arc<Path>, CachedPreviewEntry>,
+    bytes: usize,
+    clock: u64,
+}
+
+impl PreviewCache {
+    fn contains_key(&self, path: &Path) -> bool {
+        self.entries.contains_key(path)
+    }
+
+    fn get(&mut self, path: &Path) -> Option<&CachedPreview> {
+        let entry = self.entries.get_mut(path)?;
+        self.clock = self.clock.wrapping_add(1);
+        entry.used = self.clock;
+        Some(&entry.preview)
+    }
+
+    fn insert(&mut self, path: Arc<Path>, preview: CachedPreview) {
+        let preview = if preview.retained_bytes() > MAX_CACHED_PREVIEW_BYTES {
+            match preview {
+                CachedPreview::Directory(entries) => CachedPreview::Directory(
+                    bounded_directory_preview(entries, MAX_DIRECTORY_PREVIEW_BYTES),
+                ),
+                CachedPreview::Document(_) => CachedPreview::LargeFile,
+                preview => preview,
+            }
+        } else {
+            preview
+        };
+        if let Some(previous) = self.entries.remove(&path) {
+            self.bytes -= previous.bytes;
+        }
+        self.clock = self.clock.wrapping_add(1);
+        let bytes = preview.retained_bytes();
+        self.bytes += bytes;
+        self.entries.insert(
+            path.clone(),
+            CachedPreviewEntry {
+                preview,
+                bytes,
+                used: self.clock,
+            },
+        );
+        while self.entries.len() > MAX_CACHED_PREVIEWS || self.bytes > MAX_CACHED_PREVIEW_BYTES {
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .filter(|(key, _)| *key != &path)
+                .min_by_key(|(_, entry)| entry.used)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            let entry = self.entries.remove(&oldest).unwrap();
+            self.bytes -= entry.bytes;
+        }
+    }
+}
+
+struct PendingPreview {
+    generation: usize,
+    status: Arc<PreviewLoadStatus>,
+}
+
 // We don't store this enum in the cache so as to avoid lifetime constraints
 // from borrowing a document already opened in the editor.
 pub enum Preview<'picker, 'editor> {
     Cached(&'picker CachedPreview),
     EditorDocument(&'editor Document),
+    Loading,
 }
 
 impl Preview<'_, '_> {
@@ -118,6 +241,7 @@ impl Preview<'_, '_> {
     fn placeholder(&self) -> &str {
         match *self {
             Self::EditorDocument(_) => "<Invalid file location>",
+            Self::Loading => "<Loading preview…>",
             Self::Cached(preview) => match preview {
                 CachedPreview::Document(_) => "<Invalid file location>",
                 CachedPreview::Directory(_) => "<Invalid directory location>",
@@ -148,12 +272,12 @@ pub struct Injector<T, D> {
     editor_data: Arc<D>,
     version: usize,
     picker_version: Arc<AtomicUsize>,
-    /// A marker that requests a redraw when the injector drops.
-    /// This marker causes the "running" indicator to disappear when a background job
+    /// Requests a redraw when the injector drops, including on blocking workers.
+    /// This causes the "running" indicator to disappear when a background job
     /// providing items is finished and drops. This could be wrapped in an [Arc] to ensure
     /// that the redraw is only requested when all Injectors drop for a Picker (which removes
     /// the "running" indicator) but the redraw handle is debounced so this is unnecessary.
-    _redraw: helix_event::RequestRedrawOnDrop,
+    redraw: Arc<dyn Fn() + Send + Sync>,
 }
 
 impl<I, D> Clone for Injector<I, D> {
@@ -164,7 +288,7 @@ impl<I, D> Clone for Injector<I, D> {
             editor_data: self.editor_data.clone(),
             version: self.version,
             picker_version: self.picker_version.clone(),
-            _redraw: helix_event::RequestRedrawOnDrop,
+            redraw: self.redraw.clone(),
         }
     }
 }
@@ -174,6 +298,13 @@ impl<I, D> Clone for Injector<I, D> {
 pub struct InjectorShutdown;
 
 impl<T, D> Injector<T, D> {
+    pub fn cancellation(&self) -> PickerCancellation {
+        PickerCancellation {
+            version: self.version,
+            current: self.picker_version.clone(),
+        }
+    }
+
     pub fn push(&self, item: T) -> Result<(), InjectorShutdown> {
         if self.version != self.picker_version.load(atomic::Ordering::Relaxed) {
             return Err(InjectorShutdown);
@@ -181,6 +312,46 @@ impl<T, D> Injector<T, D> {
 
         inject_nucleo_item(&self.dst, &self.columns, item, &self.editor_data);
         Ok(())
+    }
+}
+
+impl<T, D> Drop for Injector<T, D> {
+    fn drop(&mut self) {
+        (self.redraw)();
+    }
+}
+
+#[derive(Clone)]
+pub struct PickerCancellation {
+    version: usize,
+    current: Arc<AtomicUsize>,
+}
+
+impl PickerCancellation {
+    pub fn is_canceled(&self) -> bool {
+        self.version != self.current.load(atomic::Ordering::Relaxed)
+    }
+
+    pub fn reader<'a, R: std::io::Read + 'a>(&'a self, reader: R) -> impl std::io::Read + 'a {
+        struct Reader<'a, R> {
+            inner: R,
+            cancellation: &'a PickerCancellation,
+        }
+        impl<R: std::io::Read> std::io::Read for Reader<'_, R> {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                if self.cancellation.is_canceled() {
+                    // Interrupted is retried by read_to_end, so cancellation
+                    // needs an error that stops the searcher's reader loop.
+                    return Err(std::io::Error::other("picker request canceled"));
+                }
+                let len = buffer.len().min(64 * 1024);
+                self.inner.read(&mut buffer[..len])
+            }
+        }
+        Reader {
+            inner: reader,
+            cancellation: self,
+        }
     }
 }
 
@@ -262,13 +433,17 @@ pub struct Picker<T: 'static + Send + Sync, D: 'static> {
 
     pub truncate_start: bool,
     /// Caches paths to documents
-    preview_cache: HashMap<Arc<Path>, CachedPreview>,
-    read_buffer: Vec<u8>,
+    preview_cache: PreviewCache,
+    preview_path: Option<Arc<Path>>,
+    preview_version: Arc<AtomicUsize>,
+    preview_pending: Option<PendingPreview>,
+    preview_retry_at: Option<Instant>,
     /// Given an item in the picker, return the file path and line number to display.
     file_fn: Option<FileCallback<T>>,
-    /// An event handler for syntax highlighting the currently previewed file.
-    preview_highlight_handler: Sender<Arc<Path>>,
+    /// Debounced, bounded background loading for the currently previewed file.
+    preview_load_handler: Sender<PreviewRequest>,
     dynamic_query_handler: Option<Sender<DynamicQueryChange>>,
+    background_task: helix_event::TaskController,
 }
 
 impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
@@ -281,7 +456,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         assert!(matcher_columns > 0);
         let matcher = Nucleo::new(
             Config::DEFAULT,
-            Arc::new(helix_event::request_redraw),
+            Arc::new(helix_event::redraw_callback()),
             None,
             matcher_columns,
         );
@@ -291,7 +466,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             editor_data: Arc::new(editor_data),
             version: 0,
             picker_version: Arc::new(AtomicUsize::new(0)),
-            _redraw: helix_event::RequestRedrawOnDrop,
+            redraw: Arc::new(helix_event::redraw_callback()),
         };
         (matcher, streamer)
     }
@@ -316,7 +491,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         assert!(matcher_columns > 0);
         let matcher = Nucleo::new(
             Config::DEFAULT,
-            Arc::new(helix_event::request_redraw),
+            Arc::new(helix_event::redraw_callback()),
             None,
             matcher_columns,
         );
@@ -342,10 +517,10 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
     ) -> Self {
         Self::with(
             matcher,
-            injector.columns,
+            injector.columns.clone(),
             primary_column,
-            injector.editor_data,
-            injector.picker_version,
+            injector.editor_data.clone(),
+            injector.picker_version.clone(),
             callback_fn,
         )
     }
@@ -389,12 +564,25 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             default_action: Action::Replace,
             completion_height: 0,
             widths,
-            preview_cache: HashMap::new(),
-            read_buffer: Vec::with_capacity(1024),
+            preview_cache: PreviewCache::default(),
+            preview_path: None,
+            preview_version: Arc::new(AtomicUsize::new(0)),
+            preview_pending: None,
+            preview_retry_at: None,
             file_fn: None,
-            preview_highlight_handler: PreviewHighlightHandler::<T, D>::default().spawn(),
+            preview_load_handler: PreviewLoadHandler::<T, D>::default().spawn(),
             dynamic_query_handler: None,
+            background_task: helix_event::TaskController::new(),
         }
+    }
+
+    /// Start an operation that must stop when this picker closes.
+    pub fn cancel_background_task(&mut self) {
+        self.background_task.cancel();
+    }
+
+    pub fn background_task(&mut self) -> helix_event::TaskHandle {
+        self.background_task.restart()
     }
 
     pub fn injector(&self) -> Injector<T, D> {
@@ -404,7 +592,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             editor_data: self.editor_data.clone(),
             version: self.version.load(atomic::Ordering::Relaxed),
             picker_version: self.version.clone(),
-            _redraw: helix_event::RequestRedrawOnDrop,
+            redraw: Arc::new(helix_event::redraw_callback()),
         }
     }
 
@@ -444,6 +632,8 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             query: self.primary_query(),
             // Treat the initial query as a paste.
             is_paste: true,
+            generation: self.version.load(atomic::Ordering::Relaxed),
+            version: self.version.clone(),
         };
         helix_event::send_blocking(&handler, event);
         self.dynamic_query_handler = Some(handler);
@@ -522,6 +712,35 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
 
     pub fn toggle_preview(&mut self) {
         self.show_preview = !self.show_preview;
+        if !self.show_preview {
+            self.cancel_preview_load();
+        }
+    }
+
+    fn cancel_preview_load(&mut self) {
+        if self.preview_path.take().is_some() {
+            self.preview_version.fetch_add(1, atomic::Ordering::Relaxed);
+        }
+        self.preview_pending = None;
+        self.preview_retry_at = None;
+    }
+
+    fn retry_preview_load(&mut self) -> bool {
+        if let Some(pending) = &self.preview_pending {
+            if !pending.status.failed() {
+                return false;
+            }
+            self.preview_pending = None;
+            self.preview_retry_at = Some(Instant::now() + PREVIEW_RETRY_DELAY);
+            if tokio::runtime::Handle::try_current().is_ok() {
+                tokio::spawn(async {
+                    tokio::time::sleep(PREVIEW_RETRY_DELAY).await;
+                    helix_event::request_redraw();
+                });
+            }
+        }
+        self.preview_retry_at
+            .is_none_or(|retry_at| Instant::now() >= retry_at)
     }
 
     fn prompt_handle_event(&mut self, event: &Event, cx: &mut Context) -> EventResult {
@@ -533,6 +752,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
 
     fn handle_prompt_change(&mut self, is_paste: bool) {
         // TODO: better track how the pattern has changed
+        let old_primary_query = self.primary_query();
         let line = self.prompt.line();
         let old_query = self.query.parse(line);
         if self.query == old_query {
@@ -572,9 +792,17 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         // If this is a dynamic picker, notify the query hook that the primary
         // query might have been updated.
         if let Some(handler) = &self.dynamic_query_handler {
+            let query = self.primary_query();
+            if query != old_primary_query {
+                // Stop obsolete scans during the debounce before their
+                // successors start, including queries that produce no matches.
+                self.version.fetch_add(1, atomic::Ordering::Relaxed);
+            }
             let event = DynamicQueryChange {
-                query: self.primary_query(),
+                query,
                 is_paste,
+                generation: self.version.load(atomic::Ordering::Relaxed),
+                version: self.version.clone(),
             };
             helix_event::send_blocking(handler, event);
         }
@@ -586,95 +814,74 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         &'picker mut self,
         editor: &'editor Editor,
     ) -> Option<(Preview<'picker, 'editor>, Option<(usize, usize)>)> {
-        let current = self.selection()?;
-        let (path_or_id, range) = (self.file_fn.as_ref()?)(editor, current)?;
+        let Some(current) = self.selection() else {
+            self.cancel_preview_load();
+            return None;
+        };
+        let Some((path_or_id, range)) = (self.file_fn.as_ref()?)(editor, current) else {
+            self.cancel_preview_load();
+            return None;
+        };
 
         match path_or_id {
             PathOrId::Path(path) => {
-                if let Some(doc) = editor.document_by_path(path) {
+                let path: Arc<Path> = self
+                    .preview_path
+                    .as_ref()
+                    .filter(|current| current.as_ref() == path)
+                    .cloned()
+                    .unwrap_or_else(|| path.into());
+                let changed = self.preview_path.as_deref() != Some(path.as_ref());
+                if changed {
+                    self.preview_version.fetch_add(1, atomic::Ordering::Relaxed);
+                    self.preview_path = Some(path.clone());
+                    self.preview_pending = None;
+                    self.preview_retry_at = None;
+                }
+                if let Some(doc) = editor.document_by_path(&path) {
                     return Some((Preview::EditorDocument(doc), range));
                 }
-
-                if self.preview_cache.contains_key(path) {
-                    // NOTE: we use `HashMap::get_key_value` here instead of indexing so we can
-                    // retrieve the `Arc<Path>` key. The `path` in scope here is a `&Path` and
-                    // we can cheaply clone the key for the preview highlight handler.
-                    let (path, preview) = self.preview_cache.get_key_value(path).unwrap();
-                    if matches!(preview, CachedPreview::Document(doc) if doc.syntax().is_none()) {
-                        helix_event::send_blocking(&self.preview_highlight_handler, path.clone());
-                    }
-                    return Some((Preview::Cached(preview), range));
+                if self.preview_cache.contains_key(&path) {
+                    return Some((
+                        Preview::Cached(self.preview_cache.get(&path).unwrap()),
+                        range,
+                    ));
                 }
-
-                let path: Arc<Path> = path.into();
-                let preview = std::fs::metadata(&path)
-                    .and_then(|metadata| {
-                        if metadata.is_dir() {
-                            let files = super::directory_content(&path, editor)?;
-                            let file_names: Vec<_> = files
-                                .iter()
-                                .filter_map(|(file_path, is_dir)| {
-                                    let name = file_path
-                                        .strip_prefix(&path)
-                                        .map(|p| Some(p.as_os_str()))
-                                        .unwrap_or_else(|_| file_path.file_name())?
-                                        .to_string_lossy();
-                                    if *is_dir {
-                                        Some((format!("{}/", name), true))
-                                    } else {
-                                        Some((name.into_owned(), false))
-                                    }
-                                })
-                                .collect();
-                            Ok(CachedPreview::Directory(file_names))
-                        } else if metadata.is_file() {
-                            if metadata.len() > MAX_FILE_SIZE_FOR_PREVIEW {
-                                return Ok(CachedPreview::LargeFile);
-                            }
-                            let is_binary = std::fs::File::open(&path).and_then(|file| {
-                                // Read up to 1kb to detect the content type
-                                let n = file.take(1024).read_to_end(&mut self.read_buffer)?;
-                                let is_binary = crate::is_binary(&self.read_buffer[..n]);
-                                self.read_buffer.clear();
-                                Ok(is_binary)
-                            })?;
-                            if is_binary {
-                                return Ok(CachedPreview::Binary);
-                            }
-                            let mut doc = Document::open(
-                                &path,
-                                None,
-                                false,
-                                editor.config.clone(),
-                                editor.syn_loader.clone(),
-                            )
-                            .or(Err(std::io::Error::new(
-                                std::io::ErrorKind::NotFound,
-                                "Cannot open document",
-                            )))?;
-                            let loader = editor.syn_loader.load();
-                            if let Some(language_config) = doc.detect_language_config(&loader) {
-                                doc.language = Some(language_config);
-                                // Asynchronously highlight the new document
-                                helix_event::send_blocking(
-                                    &self.preview_highlight_handler,
-                                    path.clone(),
-                                );
-                            }
-                            Ok(CachedPreview::Document(Box::new(doc)))
-                        } else {
-                            Err(std::io::Error::new(
-                                std::io::ErrorKind::NotFound,
-                                "Neither a dir, nor a file",
-                            ))
+                if self.retry_preview_load() {
+                    let generation = self
+                        .preview_version
+                        .fetch_add(1, atomic::Ordering::Relaxed)
+                        .wrapping_add(1);
+                    let status = Arc::new(PreviewLoadStatus::default());
+                    self.preview_pending = Some(PendingPreview {
+                        generation,
+                        status: status.clone(),
+                    });
+                    self.preview_retry_at = None;
+                    let request = PreviewRequest {
+                        path,
+                        generation,
+                        version: self.preview_version.clone(),
+                        status: status.clone(),
+                        config: Arc::new(arc_swap::ArcSwap::from_pointee(editor.config().clone())),
+                        syn_loader: editor.syn_loader.clone(),
+                    };
+                    // Retry a saturated or closed handler later instead of blocking
+                    // rendering or assuming that a dropped event is still pending.
+                    if let Err(error) = self.preview_load_handler.try_send(request) {
+                        if matches!(error, tokio::sync::mpsc::error::TrySendError::Closed(_)) {
+                            self.preview_load_handler =
+                                PreviewLoadHandler::<T, D>::default().spawn();
                         }
-                    })
-                    .unwrap_or(CachedPreview::NotFound);
-                self.preview_cache.insert(path.clone(), preview);
-                Some((Preview::Cached(&self.preview_cache[&path]), range))
+                        status.fail();
+                        helix_event::request_redraw();
+                    }
+                }
+                Some((Preview::Loading, range))
             }
             PathOrId::Id(id) => {
-                let doc = editor.documents.get(&id).unwrap();
+                self.cancel_preview_load();
+                let doc = editor.documents.get(&id)?;
                 Some((Preview::EditorDocument(doc), range))
             }
         }
@@ -982,6 +1189,8 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             EditorView::doc_diagnostics_highlights_into(
                 doc,
                 &cx.editor.theme,
+                offset.anchor,
+                area.height,
                 &mut overlay_highlights,
             );
 
@@ -1047,6 +1256,8 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
         if render_preview {
             let preview_area = area.clip_left(picker_width);
             self.render_preview(preview_area, surface, cx);
+        } else {
+            self.cancel_preview_load();
         }
     }
 
@@ -1064,6 +1275,11 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
         };
 
         let close_fn = |picker: &mut Self| {
+            picker.background_task.cancel();
+            picker
+                .preview_version
+                .fetch_add(1, atomic::Ordering::Relaxed);
+            picker.preview_path = None;
             // if the picker is very large don't store it as last_picker to avoid
             // excessive memory consumption
             let callback: compositor::Callback =
@@ -1201,7 +1417,300 @@ impl<T: 'static + Send + Sync, D> Drop for Picker<T, D> {
     fn drop(&mut self) {
         // ensure we cancel any ongoing background threads streaming into the picker
         self.version.fetch_add(1, atomic::Ordering::Relaxed);
+        self.preview_version.fetch_add(1, atomic::Ordering::Relaxed);
     }
 }
 
 type PickerCallback<T> = Box<dyn Fn(&mut Context, &T, Action)>;
+
+#[cfg(test)]
+mod preview_cache_tests {
+    use arc_swap::{access::Map, ArcSwap};
+    use helix_core::{syntax, Rope};
+    use helix_view::theme;
+    use tokio::sync::mpsc::{channel, Receiver};
+
+    use super::*;
+
+    fn path(index: usize) -> Arc<Path> {
+        std::path::PathBuf::from(format!("/preview/{index}")).into()
+    }
+
+    fn editor() -> Editor {
+        let config = Arc::new(ArcSwap::from_pointee(crate::config::Config::default()));
+        let handlers = crate::handlers::setup_for_test(config.clone());
+        Editor::new(
+            Rect::new(0, 0, 80, 24),
+            Arc::new(theme::Loader::new(&[])),
+            Arc::new(ArcSwap::from_pointee(syntax::Loader::default())),
+            Arc::new(Map::new(config, |config: &crate::config::Config| {
+                &config.editor
+            })),
+            handlers,
+            helix_loader::workspace_trust::WorkspaceTrust::fully_trusted(),
+        )
+    }
+
+    fn picker(path: &Path) -> (Picker<std::path::PathBuf, ()>, Receiver<PreviewRequest>) {
+        let mut picker = Picker::new(
+            [Column::new("path", |path: &std::path::PathBuf, _: &()| {
+                Cell::from(path.to_string_lossy().into_owned())
+            })],
+            0,
+            [path.to_path_buf()],
+            (),
+            |_, _, _| {},
+        )
+        .with_preview(|_, path| Some((path.as_path().into(), None)));
+        picker.matcher.tick(1000);
+        picker.matcher.tick(1000);
+        assert!(picker.selection().is_some());
+        let (sender, receiver) = channel(1);
+        picker.preview_load_handler = sender;
+        (picker, receiver)
+    }
+
+    #[test]
+    fn canceled_multiline_search_stops_reading_before_any_match() {
+        use std::io::Read;
+
+        struct CancelAfterRead {
+            version: Arc<AtomicUsize>,
+            bytes_read: usize,
+        }
+        impl Read for CancelAfterRead {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                // A multiline search fills its input before producing matches.
+                // Cancel during that fill, even for a file with no matches.
+                assert!(buffer.len() <= 64 * 1024);
+                buffer.fill(b'a');
+                self.bytes_read += buffer.len();
+                self.version.fetch_add(1, atomic::Ordering::Relaxed);
+                Ok(buffer.len())
+            }
+        }
+        let version = Arc::new(AtomicUsize::new(1));
+        let cancellation = PickerCancellation {
+            version: 1,
+            current: version.clone(),
+        };
+        let mut source = CancelAfterRead {
+            version,
+            bytes_read: 0,
+        };
+        let matcher = grep_regex::RegexMatcherBuilder::new()
+            .multi_line(true)
+            .build("absent\\npattern")
+            .unwrap();
+        let mut searcher = grep_searcher::SearcherBuilder::new()
+            .multi_line(true)
+            .build();
+        let result = searcher.search_reader(
+            &matcher,
+            cancellation.reader(&mut source),
+            grep_searcher::sinks::UTF8(|_, _| panic!("canceled scan produced a match")),
+        );
+        assert!(result.is_err());
+        assert!(source.bytes_read > 0);
+        assert!(source.bytes_read <= 64 * 1024);
+    }
+
+    #[test]
+    fn cancellable_rope_search_keeps_multiline_unicode_buffer_contents() {
+        let cancellation = PickerCancellation {
+            version: 1,
+            current: Arc::new(AtomicUsize::new(1)),
+        };
+        let rope = Rope::from_str("disk differs\n😀 unsaved\nβ suffix\n");
+        let matcher = grep_regex::RegexMatcherBuilder::new()
+            .multi_line(true)
+            .build("😀 unsaved\\nβ")
+            .unwrap();
+        let mut searcher = grep_searcher::SearcherBuilder::new()
+            .multi_line(true)
+            .build();
+        let mut found = Vec::new();
+        searcher
+            .search_reader(
+                &matcher,
+                cancellation.reader(helix_core::RopeReader::new(rope.slice(..))),
+                grep_searcher::sinks::UTF8(|line, text| {
+                    found.push((line, text.to_owned()));
+                    Ok(true)
+                }),
+            )
+            .unwrap();
+        assert_eq!(found, vec![(2, "😀 unsaved\nβ suffix\n".to_owned())]);
+    }
+
+    #[tokio::test]
+    async fn picker_injector_can_finish_on_a_plain_blocking_thread() {
+        let (picker, _) = picker(Path::new("/preview/blocking-injector"));
+        let injector = picker.injector();
+        std::thread::spawn(move || drop(injector)).join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn closing_an_open_document_starts_a_preview_for_the_same_selected_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("preview.txt");
+        let mut editor = editor();
+        let id = editor.new_file(Action::VerticalSplit);
+        editor.documents.get_mut(&id).unwrap().set_path(Some(&path));
+        let (mut picker, mut requests) = picker(&path);
+        assert!(matches!(
+            picker.get_preview(&editor),
+            Some((Preview::EditorDocument(_), _))
+        ));
+        assert!(requests.try_recv().is_err());
+        assert!(picker.preview_pending.is_none());
+        assert!(editor.close_document(id, true).is_ok());
+        assert!(matches!(
+            picker.get_preview(&editor),
+            Some((Preview::Loading, _))
+        ));
+        let request = requests.try_recv().unwrap();
+        assert_eq!(request.path.as_ref(), path);
+        assert_eq!(
+            picker.preview_pending.as_ref().unwrap().generation,
+            request.generation
+        );
+        for _ in 0..8 {
+            picker.get_preview(&editor);
+        }
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn failed_preview_load_retries_once_after_a_cooldown() {
+        let editor = editor();
+        let (mut picker, mut requests) = picker(Path::new("/preview/retry"));
+        picker.get_preview(&editor);
+        let first = requests.try_recv().unwrap();
+        for _ in 0..8 {
+            picker.get_preview(&editor);
+        }
+        assert!(requests.try_recv().is_err());
+
+        // A blocking-worker JoinError reports failure through this request's
+        // status without mutating a newer selection's pending state.
+        first.status.fail();
+        for _ in 0..8 {
+            picker.get_preview(&editor);
+        }
+        assert!(picker.preview_retry_at.is_some());
+        assert!(requests.try_recv().is_err());
+        picker.preview_retry_at = Some(Instant::now() - Duration::from_secs(1));
+        picker.get_preview(&editor);
+        let retry = requests.try_recv().unwrap();
+        assert_ne!(first.generation, retry.generation);
+        assert_eq!(
+            retry.version.load(atomic::Ordering::Relaxed),
+            retry.generation
+        );
+        for _ in 0..8 {
+            picker.get_preview(&editor);
+        }
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn a_dropped_preview_request_can_retry_without_a_frame_by_frame_send_loop() {
+        let editor = editor();
+        let (mut picker, mut requests) = picker(Path::new("/preview/full"));
+        picker.get_preview(&editor);
+        // Leave the first event in the bounded channel and simulate its worker
+        // failing. The attempted replacement cannot be enqueued yet.
+        picker.preview_pending.as_ref().unwrap().status.fail();
+        picker.get_preview(&editor);
+        picker.preview_retry_at = Some(Instant::now() - Duration::from_secs(1));
+        picker.get_preview(&editor);
+        assert!(picker.preview_pending.as_ref().unwrap().status.failed());
+        let discarded = requests.try_recv().unwrap();
+        for _ in 0..8 {
+            picker.get_preview(&editor);
+        }
+        assert!(requests.try_recv().is_err());
+        picker.preview_retry_at = Some(Instant::now() - Duration::from_secs(1));
+        picker.get_preview(&editor);
+        let retry = requests.try_recv().unwrap();
+        assert_ne!(discarded.generation, retry.generation);
+        assert!(!retry.status.failed());
+    }
+
+    #[test]
+    fn preview_cache_evicts_least_recently_used_entries() {
+        let mut cache = PreviewCache::default();
+        for index in 0..MAX_CACHED_PREVIEWS {
+            cache.insert(path(index), CachedPreview::Binary);
+        }
+        assert!(cache.get(&path(0)).is_some());
+        cache.insert(path(MAX_CACHED_PREVIEWS), CachedPreview::LargeFile);
+        assert_eq!(cache.entries.len(), MAX_CACHED_PREVIEWS);
+        assert!(cache.contains_key(&path(0)));
+        assert!(!cache.contains_key(&path(1)));
+        assert!(cache.contains_key(&path(MAX_CACHED_PREVIEWS)));
+    }
+
+    #[test]
+    fn preview_cache_bounds_bytes_and_accounts_for_replacements() {
+        let mut cache = PreviewCache::default();
+        for index in 0..8 {
+            let name = String::with_capacity(8 * 1024 * 1024);
+            cache.insert(path(index), CachedPreview::Directory(vec![(name, false)]));
+            assert!(cache.bytes <= MAX_CACHED_PREVIEW_BYTES);
+            assert!(cache.contains_key(&path(index)));
+        }
+        assert!(!cache.contains_key(&path(0)));
+        let old_bytes = cache.bytes;
+        cache.insert(path(7), CachedPreview::NotFound);
+        assert!(cache.bytes < old_bytes);
+        assert_eq!(
+            cache.bytes,
+            cache
+                .entries
+                .values()
+                .map(|entry| entry.bytes)
+                .sum::<usize>()
+        );
+    }
+
+    #[test]
+    fn oversized_single_directory_preview_is_truncated_with_a_hard_byte_limit() {
+        let mut cache = PreviewCache::default();
+        cache.insert(path(0), CachedPreview::Binary);
+        cache.insert(
+            path(1),
+            CachedPreview::Directory(vec![
+                ("visible.txt".into(), false),
+                (String::with_capacity(MAX_CACHED_PREVIEW_BYTES + 1), false),
+            ]),
+        );
+        let CachedPreview::Directory(entries) = cache.get(&path(1)).unwrap() else {
+            panic!("large directory previews must remain readable");
+        };
+        assert_eq!(entries[0].0, "visible.txt");
+        assert_eq!(entries.last().unwrap().0, TRUNCATED_DIRECTORY_PREVIEW);
+        assert_eq!(entries.capacity(), entries.len());
+        assert!(cache.bytes <= MAX_CACHED_PREVIEW_BYTES);
+        assert!(cache.entries[&path(1)].bytes <= MAX_DIRECTORY_PREVIEW_BYTES);
+    }
+
+    #[tokio::test]
+    async fn an_oversized_decoded_document_is_not_retained_in_the_cache() {
+        let editor = editor();
+        let doc = Document::from(
+            Rope::from_str(&"x".repeat(MAX_CACHED_PREVIEW_BYTES + 1)),
+            None,
+            editor.config.clone(),
+            editor.syn_loader.clone(),
+        );
+        let mut cache = PreviewCache::default();
+        cache.insert(path(0), CachedPreview::Document(Box::new(doc)));
+        assert!(matches!(
+            cache.get(&path(0)),
+            Some(CachedPreview::LargeFile)
+        ));
+        assert!(cache.bytes <= MAX_CACHED_PREVIEW_BYTES);
+    }
+}

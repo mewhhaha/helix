@@ -1,4 +1,7 @@
 pub mod config;
+mod display;
+mod textobject_cache;
+pub use display::DisplayHighlighter;
 
 use std::{
     borrow::Cow,
@@ -513,6 +516,8 @@ impl FileTypeGlobMatcher {
 #[derive(Debug)]
 pub struct Syntax {
     inner: tree_house::Syntax,
+    display_cache: parking_lot::Mutex<display::DisplayCache>,
+    textobject_cache: parking_lot::Mutex<textobject_cache::TextObjectCache>,
 }
 
 const PARSE_TIMEOUT: Duration = Duration::from_millis(500); // half a second is pretty generous
@@ -520,7 +525,11 @@ const PARSE_TIMEOUT: Duration = Duration::from_millis(500); // half a second is 
 impl Syntax {
     pub fn new(source: RopeSlice, language: Language, loader: &Loader) -> Result<Self, Error> {
         let inner = tree_house::Syntax::new(source, language, PARSE_TIMEOUT, loader)?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            display_cache: Default::default(),
+            textobject_cache: Default::default(),
+        })
     }
 
     pub fn update(
@@ -534,6 +543,8 @@ impl Syntax {
         if edits.is_empty() {
             Ok(())
         } else {
+            self.display_cache.get_mut().clear();
+            self.textobject_cache.get_mut().clear();
             self.inner.update(source, PARSE_TIMEOUT, &edits, loader)
         }
     }
@@ -597,6 +608,62 @@ impl Syntax {
         range: impl RangeBounds<u32>,
     ) -> Highlighter<'a> {
         Highlighter::new(&self.inner, source, loader, range)
+    }
+
+    pub fn display_highlighter<'a>(
+        &'a self,
+        source: RopeSlice<'a>,
+        loader: &'a Loader,
+        range: ops::Range<u32>,
+    ) -> DisplayHighlighter<'a> {
+        DisplayHighlighter::new(self, source, loader, range)
+    }
+
+    pub(crate) fn textobject_range_for_pos(
+        &self,
+        query: &TextObjectQuery,
+        capture: &str,
+        layer: Layer,
+        text: RopeSlice,
+        pos: usize,
+    ) -> Option<ops::Range<usize>> {
+        use textobject_cache::{CaptureRange, CaptureRanges, MAX_BYTES};
+        if let Some(ranges) = self.textobject_cache.lock().get(layer, query.id, capture) {
+            return ranges.containing(pos);
+        }
+        // Query the original root so quantified/grouped captures and patterns
+        // which inspect nodes outside the cursor's subtree keep their context.
+        let root = self.tree_for_byte_range(pos as u32, pos as u32).root_node();
+        let nodes = query.capture_nodes(capture, &root, text)?;
+        let mut ranges = Vec::new();
+        let mut recording = true;
+        let mut best: Option<ops::Range<usize>> = None;
+        for (order, node) in nodes.enumerate() {
+            let range = node.byte_range();
+            if range.contains(&pos) && best.as_ref().is_none_or(|best| range.len() < best.len()) {
+                best = Some(range.clone());
+            }
+            if recording {
+                ranges.push(CaptureRange { range, order });
+                // Include the future prefix-end index in the retained budget.
+                if ranges.capacity() * std::mem::size_of::<CaptureRange>()
+                    + ranges.len() * std::mem::size_of::<usize>()
+                    > MAX_BYTES
+                {
+                    ranges = Vec::new();
+                    recording = false;
+                }
+            }
+        }
+        if recording {
+            self.textobject_cache.lock().insert(
+                layer,
+                query.id,
+                capture,
+                CaptureRanges::new(ranges),
+            );
+        }
+        best
     }
 
     pub fn query_iter<'a, QueryLoader, LayerState, Range>(
@@ -797,9 +864,58 @@ pub enum OverlayHighlights {
     Heterogenous {
         highlights: Vec<(Highlight, ops::Range<usize>)>,
     },
+    /// An immutable, sorted collection shared with its document, restricted to
+    /// an index window. This avoids copying offscreen document-wide ranges.
+    SharedHeterogenous {
+        highlights: Arc<Vec<(Highlight, ops::Range<usize>)>>,
+        indices: ops::Range<usize>,
+    },
+    SharedHomogeneous {
+        highlight: Highlight,
+        ranges: Arc<Vec<ops::Range<usize>>>,
+        indices: ops::Range<usize>,
+    },
 }
 
 impl OverlayHighlights {
+    pub fn shared_homogeneous(
+        highlight: Highlight,
+        ranges: Arc<Vec<ops::Range<usize>>>,
+        visible: ops::Range<usize>,
+    ) -> Self {
+        let indices = if visible.start >= visible.end {
+            0..0
+        } else {
+            let start = ranges.partition_point(|range| range.end <= visible.start);
+            let end = start + ranges[start..].partition_point(|range| range.start < visible.end);
+            start..end
+        };
+        Self::SharedHomogeneous {
+            highlight,
+            ranges,
+            indices,
+        }
+    }
+
+    pub fn shared_heterogenous(
+        highlights: Arc<Vec<(Highlight, ops::Range<usize>)>>,
+        visible: ops::Range<usize>,
+    ) -> Self {
+        if visible.start >= visible.end {
+            return Self::SharedHeterogenous {
+                highlights,
+                indices: 0..0,
+            };
+        }
+        let start = highlights.partition_point(|(_, range)| range.end <= visible.start);
+        let end =
+            start + highlights[start..].partition_point(|(_, range)| range.start < visible.end);
+        Self::SharedHeterogenous {
+            highlights,
+            indices: start..end,
+        }
+    }
+
     pub fn single(highlight: Highlight, range: ops::Range<usize>) -> Self {
         Self::Homogeneous {
             highlight,
@@ -807,10 +923,12 @@ impl OverlayHighlights {
         }
     }
 
-    fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         match self {
             Self::Homogeneous { ranges, .. } => ranges.is_empty(),
             Self::Heterogenous { highlights } => highlights.is_empty(),
+            Self::SharedHeterogenous { indices, .. } => indices.is_empty(),
+            Self::SharedHomogeneous { indices, .. } => indices.is_empty(),
         }
     }
 }
@@ -843,6 +961,25 @@ impl Overlay {
                 .get(self.idx)
                 .map(|range| (*highlight, range.clone())),
             OverlayHighlights::Heterogenous { highlights } => highlights.get(self.idx).cloned(),
+            OverlayHighlights::SharedHeterogenous {
+                highlights,
+                indices,
+            } => {
+                (self.idx < indices.len()).then_some(())?;
+                highlights
+                    .get(indices.start.checked_add(self.idx)?)
+                    .cloned()
+            }
+            OverlayHighlights::SharedHomogeneous {
+                highlight,
+                ranges,
+                indices,
+            } => {
+                (self.idx < indices.len()).then_some(())?;
+                ranges
+                    .get(indices.start.checked_add(self.idx)?)
+                    .map(|range| (*highlight, range.clone()))
+            }
         }
     }
 
@@ -854,6 +991,23 @@ impl Overlay {
             OverlayHighlights::Heterogenous { highlights } => highlights
                 .get(self.idx)
                 .map(|(_highlight, range)| range.start),
+            OverlayHighlights::SharedHeterogenous {
+                highlights,
+                indices,
+            } => {
+                (self.idx < indices.len()).then_some(())?;
+                highlights
+                    .get(indices.start.checked_add(self.idx)?)
+                    .map(|(_, range)| range.start)
+            }
+            OverlayHighlights::SharedHomogeneous {
+                ranges, indices, ..
+            } => {
+                (self.idx < indices.len()).then_some(())?;
+                ranges
+                    .get(indices.start.checked_add(self.idx)?)
+                    .map(|range| range.start)
+            }
         }
     }
 }
@@ -1008,11 +1162,16 @@ impl CapturedNode<'_> {
 #[derive(Debug)]
 pub struct TextObjectQuery {
     query: Query,
+    id: u64,
 }
 
 impl TextObjectQuery {
     pub fn new(query: Query) -> Self {
-        Self { query }
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        Self {
+            query,
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        }
     }
 
     /// Run the query on the given node and return sub nodes which match given
@@ -1204,6 +1363,83 @@ mod test {
     use crate::{Rope, Transaction};
 
     static LOADER: Lazy<Loader> = Lazy::new(crate::config::default_lang_loader);
+
+    #[test]
+    fn shared_overlay_windows_seek_and_preserve_overlapping_boundaries() {
+        let highlights = Arc::new(vec![
+            (Highlight::new(1), 0..5),
+            (Highlight::new(2), 5..20),
+            (Highlight::new(3), 25..30),
+            (Highlight::new(4), 100..105),
+        ]);
+        let shared = OverlayHighlights::shared_heterogenous(highlights.clone(), 3..26);
+        let OverlayHighlights::SharedHeterogenous {
+            highlights: snapshot,
+            indices,
+        } = &shared
+        else {
+            unreachable!()
+        };
+        assert!(Arc::ptr_eq(&highlights, snapshot));
+        assert_eq!(indices, &(0..3));
+        let mut overlay = Overlay::new(shared).unwrap();
+        assert_eq!(overlay.current(), Some((Highlight::new(1), 0..5)));
+        overlay.idx = 2;
+        assert_eq!(overlay.current(), Some((Highlight::new(3), 25..30)));
+        overlay.idx = 3;
+        assert_eq!(overlay.current(), None);
+        assert_eq!(overlay.start(), None);
+        assert!(OverlayHighlights::shared_heterogenous(highlights.clone(), 30..40).is_empty());
+        assert!(OverlayHighlights::shared_heterogenous(highlights.clone(), 10..10).is_empty());
+    }
+
+    #[test]
+    fn shared_homogeneous_windows_preserve_ranges_and_overlay_priority() {
+        let ranges = Arc::new(vec![0..5, 8..20, 25..30, 100..105]);
+        let shared =
+            OverlayHighlights::shared_homogeneous(Highlight::new(1), ranges.clone(), 3..26);
+        let OverlayHighlights::SharedHomogeneous {
+            ranges: snapshot,
+            indices,
+            ..
+        } = &shared
+        else {
+            unreachable!()
+        };
+        assert!(Arc::ptr_eq(&ranges, snapshot));
+        assert_eq!(indices, &(0..3));
+        let mut overlay = Overlay::new(shared).unwrap();
+        assert_eq!(overlay.current(), Some((Highlight::new(1), 0..5)));
+        overlay.idx = 2;
+        assert_eq!(overlay.current(), Some((Highlight::new(1), 25..30)));
+        overlay.idx = 3;
+        assert_eq!(overlay.start(), None);
+        assert_eq!(overlay.current(), None);
+        assert!(
+            OverlayHighlights::shared_homogeneous(Highlight::new(1), ranges.clone(), 30..40)
+                .is_empty()
+        );
+        assert!(
+            OverlayHighlights::shared_homogeneous(Highlight::new(1), ranges.clone(), 10..10)
+                .is_empty()
+        );
+
+        let mut highlighter = OverlayHighlighter::new([
+            OverlayHighlights::shared_homogeneous(Highlight::new(1), ranges, 3..26),
+            OverlayHighlights::single(Highlight::new(2), 2..4),
+        ]);
+        let (_, highlights) = highlighter.advance();
+        assert_eq!(highlights.collect::<Vec<_>>(), vec![Highlight::new(1)]);
+        let (event, highlights) = highlighter.advance();
+        assert_eq!(event, HighlightEvent::Refresh);
+        assert_eq!(
+            highlights.collect::<Vec<_>>(),
+            vec![Highlight::new(1), Highlight::new(2)]
+        );
+        let (event, highlights) = highlighter.advance();
+        assert_eq!(event, HighlightEvent::Refresh);
+        assert_eq!(highlights.collect::<Vec<_>>(), vec![Highlight::new(1)]);
+    }
 
     #[test]
     fn test_textobject_queries() {

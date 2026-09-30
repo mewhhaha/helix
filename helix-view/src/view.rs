@@ -24,6 +24,10 @@ use std::{
 
 const JUMP_LIST_CAPACITY: usize = 30;
 
+#[cfg(test)]
+#[path = "view/checkpoint_tests.rs"]
+mod checkpoint_tests;
+
 type Jump = (DocumentId, Selection);
 
 #[derive(Debug, Clone)]
@@ -474,6 +478,7 @@ impl View {
             other_inlay_hints,
             padding_before_inlay_hints,
             padding_after_inlay_hints,
+            layout_keys,
         }) = doc.inlay_hints.get(&self.id)
         {
             let type_style = theme.and_then(|t| t.find_highlight("ui.virtual.inlay-hint.type"));
@@ -485,11 +490,31 @@ impl View {
             // types -> parameters -> others should hopefully be the "correct" order for most use cases,
             // with the padding coming before and after as expected.
             text_annotations
-                .add_inline_annotations(padding_before_inlay_hints, None)
-                .add_inline_annotations(type_inlay_hints, type_style)
-                .add_inline_annotations(parameter_inlay_hints, parameter_style)
-                .add_inline_annotations(other_inlay_hints, other_style)
-                .add_inline_annotations(padding_after_inlay_hints, None);
+                .add_inline_annotations_cached(
+                    padding_before_inlay_hints,
+                    None,
+                    layout_keys.map(|keys| keys[0]),
+                )
+                .add_inline_annotations_cached(
+                    type_inlay_hints,
+                    type_style,
+                    layout_keys.map(|keys| keys[1]),
+                )
+                .add_inline_annotations_cached(
+                    parameter_inlay_hints,
+                    parameter_style,
+                    layout_keys.map(|keys| keys[2]),
+                )
+                .add_inline_annotations_cached(
+                    other_inlay_hints,
+                    other_style,
+                    layout_keys.map(|keys| keys[3]),
+                )
+                .add_inline_annotations_cached(
+                    padding_after_inlay_hints,
+                    None,
+                    layout_keys.map(|keys| keys[4]),
+                );
         };
         let config = doc.config.load();
 
@@ -498,14 +523,21 @@ impl View {
                 color_swatches,
                 colors,
                 color_swatches_padding,
+                layout_keys,
+                ..
             }) = &doc.color_swatches
             {
-                for (color_swatch, color) in color_swatches.iter().zip(colors) {
-                    text_annotations
-                        .add_inline_annotations(std::slice::from_ref(color_swatch), Some(*color));
-                }
+                text_annotations.add_inline_annotations_with_highlights_cached(
+                    color_swatches,
+                    colors,
+                    layout_keys.map(|keys| (keys[0], keys[2])),
+                );
 
-                text_annotations.add_inline_annotations(color_swatches_padding, None);
+                text_annotations.add_inline_annotations_cached(
+                    color_swatches_padding,
+                    None,
+                    layout_keys.map(|keys| keys[1]),
+                );
             }
         }
 
@@ -514,7 +546,7 @@ impl View {
             .diagnostics_handler
             .show_cursorline_diagnostics(doc, self.id);
         let config = config.inline_diagnostics.prepare(width, enable_cursor_line);
-        if !config.disabled() {
+        if !config.disabled() && !doc.diagnostics().is_empty() {
             let cursor = doc
                 .selection(self.id)
                 .primary()

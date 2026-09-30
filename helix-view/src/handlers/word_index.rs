@@ -3,16 +3,22 @@
 //! This provides an eventually consistent set of words used in any open buffers. This set is
 //! later used for lexical completion.
 
-use std::{borrow::Cow, iter, sync::Arc, time::Duration};
+use std::{borrow::Cow, collections::VecDeque, iter, sync::Arc, time::Duration};
 
 use foldhash::HashMap;
 use helix_core::{
-    chars::char_is_word, diff::compare_ropes, fuzzy::fuzzy_match, ChangeSet, Rope, RopeSlice,
+    chars::char_is_word,
+    diff::compare_ropes,
+    fuzzy::{fuzzy_match, fuzzy_match_cancelable},
+    ChangeSet, Rope, RopeSlice,
 };
 use helix_event::{register_hook, AsyncHook, TaskController, TaskHandle};
 use helix_stdx::rope::RopeSliceExt as _;
-use parking_lot::RwLock;
-use tokio::{sync::mpsc, time::Instant};
+use parking_lot::{Mutex, RwLock};
+use tokio::{
+    sync::{mpsc, Notify},
+    time::Instant,
+};
 
 use crate::{
     events::{ConfigDidChange, DocumentDidChange, DocumentDidClose, DocumentDidOpen},
@@ -32,11 +38,12 @@ struct Change {
     /// [`Hook::handle_event`]). The observed changesets cannot be reliably chained, so the
     /// coalesced changeset is recomputed once, lazily, at [`Hook::finish_debounce`].
     dirty: bool,
+    generation: u64,
 }
 
 #[derive(Debug)]
 enum Event {
-    Insert(Rope),
+    Insert(DocumentId, Rope),
     Update(DocumentId, Change),
     Delete(DocumentId, Rope),
     /// Clear the entire word index.
@@ -44,12 +51,52 @@ enum Event {
     Clear,
 }
 
-/// Sends an event to the coordinator task (lossy).
-///
-/// The coordinator stops when its [`Handler`] is dropped. A closed channel means that index is no
-/// longer in use, so dropping the event is harmless.
-fn send(coordinator: &mpsc::UnboundedSender<Event>, event: Event) {
-    let _ = coordinator.send(event);
+/// At most one pending revision per open document. Sending a newer revision
+/// cancels its active preparation before replacing the pending work.
+#[derive(Debug, Default, Clone)]
+struct Coordinator {
+    pending: Arc<Mutex<Pending>>,
+    notify: Arc<Notify>,
+}
+
+#[derive(Debug, Default)]
+struct Pending {
+    events: HashMap<DocumentId, Event>,
+    order: VecDeque<DocumentId>,
+    clear: bool,
+    active: Option<(DocumentId, TaskController)>,
+    generation: u64,
+}
+
+fn send(coordinator: &Coordinator, event: Event) {
+    let mut pending = coordinator.pending.lock();
+    if matches!(&event, Event::Update(_, change) if change.generation != pending.generation) {
+        return;
+    }
+    let doc = match &event {
+        Event::Insert(doc, _) | Event::Update(doc, _) | Event::Delete(doc, _) => *doc,
+        Event::Clear => {
+            pending.generation = pending.generation.wrapping_add(1);
+            pending.clear = true;
+            pending.events.clear();
+            pending.order.clear();
+            if let Some((_, controller)) = &mut pending.active {
+                controller.cancel();
+            }
+            coordinator.notify.notify_one();
+            return;
+        }
+    };
+    if let Some((active_doc, controller)) = &mut pending.active {
+        if *active_doc == doc {
+            controller.cancel();
+        }
+    }
+    if !pending.events.contains_key(&doc) {
+        pending.order.push_back(doc);
+    }
+    pending.events.insert(doc, event);
+    coordinator.notify.notify_one();
 }
 
 #[derive(Debug)]
@@ -62,7 +109,7 @@ pub struct Handler {
     /// See [WordIndex::run]. A supervisor-like task is in charge of spawning tasks to update the
     /// index. This ensures that consecutive edits to a document trigger the correct order of
     /// insertions and deletions into the word set.
-    coordinator: mpsc::UnboundedSender<Event>,
+    coordinator: Coordinator,
     /// Cancels in-flight indexing when the handler is dropped.
     ///
     /// Indexing a large document runs on a blocking task which cannot be preempted. Without this,
@@ -75,17 +122,18 @@ pub struct Handler {
 impl Handler {
     pub fn spawn() -> Self {
         let index = WordIndex::default();
-        let (tx, rx) = mpsc::unbounded_channel();
+        let coordinator = Coordinator::default();
         let mut cancel = TaskController::new();
-        tokio::spawn(index.clone().run(rx, cancel.restart()));
+        tokio::spawn(index.clone().run(coordinator.clone(), cancel.restart()));
         Self {
             hook: Hook {
                 changes: HashMap::default(),
-                coordinator: tx.clone(),
+                coordinator: coordinator.clone(),
+                generation: 0,
             }
             .spawn(),
             index,
-            coordinator: tx,
+            coordinator,
             _cancel: cancel,
         }
     }
@@ -94,7 +142,18 @@ impl Handler {
 #[derive(Debug)]
 struct Hook {
     changes: HashMap<DocumentId, Change>,
-    coordinator: mpsc::UnboundedSender<Event>,
+    coordinator: Coordinator,
+    generation: u64,
+}
+
+impl Hook {
+    fn sync_generation(&mut self) {
+        let generation = self.coordinator.pending.lock().generation;
+        if self.generation != generation {
+            self.changes.clear();
+            self.generation = generation;
+        }
+    }
 }
 
 const DEBOUNCE: Duration = Duration::from_secs(1);
@@ -103,9 +162,13 @@ impl AsyncHook for Hook {
     type Event = Event;
 
     fn handle_event(&mut self, event: Self::Event, timeout: Option<Instant>) -> Option<Instant> {
+        self.sync_generation();
         match event {
-            Event::Insert(_) => unreachable!("inserts are sent to the worker directly"),
+            Event::Insert(_, _) => unreachable!("inserts are sent to the worker directly"),
             Event::Update(doc, change) => {
+                if change.generation != self.generation {
+                    return timeout;
+                }
                 if let Some(pending_change) = self.changes.get_mut(&doc) {
                     // There is already a change waiting for this document. Coalesce: keep the
                     // original `old_text` and advance to the latest `text`.
@@ -146,15 +209,10 @@ impl AsyncHook for Hook {
     }
 
     fn finish_debounce(&mut self) {
-        for (doc, mut change) in self.changes.drain() {
-            // A coalesced change carries a stale changeset; recompute it from the real endpoints.
-            // This diff is valid regardless of any ghost edits skipped between observed changes.
-            if change.dirty {
-                change.changes = compare_ropes(&change.old_text, &change.text)
-                    .changes()
-                    .clone();
-                change.dirty = false;
-            }
+        self.sync_generation();
+        // Recomputing a coalesced diff belongs to blocking preparation, not the
+        // Tokio worker running this hook.
+        for (doc, change) in self.changes.drain() {
             send(&self.coordinator, Event::Update(doc, change));
         }
     }
@@ -184,30 +242,6 @@ impl WordIndexInner {
         self.words.keys()
     }
 
-    fn insert(&mut self, word: RopeSlice) {
-        let word: Cow<str> = word.into();
-        if let Some(rc) = self.words.get_mut(word.as_ref()) {
-            *rc = rc.saturating_add(1);
-        } else {
-            let word = match word {
-                Cow::Owned(s) => Word::from_string(s),
-                Cow::Borrowed(s) => Word::from_ref(s),
-            };
-            self.words.insert(word, 1);
-        }
-    }
-
-    fn remove(&mut self, word: RopeSlice) {
-        let word: Cow<str> = word.into();
-        match self.words.get_mut(word.as_ref()) {
-            Some(1) => {
-                self.words.remove(word.as_ref());
-            }
-            Some(n) => *n -= 1,
-            None => (),
-        }
-    }
-
     fn clear(&mut self) {
         std::mem::take(&mut self.words);
     }
@@ -217,6 +251,8 @@ impl WordIndexInner {
 pub struct WordIndex {
     inner: Arc<RwLock<WordIndexInner>>,
 }
+
+type WordDelta = HashMap<Word, i64>;
 
 impl WordIndex {
     pub fn matches(&self, pattern: &str) -> Vec<String> {
@@ -229,16 +265,109 @@ impl WordIndex {
             .collect()
     }
 
-    fn add_document(&self, text: &Rope, cancel: &TaskHandle) {
-        let mut inner = self.inner.write();
-        for (i, word) in words(text.slice(..)).enumerate() {
-            if i % CANCEL_CHECK_INTERVAL == 0 && cancel.is_canceled() {
-                return;
+    pub fn matches_cancelable(&self, pattern: &str, cancel: &TaskHandle) -> Vec<String> {
+        let inner = self.inner.read();
+        let Some(mut matches) =
+            fuzzy_match_cancelable(pattern, inner.words(), || cancel.is_canceled())
+        else {
+            return Vec::new();
+        };
+        matches.sort_unstable_by_key(|(_, score)| *score);
+        let mut words = Vec::with_capacity(matches.len());
+        for (i, (word, _)) in matches.into_iter().enumerate() {
+            if i % 64 == 0 && cancel.is_canceled() {
+                return Vec::new();
             }
-            inner.insert(word);
+            words.push(word.to_string());
+        }
+        words
+    }
+
+    fn stage_words(
+        delta: &mut WordDelta,
+        text: RopeSlice,
+        amount: i64,
+        cancel: &TaskHandle,
+    ) -> bool {
+        for word in words_with_cancel(text, || cancel.is_canceled()) {
+            let word: Cow<str> = word.into();
+            let word = match word {
+                Cow::Owned(s) => Word::from_string(s),
+                Cow::Borrowed(s) => Word::from_ref(s),
+            };
+            *delta.entry(word).or_default() += amount;
+        }
+        !cancel.is_canceled()
+    }
+
+    fn prepare_delta(
+        old: Option<&Rope>,
+        text: Option<&Rope>,
+        changes: Option<&ChangeSet>,
+        cancel: &TaskHandle,
+    ) -> Option<WordDelta> {
+        let mut delta = WordDelta::default();
+        match (old, text) {
+            (Some(old), Some(text)) => {
+                let calculated;
+                let changes = if let Some(changes) = changes {
+                    changes
+                } else {
+                    calculated = compare_ropes(old, text);
+                    calculated.changes()
+                };
+                if cancel.is_canceled() {
+                    return None;
+                }
+                for (old_window, new_window) in
+                    changed_windows(old.slice(..), text.slice(..), changes)
+                {
+                    if !Self::stage_words(&mut delta, new_window, 1, cancel)
+                        || !Self::stage_words(&mut delta, old_window, -1, cancel)
+                    {
+                        return None;
+                    }
+                }
+            }
+            (None, Some(text)) => {
+                if !Self::stage_words(&mut delta, text.slice(..), 1, cancel) {
+                    return None;
+                }
+            }
+            (Some(old), None) => {
+                if !Self::stage_words(&mut delta, old.slice(..), -1, cancel) {
+                    return None;
+                }
+            }
+            (None, None) => (),
+        }
+        (!cancel.is_canceled()).then_some(delta)
+    }
+
+    fn apply_delta(&self, delta: WordDelta) {
+        let mut inner = self.inner.write();
+        for (word, difference) in delta {
+            if difference == 0 {
+                continue;
+            }
+            let count = (i64::from(*inner.words.get(&word).unwrap_or(&0)) + difference)
+                .clamp(0, u32::MAX as i64) as u32;
+            if count == 0 {
+                inner.words.remove(&word);
+            } else {
+                inner.words.insert(word, count);
+            }
         }
     }
 
+    #[cfg(any(test, feature = "bench"))]
+    fn add_document(&self, text: &Rope, cancel: &TaskHandle) {
+        if let Some(delta) = Self::prepare_delta(None, Some(text), None, cancel) {
+            self.apply_delta(delta);
+        }
+    }
+
+    #[cfg(test)]
     fn update_document(
         &self,
         old_text: &Rope,
@@ -246,80 +375,131 @@ impl WordIndex {
         changes: &ChangeSet,
         cancel: &TaskHandle,
     ) {
-        let mut inner = self.inner.write();
-        // A single changed window can span the whole document, so the check is driven by a count
-        // of the words processed rather than the number of windows.
-        let mut since_check = 0;
-        for (old_window, new_window) in changed_windows(old_text.slice(..), text.slice(..), changes)
+        if let Some(delta) = Self::prepare_delta(Some(old_text), Some(text), Some(changes), cancel)
         {
-            for word in words(new_window) {
-                inner.insert(word);
-                since_check += 1;
-            }
-            for word in words(old_window) {
-                inner.remove(word);
-                since_check += 1;
-            }
-            if since_check >= CANCEL_CHECK_INTERVAL {
-                if cancel.is_canceled() {
-                    return;
-                }
-                since_check = 0;
-            }
-        }
-    }
-
-    fn remove_document(&self, text: &Rope, cancel: &TaskHandle) {
-        let mut inner = self.inner.write();
-        for (i, word) in words(text.slice(..)).enumerate() {
-            if i % CANCEL_CHECK_INTERVAL == 0 && cancel.is_canceled() {
-                return;
-            }
-            inner.remove(word);
+            self.apply_delta(delta);
         }
     }
 
     fn clear(&self) {
-        let mut inner = self.inner.write();
-        inner.clear();
+        self.inner.write().clear();
     }
 
-    /// Coordinate the indexing of documents.
-    ///
-    /// This task wraps a MPSC queue and spawns blocking tasks which update the index. Updates
-    /// are applied one-by-one to ensure that changes to the index are **serialized**:
-    /// updates to each document must be applied in-order.
-    async fn run(self, mut events: mpsc::UnboundedReceiver<Event>, cancel: TaskHandle) {
-        while let Some(event) = events.recv().await {
+    async fn run(self, coordinator: Coordinator, cancel: TaskHandle) {
+        // These are the revisions actually committed to the index, rather than
+        // the event's old text (which can contain skipped completion previews).
+        let mut indexed = HashMap::<DocumentId, Rope>::default();
+        loop {
             if cancel.is_canceled() {
                 return;
             }
-            let this = self.clone();
-            let cancel = cancel.clone();
-            tokio::task::spawn_blocking(move || match event {
-                Event::Insert(text) => {
-                    this.add_document(&text, &cancel);
+            let (clear, next) = {
+                let mut pending = coordinator.pending.lock();
+                if pending.clear {
+                    pending.clear = false;
+                    (true, None)
+                } else {
+                    (
+                        false,
+                        pending.order.pop_front().map(|doc| {
+                            let event = pending.events.remove(&doc).unwrap();
+                            let mut controller = TaskController::new();
+                            let handle = controller.restart();
+                            pending.active = Some((doc, controller));
+                            (doc, event, handle)
+                        }),
+                    )
                 }
-                Event::Update(
-                    _doc,
-                    Change {
-                        old_text,
-                        text,
-                        changes,
-                        ..
-                    },
-                ) => {
-                    this.update_document(&old_text, &text, &changes, &cancel);
-                }
-                Event::Delete(_doc, text) => {
-                    this.remove_document(&text, &cancel);
-                }
-                Event::Clear => {
+            };
+            if clear {
+                let previous = std::mem::take(&mut indexed);
+                let this = self.clone();
+                if let Err(error) = tokio::task::spawn_blocking(move || {
                     this.clear();
+                    drop(previous);
+                })
+                .await
+                {
+                    log::error!("clearing word index failed: {error}");
+                    return;
                 }
-            })
-            .await
-            .unwrap();
+                continue;
+            }
+            let Some((doc, event, handle)) = next else {
+                tokio::select! { _ = cancel.canceled() => return, _ = coordinator.notify.notified() => {} }
+                continue;
+            };
+            let old = indexed.get(&doc).cloned();
+            let (text, changes) = match event {
+                Event::Insert(_, text) => (Some(text), None),
+                Event::Update(_, change) => {
+                    let changes = (!change.dirty
+                        && old
+                            .as_ref()
+                            .is_some_and(|old| old.is_instance(&change.old_text)))
+                    .then_some(change.changes);
+                    (Some(change.text), changes)
+                }
+                Event::Delete(_, _) => (None, None),
+                Event::Clear => unreachable!(),
+            };
+            let work_text = text.clone();
+            let work_handle = handle.clone();
+            let shutdown = cancel.clone();
+            let task = tokio::task::spawn_blocking(move || {
+                if shutdown.is_canceled() {
+                    return None;
+                }
+                Self::prepare_delta(
+                    old.as_ref(),
+                    work_text.as_ref(),
+                    changes.as_ref(),
+                    &work_handle,
+                )
+            });
+            let result = tokio::select! {
+                _ = cancel.canceled() => {
+                    if let Some((_, controller)) = &mut coordinator.pending.lock().active { controller.cancel(); }
+                    return;
+                }
+                result = task => result,
+            };
+            // Accept the complete delta atomically with cancellation. Commit it
+            // in full before starting another revision, without holding the
+            // scheduler mutex or doing index maintenance on a Tokio worker.
+            let accepted = {
+                let mut pending = coordinator.pending.lock();
+                let accepted = if !handle.is_canceled() && !cancel.is_canceled() {
+                    match result {
+                        Ok(Some(delta)) => {
+                            if let Some(text) = text {
+                                indexed.insert(doc, text);
+                            } else {
+                                indexed.remove(&doc);
+                            }
+                            Some(delta)
+                        }
+                        Ok(None) => None,
+                        Err(error) => {
+                            log::error!("word indexing task failed: {error}");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                pending.active = None;
+                accepted
+            };
+            if let Some(delta) = accepted {
+                let this = self.clone();
+                if let Err(error) =
+                    tokio::task::spawn_blocking(move || this.apply_delta(delta)).await
+                {
+                    log::error!("committing word index failed: {error}");
+                    return;
+                }
+            }
         }
     }
 }
@@ -333,10 +513,19 @@ impl WordIndex {
 /// This is a single forward pass over the text's grapheme clusters: each cluster is visited once.
 /// and the only rope position ever sought is the start of an emitted word, which keeps
 /// extraction roughly linear in the length of the text.
+#[cfg(any(test, feature = "bench"))]
 fn words(text: RopeSlice) -> impl Iterator<Item = RopeSlice> {
+    words_with_cancel(text, || false)
+}
+
+fn words_with_cancel(
+    text: RopeSlice<'_>,
+    mut is_canceled: impl FnMut() -> bool,
+) -> impl Iterator<Item = RopeSlice<'_>> {
     let mut graphemes = text.grapheme_indices();
     // The in-progress word run: the byte offset of its first cluster, its length in chars, and the
     // number of graphemes it spans. `graphemes_len == 0` means we are between words.
+    let mut visited = 0usize;
     let mut start_byte = 0;
     let mut char_len = 0;
     let mut graphemes_len = 0;
@@ -349,6 +538,10 @@ fn words(text: RopeSlice) -> impl Iterator<Item = RopeSlice> {
 
     iter::from_fn(move || {
         loop {
+            if visited.is_multiple_of(CANCEL_CHECK_INTERVAL) && is_canceled() {
+                return None;
+            }
+            visited += 1;
             let Some((byte_idx, grapheme)) = graphemes.next() else {
                 // Flush a word that runs up to the end of the text.
                 let word = qualify(start_byte, text.len_bytes(), char_len, graphemes_len);
@@ -452,12 +645,13 @@ pub(crate) fn register_hooks(handlers: &Handlers) {
     register_hook!(move |event: &mut DocumentDidOpen<'_>| {
         let doc = doc!(event.editor, &event.doc);
         if doc.word_completion_enabled() {
-            send(&coordinator, Event::Insert(doc.text().clone()));
+            send(&coordinator, Event::Insert(doc.id(), doc.text().clone()));
         }
         Ok(())
     });
 
     let tx = handlers.word_index.hook.clone();
+    let coordinator = handlers.word_index.coordinator.clone();
     register_hook!(move |event: &mut DocumentDidChange<'_>| {
         if !event.ghost_transaction && event.doc.word_completion_enabled() {
             helix_event::send_blocking(
@@ -469,6 +663,7 @@ pub(crate) fn register_hooks(handlers: &Handlers) {
                         text: event.doc.text().clone(),
                         changes: event.changes.clone(),
                         dirty: false,
+                        generation: coordinator.pending.lock().generation,
                     },
                 ),
             );
@@ -498,7 +693,7 @@ pub(crate) fn register_hooks(handlers: &Handlers) {
         if !event.old.word_completion.enable && event.new.word_completion.enable {
             for doc in event.editor.documents() {
                 if doc.word_completion_enabled() {
-                    send(&coordinator, Event::Insert(doc.text().clone()));
+                    send(&coordinator, Event::Insert(doc.id(), doc.text().clone()));
                 }
             }
         }
@@ -567,6 +762,120 @@ mod tests {
         assert_words("a foo c", ["foo"]);
     }
 
+    #[test]
+    fn long_tokens_and_nonword_runs_check_cancellation_without_emitting_words() {
+        for input in ["a".repeat(100_000), " ".repeat(100_000)] {
+            let text = Rope::from_str(&input);
+            let mut checks = 0;
+            let mut scan = words_with_cancel(text.slice(..), || {
+                checks += 1;
+                checks >= 2
+            });
+            assert!(scan.next().is_none());
+            drop(scan);
+            assert_eq!(checks, 2);
+        }
+    }
+
+    #[test]
+    fn canceled_staging_never_changes_reference_counts() {
+        let index = WordIndex::default();
+        let before = Rope::from_str("shared shared first");
+        let after = Rope::from_str("shared later");
+        let mut cancel = TaskController::new();
+        let handle = cancel.restart();
+        index.add_document(&before, &handle);
+        let expected = index.counts();
+        cancel.cancel();
+        let diff = compare_ropes(&before, &after);
+        index.update_document(&before, &after, diff.changes(), &handle);
+        assert_eq!(index.counts(), expected);
+        assert!(index.matches_cancelable("sh", &handle).is_empty());
+    }
+
+    #[test]
+    fn clear_discards_debounced_and_already_queued_old_generation_events() {
+        let coordinator = Coordinator::default();
+        let mut hook = Hook {
+            changes: HashMap::default(),
+            coordinator: coordinator.clone(),
+            generation: 0,
+        };
+        let doc = DocumentId::default();
+        hook.handle_event(Event::Update(doc, build_change("before", "after")), None);
+        let queued_old = build_change("after", "stale");
+        send(&coordinator, Event::Clear);
+        hook.handle_event(Event::Update(doc, queued_old), None);
+        hook.finish_debounce();
+        assert!(coordinator.pending.lock().events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn latest_revisions_close_and_clear_converge_to_exact_counts() {
+        let coordinator = Coordinator::default();
+        let index = WordIndex::default();
+        let mut cancel = TaskController::new();
+        let task = tokio::spawn(index.clone().run(coordinator.clone(), cancel.restart()));
+        let first = DocumentId::new(1);
+        let second = DocumentId::new(2);
+        send(
+            &coordinator,
+            Event::Insert(first, Rope::from_str("shared alpha")),
+        );
+        send(
+            &coordinator,
+            Event::Insert(second, Rope::from_str("shared bravo")),
+        );
+        for _ in 0..1000 {
+            send(
+                &coordinator,
+                Event::Update(first, build_change("ghost ignored", "shared omega")),
+            );
+        }
+        assert_eq!(coordinator.pending.lock().events.len(), 2);
+        let expected = std::collections::HashMap::from([
+            ("shared".to_owned(), 2),
+            ("bravo".to_owned(), 1),
+            ("omega".to_owned(), 1),
+        ]);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while index.counts() != expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        send(
+            &coordinator,
+            Event::Delete(second, Rope::from_str("ghost close text")),
+        );
+        let expected =
+            std::collections::HashMap::from([("shared".to_owned(), 1), ("omega".to_owned(), 1)]);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while index.counts() != expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        send(&coordinator, Event::Clear);
+        send(
+            &coordinator,
+            Event::Insert(first, Rope::from_str("final shared")),
+        );
+        let expected =
+            std::collections::HashMap::from([("shared".to_owned(), 1), ("final".to_owned(), 1)]);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while index.counts() != expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        cancel.cancel();
+        task.await.unwrap();
+    }
+
     #[track_caller]
     fn assert_diff<S, R, I>(before: &str, after: &str, expect_removed: R, expect_inserted: I)
     where
@@ -622,6 +931,7 @@ mod tests {
             text,
             changes,
             dirty: false,
+            generation: 0,
         }
     }
 
@@ -630,18 +940,28 @@ mod tests {
     /// its changeset recomputed if the observed changes were coalesced). Returns `None` if no
     /// change was emitted.
     fn coalesce<'a>(observations: impl IntoIterator<Item = (&'a str, &'a str)>) -> Option<Change> {
-        let (coordinator, mut rx) = mpsc::unbounded_channel();
+        let coordinator = Coordinator::default();
+        let observed = coordinator.clone();
         let mut hook = Hook {
             changes: HashMap::default(),
             coordinator,
+            generation: 0,
         };
         let doc = DocumentId::default();
         for (old, new) in observations {
             hook.handle_event(Event::Update(doc, build_change(old, new)), None);
         }
         hook.finish_debounce();
-        match rx.try_recv() {
-            Ok(Event::Update(_, change)) => Some(change),
+        let event = observed.pending.lock().events.remove(&doc);
+        match event {
+            Some(Event::Update(_, mut change)) => {
+                if change.dirty {
+                    change.changes = compare_ropes(&change.old_text, &change.text)
+                        .changes()
+                        .clone();
+                }
+                Some(change)
+            }
             _ => None,
         }
     }

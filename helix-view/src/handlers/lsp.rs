@@ -1,6 +1,7 @@
 use std::collections::btree_map::Entry;
 use std::collections::HashSet;
 use std::fmt::Display;
+use std::{io, path::Path};
 
 use crate::editor::Action;
 use crate::events::{
@@ -15,7 +16,15 @@ use helix_lsp::{lsp, LanguageServerId, OffsetEncoding};
 
 use super::Handlers;
 
-pub struct DocumentColorsEvent(pub DocumentId);
+fn resource_target_exists(path: &Path) -> io::Result<bool> {
+    match path.symlink_metadata() {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
+pub struct DocumentColorsEvent(pub DocumentId, pub i32);
 pub struct DocumentLinksEvent(pub DocumentId);
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -241,11 +250,31 @@ impl Editor {
             ResourceOp::Create(op) => {
                 let uri = Uri::try_from(&op.uri)?;
                 let path = uri.as_path().expect("URIs are valid paths");
-                let ignore_if_exists = op.options.as_ref().is_some_and(|options| {
-                    !options.overwrite.unwrap_or(false) && options.ignore_if_exists.unwrap_or(false)
-                });
-                if !ignore_if_exists || !path.exists() {
-                    self.create_path(path, false)?;
+                let overwrite = op
+                    .options
+                    .as_ref()
+                    .and_then(|options| options.overwrite)
+                    .unwrap_or(false);
+                let ignore_if_exists = !overwrite
+                    && op
+                        .options
+                        .as_ref()
+                        .and_then(|options| options.ignore_if_exists)
+                        .unwrap_or(false);
+                if !overwrite && resource_target_exists(path)? {
+                    if ignore_if_exists {
+                        return Ok(());
+                    }
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!("cannot create existing file {}", path.display()),
+                    )
+                    .into());
+                }
+                if let Err(err) = self.create_path(path, false, overwrite) {
+                    if !ignore_if_exists || err.kind() != std::io::ErrorKind::AlreadyExists {
+                        return Err(err.into());
+                    }
                 }
             }
             ResourceOp::Delete(op) => {
@@ -270,11 +299,31 @@ impl Editor {
                 let from = from_uri.as_path().expect("URIs are valid paths");
                 let to_uri = Uri::try_from(&op.new_uri)?;
                 let to = to_uri.as_path().expect("URIs are valid paths");
-                let ignore_if_exists = op.options.as_ref().is_some_and(|options| {
-                    !options.overwrite.unwrap_or(false) && options.ignore_if_exists.unwrap_or(false)
-                });
-                if !ignore_if_exists || !to.exists() {
-                    self.move_path(from, to)?;
+                let overwrite = op
+                    .options
+                    .as_ref()
+                    .and_then(|options| options.overwrite)
+                    .unwrap_or(false);
+                let ignore_if_exists = !overwrite
+                    && op
+                        .options
+                        .as_ref()
+                        .and_then(|options| options.ignore_if_exists)
+                        .unwrap_or(false);
+                if !overwrite && resource_target_exists(to)? {
+                    if ignore_if_exists {
+                        return Ok(());
+                    }
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!("cannot rename to existing file {}", to.display()),
+                    )
+                    .into());
+                }
+                if let Err(err) = self.move_path_with_overwrite(from, to, overwrite) {
+                    if !ignore_if_exists || err.kind() != std::io::ErrorKind::AlreadyExists {
+                        return Err(err.into());
+                    }
                 }
             }
         }

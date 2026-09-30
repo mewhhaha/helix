@@ -7,7 +7,7 @@ use crate::{
     },
 };
 use helix_core::snippets::{ActiveSnippet, RenderedSnippet, Snippet};
-use helix_core::{self as core, chars, fuzzy::MATCHER, Change, Transaction};
+use helix_core::{self as core, chars, fuzzy::MATCHER, syntax, Change, Transaction};
 use helix_lsp::{lsp, util, OffsetEncoding};
 use helix_view::{
     editor::CompleteAction,
@@ -23,7 +23,15 @@ use nucleo::{
 use tui::text::Spans;
 use tui::{buffer::Buffer as Surface, text::Span};
 
-use std::cmp::Reverse;
+use std::{cmp::Reverse, sync::Arc};
+
+struct PreparedDocumentation {
+    option_index: usize,
+    revision: u64,
+    language: String,
+    loader: Arc<arc_swap::ArcSwap<syntax::Loader>>,
+    markdown: Markdown,
+}
 
 impl menu::Item for CompletionItem {
     type Data = Style;
@@ -37,12 +45,13 @@ impl menu::Item for CompletionItem {
                         .as_ref()
                         .is_some_and(|tags| tags.contains(&lsp::CompletionItemTag::DEPRECATED))
             }
-            CompletionItem::Other(_) => false,
+            CompletionItem::Other(_) | CompletionItem::Word(_) => false,
         };
 
         let label = match self {
             CompletionItem::Lsp(LspCompletionItem { item, .. }) => item.label.as_str(),
             CompletionItem::Other(core::CompletionItem { label, .. }) => label,
+            CompletionItem::Word(item) => &item.label,
         };
 
         let kind = match self {
@@ -99,6 +108,7 @@ impl menu::Item for CompletionItem {
                 None => "".into(),
             },
             CompletionItem::Other(core::CompletionItem { kind, .. }) => kind.as_ref().into(),
+            CompletionItem::Word(_) => "word".into(),
         };
 
         let label = Span::styled(
@@ -124,6 +134,8 @@ pub struct Completion {
     filter: String,
     // TODO: move to helix-view/central handler struct in the future
     resolve_handler: ResolveHandler,
+    documentation_revision: u64,
+    documentation: Option<PreparedDocumentation>,
 }
 
 impl Completion {
@@ -196,6 +208,9 @@ impl Completion {
                         CompletionItem::Other(core::CompletionItem { transaction, .. }) => {
                             doc.apply_temporary(transaction, view.id)
                         }
+                        CompletionItem::Word(item) => {
+                            doc.apply_temporary(&item.transaction(), view.id)
+                        }
                     };
                 }
                 PromptEvent::Update => {}
@@ -248,6 +263,7 @@ impl Completion {
                         CompletionItem::Other(core::CompletionItem { transaction, .. }) => {
                             (transaction, None, None)
                         }
+                        CompletionItem::Word(item) => (item.transaction(), None, None),
                     };
 
                     doc.apply(&transaction, view.id);
@@ -312,6 +328,8 @@ impl Completion {
             // and avoid allocation during matching
             filter: String::from(fragment),
             resolve_handler: ResolveHandler::new(),
+            documentation_revision: 0,
+            documentation: None,
         };
 
         // need to recompute immediately in case start_offset != trigger_offset
@@ -334,7 +352,7 @@ impl Completion {
             false,
         );
         let mut buf = Vec::new();
-        let (matches, options) = self.popup.contents_mut().update_options();
+        let (matches, options) = self.popup.contents_mut().update_matches();
         if incremental {
             matches.retain_mut(|(index, score)| {
                 let option = &options[*index as usize];
@@ -429,6 +447,8 @@ impl Completion {
         response: &mut CompletionResponse,
         is_incomplete: bool,
     ) {
+        self.documentation_revision = self.documentation_revision.wrapping_add(1);
+        self.documentation = None;
         let menu = self.popup.contents_mut();
         let (_, options) = menu.update_options();
         if is_incomplete {
@@ -449,6 +469,8 @@ impl Completion {
         old_item: &impl PartialEq<CompletionItem>,
         new_item: CompletionItem,
     ) {
+        self.documentation_revision = self.documentation_revision.wrapping_add(1);
+        self.documentation = None;
         self.popup.contents_mut().replace_option(old_item, new_item);
     }
 
@@ -469,8 +491,12 @@ impl Component for Completion {
     fn render(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
         self.popup.render(area, surface, cx);
 
+        let Some(option_index) = self.popup.contents().selected_option_index() else {
+            return;
+        };
+
         // if we have a selection, render a markdown popup on top/below with info
-        let option = match self.popup.contents_mut().selection_mut() {
+        let option = match self.popup.contents_mut().selection_mut_untracked() {
             Some(option) => option,
             None => return,
         };
@@ -499,36 +525,53 @@ impl Component for Completion {
             Markdown::new(md, cx.editor.syn_loader.clone())
         };
 
-        let mut markdown_doc = match option {
-            CompletionItem::Lsp(option) => match &option.item.documentation {
-                Some(lsp::Documentation::String(contents))
-                | Some(lsp::Documentation::MarkupContent(lsp::MarkupContent {
-                    kind: lsp::MarkupKind::PlainText,
-                    value: contents,
-                })) => {
-                    // TODO: convert to wrapped text
-                    markdowned(language, option.item.detail.as_deref(), Some(contents))
+        let documentation_current = self.documentation.as_ref().is_some_and(|cached| {
+            cached.option_index == option_index
+                && cached.revision == self.documentation_revision
+                && cached.language == language
+                && Arc::ptr_eq(&cached.loader, &cx.editor.syn_loader)
+        });
+        if !documentation_current {
+            let markdown_doc = match option {
+                CompletionItem::Lsp(option) => match &option.item.documentation {
+                    Some(lsp::Documentation::String(contents))
+                    | Some(lsp::Documentation::MarkupContent(lsp::MarkupContent {
+                        kind: lsp::MarkupKind::PlainText,
+                        value: contents,
+                    })) => {
+                        // TODO: convert to wrapped text
+                        markdowned(language, option.item.detail.as_deref(), Some(contents))
+                    }
+                    Some(lsp::Documentation::MarkupContent(lsp::MarkupContent {
+                        kind: lsp::MarkupKind::Markdown,
+                        value: contents,
+                    })) => {
+                        // TODO: set language based on doc scope
+                        markdowned(language, option.item.detail.as_deref(), Some(contents))
+                    }
+                    None if option.item.detail.is_some() => {
+                        // TODO: set language based on doc scope
+                        markdowned(language, option.item.detail.as_deref(), None)
+                    }
+                    None => return,
+                },
+                CompletionItem::Other(option) => {
+                    let Some(doc) = option.documentation.as_deref() else {
+                        return;
+                    };
+                    markdowned(language, None, Some(doc))
                 }
-                Some(lsp::Documentation::MarkupContent(lsp::MarkupContent {
-                    kind: lsp::MarkupKind::Markdown,
-                    value: contents,
-                })) => {
-                    // TODO: set language based on doc scope
-                    markdowned(language, option.item.detail.as_deref(), Some(contents))
-                }
-                None if option.item.detail.is_some() => {
-                    // TODO: set language based on doc scope
-                    markdowned(language, option.item.detail.as_deref(), None)
-                }
-                None => return,
-            },
-            CompletionItem::Other(option) => {
-                let Some(doc) = option.documentation.as_deref() else {
-                    return;
-                };
-                markdowned(language, None, Some(doc))
-            }
-        };
+                CompletionItem::Word(_) => return,
+            };
+            self.documentation = Some(PreparedDocumentation {
+                option_index,
+                revision: self.documentation_revision,
+                language: language.to_owned(),
+                loader: cx.editor.syn_loader.clone(),
+                markdown: markdown_doc,
+            });
+        }
+        let markdown_doc = &mut self.documentation.as_mut().unwrap().markdown;
 
         let popup_area = self.popup.area(area, cx.editor);
         let doc_width_available = area.width.saturating_sub(popup_area.right());
@@ -661,4 +704,230 @@ fn completion_changes(transaction: &Transaction, trigger_offset: usize) -> Vec<C
         .changes_iter()
         .filter(|(start, end, _)| (*start..=*end).contains(&trigger_offset))
         .collect()
+}
+
+#[cfg(test)]
+mod documentation_cache_tests {
+    use arc_swap::{access::Map, ArcSwap};
+    use helix_core::{completion::CompletionProvider, Position};
+    use helix_view::{editor::Action, theme};
+
+    use super::*;
+
+    fn editor() -> Editor {
+        let config = Arc::new(ArcSwap::from_pointee(crate::config::Config::default()));
+        let handlers = crate::handlers::setup_for_test(config.clone());
+        let mut editor = Editor::new(
+            Rect::new(0, 0, 120, 30),
+            Arc::new(theme::Loader::new(&[])),
+            Arc::new(ArcSwap::from_pointee(syntax::Loader::default())),
+            Arc::new(Map::new(config, |config: &crate::config::Config| {
+                &config.editor
+            })),
+            handlers,
+            helix_loader::workspace_trust::WorkspaceTrust::fully_trusted(),
+        );
+        editor.new_file(Action::VerticalSplit);
+        editor.cursor_cache.set(Some(Position::new(0, 0)));
+        editor
+    }
+
+    fn item(editor: &Editor, label: &str, documentation: &str) -> CompletionItem {
+        CompletionItem::Other(core::CompletionItem {
+            transaction: Transaction::new(doc!(editor).text()),
+            label: label.to_owned().into(),
+            kind: "text".into(),
+            documentation: Some(documentation.into()),
+            provider: CompletionProvider::Word,
+        })
+    }
+
+    fn render(completion: &mut Completion, editor: &mut Editor) {
+        let mut jobs = crate::job::Jobs {
+            wait_futures: Default::default(),
+            callbacks: tokio::sync::mpsc::channel(1).1,
+            status_messages: tokio::sync::mpsc::channel(1).1,
+            poll_wait_futures_first: true,
+        };
+        let area = Rect::new(0, 0, 120, 30);
+        completion.render(
+            area,
+            &mut Surface::empty(area),
+            &mut Context {
+                editor,
+                scroll: None,
+                jobs: &mut jobs,
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn lazy_word_edits_preview_and_accept_for_all_cursors() {
+        use crate::handlers::completion::{WordCompletionItem, WordEditContext};
+        use crate::{ctrl, key};
+        use helix_view::handlers::completion::ResponseContext;
+        let mut editor = editor();
+        let context = {
+            let (view, doc) = current!(editor);
+            let transaction = Transaction::change(
+                doc.text(),
+                [(0, doc.text().len_chars(), Some("fo\nfo\n".into()))].into_iter(),
+            );
+            assert!(doc.apply(&transaction, view.id));
+            doc.set_selection(
+                view.id,
+                core::Selection::new(vec![core::Range::point(2), core::Range::point(5)].into(), 1),
+            );
+            let context = Arc::new(WordEditContext {
+                rope: doc.text().clone(),
+                selection: doc.selection(view.id).clone(),
+                edit_diff: 2,
+            });
+            let savepoint = doc.savepoint(view);
+            editor.handlers.completions.active_completions.insert(
+                CompletionProvider::Word,
+                ResponseContext {
+                    is_incomplete: false,
+                    priority: 0,
+                    savepoint,
+                },
+            );
+            context
+        };
+        editor.last_completion = Some(CompleteAction::Triggered);
+        let items = ["foobár", "food"]
+            .into_iter()
+            .map(|label| {
+                CompletionItem::Word(WordCompletionItem {
+                    label: label.into(),
+                    context: context.clone(),
+                })
+            })
+            .collect();
+        let mut completion = Completion::new(&editor, items, 5);
+        let mut jobs = crate::job::Jobs {
+            wait_futures: Default::default(),
+            callbacks: tokio::sync::mpsc::channel(1).1,
+            status_messages: tokio::sync::mpsc::channel(1).1,
+            poll_wait_futures_first: true,
+        };
+        let mut cx = Context {
+            editor: &mut editor,
+            scroll: None,
+            jobs: &mut jobs,
+        };
+        completion.handle_event(&Event::Key(ctrl!('n')), &mut cx);
+        let first = completion
+            .popup
+            .contents()
+            .selection()
+            .unwrap()
+            .filter_text()
+            .to_owned();
+        assert_eq!(
+            doc!(cx.editor).text().to_string(),
+            format!("{first}\n{first}\n")
+        );
+        completion.handle_event(&Event::Key(ctrl!('n')), &mut cx);
+        let second = completion
+            .popup
+            .contents()
+            .selection()
+            .unwrap()
+            .filter_text()
+            .to_owned();
+        assert_ne!(first, second);
+        assert_eq!(
+            doc!(cx.editor).text().to_string(),
+            format!("{second}\n{second}\n")
+        );
+        completion.handle_event(&Event::Key(key!(Enter)), &mut cx);
+        assert_eq!(
+            doc!(cx.editor).text().to_string(),
+            format!("{second}\n{second}\n")
+        );
+        assert!(matches!(
+            cx.editor.last_completion,
+            Some(CompleteAction::Applied { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn completion_render_reuses_markdown_and_refreshes_resolved_or_selected_content() {
+        let mut editor = editor();
+        let first_item = item(&editor, "first", "**First** documentation.");
+        let second_item = item(&editor, "second", "Second documentation.");
+        let mut completion = Completion::new(&editor, vec![first_item.clone(), second_item], 0);
+        completion.popup.contents_mut().move_down();
+        render(&mut completion, &mut editor);
+        let first = completion
+            .documentation
+            .as_ref()
+            .unwrap()
+            .markdown
+            .parse(Some(&editor.theme));
+        render(&mut completion, &mut editor);
+        assert!(Arc::ptr_eq(
+            &first,
+            &completion
+                .documentation
+                .as_ref()
+                .unwrap()
+                .markdown
+                .parse(Some(&editor.theme))
+        ));
+
+        completion.replace_item(
+            &first_item,
+            item(&editor, "first resolved", "Resolved documentation."),
+        );
+        render(&mut completion, &mut editor);
+        let resolved = completion
+            .documentation
+            .as_ref()
+            .unwrap()
+            .markdown
+            .parse(Some(&editor.theme));
+        assert!(!Arc::ptr_eq(&first, &resolved));
+        assert!(String::from(resolved.as_ref()).contains("Resolved documentation."));
+        completion.popup.contents_mut().move_down();
+        render(&mut completion, &mut editor);
+        assert!(String::from(
+            completion
+                .documentation
+                .as_ref()
+                .unwrap()
+                .markdown
+                .parse(None)
+                .as_ref()
+        )
+        .contains("Second documentation."));
+
+        let previous = completion
+            .documentation
+            .as_ref()
+            .unwrap()
+            .markdown
+            .parse(Some(&editor.theme));
+        editor.theme = toml::from_str("\"ui.text\" = { fg = \"#123456\" }").unwrap();
+        render(&mut completion, &mut editor);
+        let themed = completion
+            .documentation
+            .as_ref()
+            .unwrap()
+            .markdown
+            .parse(Some(&editor.theme));
+        assert!(!Arc::ptr_eq(&previous, &themed));
+        editor.syn_loader.store(Arc::new(syntax::Loader::default()));
+        render(&mut completion, &mut editor);
+        assert!(!Arc::ptr_eq(
+            &themed,
+            &completion
+                .documentation
+                .as_ref()
+                .unwrap()
+                .markdown
+                .parse(Some(&editor.theme))
+        ));
+    }
 }

@@ -1140,7 +1140,7 @@ pub fn hover(cx: &mut Context) {
             }
 
             // create new popup
-            let contents = Hover::new(hovers, editor.syn_loader.clone());
+            let contents = Hover::new(hovers, editor.syn_loader.clone(), &editor.config().lsp);
             let popup = Popup::new(Hover::ID, contents).auto_close(true);
             compositor.replace_or_push(Hover::ID, popup);
         };
@@ -1507,6 +1507,7 @@ fn compute_inlay_hints_for_view(
                     other_inlay_hints,
                     padding_before_inlay_hints,
                     padding_after_inlay_hints,
+                    layout_keys: None,
                 },
             );
             doc.inlay_hints_oudated = false;

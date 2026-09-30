@@ -18,6 +18,10 @@ mod test {
     mod auto_pairs;
     mod command_line;
     mod commands;
+    mod config_refresh;
+    mod dap_background;
+    mod highlight_cache;
     mod movement;
     mod splits;
+    mod textobject_cache;
 }

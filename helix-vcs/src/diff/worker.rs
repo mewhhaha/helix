@@ -5,6 +5,7 @@ use imara_diff::{IndentHeuristic, IndentLevel, InternedInput};
 use parking_lot::RwLock;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::Notify;
+use tokio::task::JoinHandle;
 use tokio::time::{timeout, timeout_at, Duration};
 
 use crate::diff::{
@@ -51,6 +52,8 @@ impl DiffWorker {
 
                 if let Some(lines) = interner.interned_lines() {
                     self.perform_diff(lines)
+                } else {
+                    self.diff_alloc = imara_diff::Diff::default();
                 }
             };
 
@@ -159,15 +162,29 @@ impl EventAccumulator {
             }
         }
 
-        // setup task to trigger the rendering
-        match self.render_lock.take() {
+        drop(spawn_diff_notification(
+            self.render_lock.take(),
+            diff_finished_notify,
+        ));
+    }
+}
+
+// The render guard intentionally blocks drawing until the async diff finishes.
+#[allow(clippy::await_holding_lock)]
+fn spawn_diff_notification(
+    render_lock: Option<RenderLock>,
+    diff_finished_notify: Arc<Notify>,
+) -> JoinHandle<()> {
+    // Register before spawning: a short diff can finish before this task starts.
+    let diff_finished = diff_finished_notify.notified_owned();
+    tokio::spawn(async move {
+        tokio::pin!(diff_finished);
+        match render_lock {
             // diff is performed outside of the rendering loop
             // request a redraw after the diff is done
             None => {
-                tokio::spawn(async move {
-                    diff_finished_notify.notified().await;
-                    helix_event::request_redraw();
-                });
+                diff_finished.await;
+                helix_event::request_redraw();
             }
             // diff is performed inside the rendering loop
             // block redraw until the diff is done or the timeout is expired
@@ -175,25 +192,23 @@ impl EventAccumulator {
                 lock,
                 timeout: Some(timeout),
             }) => {
-                tokio::spawn(async move {
-                    let res = {
-                        // Acquire a lock on the redraw handle.
-                        // The lock will block the rendering from occurring while held.
-                        // The rendering waits for the diff if it doesn't time out
-                        timeout_at(timeout, diff_finished_notify.notified()).await
-                    };
-                    // we either reached the timeout or the diff is finished, release the render lock
-                    drop(lock);
-                    if res.is_ok() {
-                        // Diff finished in time we are done.
-                        return;
-                    }
-                    // Diff failed to complete in time log the event
-                    // and wait until the diff occurs to trigger an async redraw
-                    log::info!("Diff computation timed out, update of diffs might appear delayed");
-                    diff_finished_notify.notified().await;
-                    helix_event::request_redraw()
-                });
+                let res = {
+                    // Acquire a lock on the redraw handle.
+                    // The lock will block the rendering from occurring while held.
+                    // The rendering waits for the diff if it doesn't time out
+                    timeout_at(timeout, &mut diff_finished).await
+                };
+                // we either reached the timeout or the diff is finished, release the render lock
+                drop(lock);
+                if res.is_ok() {
+                    // Diff finished in time we are done.
+                    return;
+                }
+                // Diff failed to complete in time log the event
+                // and wait until the diff occurs to trigger an async redraw
+                log::info!("Diff computation timed out, update of diffs might appear delayed");
+                diff_finished.await;
+                helix_event::request_redraw()
             }
             // a blocking diff is performed inside the rendering loop
             // block redraw until the diff is done
@@ -201,12 +216,10 @@ impl EventAccumulator {
                 lock,
                 timeout: None,
             }) => {
-                tokio::spawn(async move {
-                    diff_finished_notify.notified().await;
-                    // diff is done release the lock
-                    drop(lock)
-                });
+                diff_finished.await;
+                // diff is done release the lock
+                drop(lock)
             }
-        };
-    }
+        }
+    })
 }

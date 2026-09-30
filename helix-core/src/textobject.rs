@@ -266,20 +266,20 @@ pub fn textobject_treesitter(
 ) -> Range {
     let byte_pos = slice.char_to_byte(range.cursor(slice));
     let layer = syntax.layer_for_byte_range(byte_pos as u32, byte_pos as u32);
-    let root = syntax
-        .tree_for_byte_range(byte_pos as u32, byte_pos as u32)
-        .root_node();
     let textobject_query = loader.textobject_query(syntax.layer(layer).language);
     let get_range = move || -> Option<Range> {
         let capture_name = format!("{}.{}", object_name, textobject); // eg. function.inner
-        let node = textobject_query?
-            .capture_nodes(&capture_name, &root, slice)?
-            .filter(|node| node.byte_range().contains(&byte_pos))
-            .min_by_key(|node| node.byte_range().len())?;
+        let bytes = syntax.textobject_range_for_pos(
+            textobject_query?,
+            &capture_name,
+            layer,
+            slice,
+            byte_pos,
+        )?;
 
         let len = slice.len_bytes();
-        let start_byte = node.start_byte();
-        let end_byte = node.end_byte();
+        let start_byte = bytes.start;
+        let end_byte = bytes.end;
         if start_byte >= len || end_byte >= len {
             return None;
         }

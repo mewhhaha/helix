@@ -154,8 +154,16 @@ impl Transport {
         mut payload: Payload,
     ) -> Result<()> {
         if let Payload::Request(request) = &mut payload {
+            let mut pending = self.pending_requests.lock().await;
+            // Guarded background workflows drop their waiters on cancellation.
+            // Prune these entries before the next request instead of retaining
+            // them indefinitely when an adapter never sends a reply.
+            pending.retain(|_, callback| !callback.is_closed());
             if let Some(back) = request.back_ch.take() {
-                self.pending_requests.lock().await.insert(request.seq, back);
+                if back.is_closed() {
+                    return Ok(());
+                }
+                pending.insert(request.seq, back);
             }
         }
         let json = serde_json::to_string(&payload)?;
@@ -219,8 +227,9 @@ impl Transport {
                         ),
                     }
                     None => {
+                        // A canceled callback may already have been pruned.
+                        // Responses belong to pending RPCs, not the event stream.
                         warn!("Response to nonexistent request #{}", res.request_seq);
-                        client_tx.send(Payload::Response(res)).expect("Failed to send");
                     }
                 }
 
@@ -321,5 +330,138 @@ impl Transport {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::io::BufReader;
+    use tokio::sync::mpsc::channel;
+
+    fn request(seq: u64, callback: Sender<Result<Response>>) -> Payload {
+        Payload::Request(Request {
+            seq,
+            command: "stackTrace".into(),
+            arguments: Some(serde_json::json!({"threadId":7})),
+            back_ch: Some(callback),
+        })
+    }
+
+    fn transport() -> Transport {
+        Transport {
+            id: DebugAdapterId::default(),
+            pending_requests: Mutex::new(HashMap::new()),
+        }
+    }
+
+    #[tokio::test]
+    async fn new_requests_prune_abandoned_callbacks_and_keep_live_requests() {
+        let transport = transport();
+        let mut writer: Box<dyn AsyncWrite + Send + Unpin> = Box::new(tokio::io::sink());
+        let (abandoned_tx, abandoned_rx) = channel(1);
+        let (live_tx, mut live_rx) = channel(1);
+        transport
+            .send_payload_to_server(&mut writer, request(1, abandoned_tx))
+            .await
+            .unwrap();
+        transport
+            .send_payload_to_server(&mut writer, request(2, live_tx))
+            .await
+            .unwrap();
+        drop(abandoned_rx);
+        let (next_tx, _next_rx) = channel(1);
+        transport
+            .send_payload_to_server(&mut writer, request(3, next_tx))
+            .await
+            .unwrap();
+        {
+            let pending = transport.pending_requests.lock().await;
+            assert!(!pending.contains_key(&1));
+            assert!(pending.contains_key(&2));
+            assert!(pending.contains_key(&3));
+        }
+        let (events, mut events_rx) = unbounded_channel();
+        transport
+            .process_server_message(
+                &events,
+                Payload::Response(Response {
+                    request_seq: 1,
+                    command: "stackTrace".into(),
+                    success: true,
+                    message: None,
+                    body: None,
+                }),
+            )
+            .await
+            .unwrap();
+        transport
+            .process_server_message(
+                &events,
+                Payload::Response(Response {
+                    request_seq: 2,
+                    command: "stackTrace".into(),
+                    success: true,
+                    message: None,
+                    body: None,
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(live_rx.recv().await.unwrap().unwrap().success);
+        assert!(
+            matches!(
+                events_rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "late canceled responses must not enter the debugger event stream"
+        );
+        assert!(!transport.pending_requests.lock().await.contains_key(&2));
+    }
+
+    #[tokio::test]
+    async fn canceled_queued_request_is_not_written_or_registered() {
+        let transport = transport();
+        let (client, adapter) = tokio::io::duplex(4096);
+        let mut writer: Box<dyn AsyncWrite + Send + Unpin> = Box::new(client);
+        let mut reader: Box<dyn AsyncBufRead + Send + Unpin> = Box::new(BufReader::new(adapter));
+        let (canceled_tx, canceled_rx) = channel(1);
+        drop(canceled_rx);
+        transport
+            .send_payload_to_server(&mut writer, request(1, canceled_tx))
+            .await
+            .unwrap();
+        assert!(transport.pending_requests.lock().await.is_empty());
+        let (live_tx, _live_rx) = channel(1);
+        transport
+            .send_payload_to_server(&mut writer, request(2, live_tx))
+            .await
+            .unwrap();
+        let message = tokio::time::timeout(
+            Duration::from_secs(1),
+            Transport::recv_server_message(
+                DebugAdapterId::default(),
+                &mut reader,
+                &mut String::new(),
+                &mut Vec::new(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let Payload::Request(request) = message else {
+            panic!("expected live request");
+        };
+        assert_eq!(
+            request.seq, 2,
+            "canceled request must not reach the adapter"
+        );
+        let mut byte = [0];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), reader.read(&mut byte))
+                .await
+                .is_err()
+        );
     }
 }

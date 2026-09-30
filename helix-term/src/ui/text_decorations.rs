@@ -107,6 +107,13 @@ impl<'a> DecorationManager<'a> {
         }
     }
 
+    /// Whether skipping an invisible text tail preserves every pending callback.
+    pub fn can_skip_graphemes_until(&self, char_idx: usize) -> bool {
+        self.decorations
+            .iter()
+            .all(|(_, anchor)| *anchor >= char_idx)
+    }
+
     pub fn decorate_grapheme(&mut self, renderer: &mut TextRenderer, grapheme: &FormattedGrapheme) {
         for (decoration, hook_char_idx) in &mut self.decorations {
             loop {

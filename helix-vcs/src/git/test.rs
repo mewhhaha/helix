@@ -85,6 +85,38 @@ fn modified_file() {
     );
 }
 
+#[test]
+fn combined_vcs_preparation_keeps_committed_baseline_and_head_for_untracked_files() {
+    let repo = empty_git_repo();
+    let tracked = repo.path().join("tracked.txt");
+    std::fs::write(&tracked, b"committed\n").unwrap();
+    create_commit(repo.path(), true);
+    std::fs::write(&tracked, b"modified buffer on disk\n").unwrap();
+    let mut controller = helix_event::TaskController::new();
+    let cancel = controller.restart();
+    let prepared = git::prepare_vcs(&tracked, true, &cancel).unwrap();
+    assert_eq!(
+        prepared.diff_base.as_deref(),
+        Some(b"committed\n".as_slice())
+    );
+    assert_eq!(prepared.head.unwrap().load().as_ref().as_ref(), "main");
+
+    let untracked = repo.path().join("untracked.txt");
+    std::fs::write(&untracked, b"not committed\n").unwrap();
+    let prepared = git::prepare_vcs(&untracked, true, &cancel).unwrap();
+    assert!(prepared.diff_base.is_none());
+    assert_eq!(prepared.head.unwrap().load().as_ref().as_ref(), "main");
+
+    controller.cancel();
+    // Canceled requests must stop before repository or path discovery.
+    assert!(git::prepare_vcs(
+        &repo.path().join("missing/subdirectory/file"),
+        true,
+        &cancel
+    )
+    .is_err());
+}
+
 /// Test that `get_file_head` does not return content for a directory.
 /// This is important to correctly cover cases where a directory is removed and replaced by a file.
 /// If the contents of the directory object were returned a diff between a path and the directory children would be produced.
@@ -155,4 +187,20 @@ fn symlink_to_git_repo() {
 
     assert_eq!(git::get_diff_base(&file_link, true).unwrap(), contents);
     assert_eq!(git::get_diff_base(&file, true).unwrap(), contents);
+}
+
+#[test]
+fn canceled_status_stops_before_repository_discovery_or_callbacks() {
+    use std::sync::{atomic::AtomicBool, Arc};
+    let interrupt = Arc::new(AtomicBool::new(true));
+    let directory = tempfile::tempdir().unwrap();
+    git::for_each_changed_file(
+        &directory.path().join("missing/path"),
+        false,
+        interrupt,
+        |_| {
+            panic!("canceled status produced a callback before discovery");
+        },
+    )
+    .unwrap();
 }

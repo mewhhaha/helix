@@ -53,14 +53,22 @@ impl Assoc {
         !matches!(self, Self::BeforeWord | Self::AfterWord)
     }
 
-    fn insert_offset(self, s: &str) -> usize {
-        let chars = s.chars().count();
+    fn insert_offset(
+        self,
+        s: &str,
+        chars: usize,
+        after_word: &mut Option<usize>,
+        before_word: &mut Option<usize>,
+    ) -> usize {
         match self {
             Assoc::After | Assoc::AfterSticky => chars,
-            Assoc::AfterWord => s.chars().take_while(|&c| char_is_word(c)).count(),
+            Assoc::AfterWord => *after_word
+                .get_or_insert_with(|| s.chars().take_while(|&c| char_is_word(c)).count()),
             // return position before inserted text
             Assoc::Before | Assoc::BeforeSticky => 0,
-            Assoc::BeforeWord => chars - s.chars().rev().take_while(|&c| char_is_word(c)).count(),
+            Assoc::BeforeWord => *before_word.get_or_insert_with(|| {
+                chars - s.chars().rev().take_while(|&c| char_is_word(c)).count()
+            }),
         }
     }
 
@@ -72,6 +80,9 @@ impl Assoc {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ChangeSet {
     pub(crate) changes: Vec<Operation>,
+    // Character lengths of Insert operations, in their order in `changes`.
+    // Retain/Delete already store their length. Keep the public Operation API unchanged.
+    inserted_chars: Vec<usize>,
     /// The required document length. Will refuse to apply changes unless it matches.
     len: usize,
     len_after: usize,
@@ -81,6 +92,7 @@ impl ChangeSet {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             changes: Vec::with_capacity(capacity),
+            inserted_chars: Vec::new(),
             len: 0,
             len_after: 0,
         }
@@ -91,6 +103,7 @@ impl ChangeSet {
         let len = doc.len_chars();
         Self {
             changes: Vec::new(),
+            inserted_chars: Vec::new(),
             len,
             len_after: len,
         }
@@ -120,25 +133,38 @@ impl ChangeSet {
     }
 
     pub(crate) fn insert(&mut self, fragment: Tendril) {
-        use Operation::*;
+        let chars = fragment.chars().count();
+        self.insert_with_len(fragment, chars);
+    }
 
-        if fragment.is_empty() {
+    fn insert_with_len(&mut self, fragment: Tendril, chars: usize) {
+        use Operation::*;
+        if chars == 0 {
             return;
         }
-
-        // Avoiding std::str::len() to account for UTF-8 characters.
-        self.len_after += fragment.chars().count();
-
+        self.len_after += chars;
         let new_last = match self.changes.as_mut_slice() {
             [.., Insert(prev)] | [.., Insert(prev), Delete(_)] => {
                 prev.push_str(&fragment);
+                *self.inserted_chars.last_mut().unwrap() += chars;
                 return;
             }
             [.., last @ Delete(_)] => std::mem::replace(last, Insert(fragment)),
             _ => Insert(fragment),
         };
-
+        self.inserted_chars.push(chars);
         self.changes.push(new_last);
+    }
+
+    fn into_operations(self) -> impl Iterator<Item = (Operation, usize)> {
+        let mut inserted_chars = self.inserted_chars.into_iter();
+        self.changes.into_iter().map(move |operation| {
+            let chars = match &operation {
+                Operation::Insert(_) => inserted_chars.next().unwrap(),
+                Operation::Retain(chars) | Operation::Delete(chars) => *chars,
+            };
+            (operation, chars)
+        })
     }
 
     pub(crate) fn retain(&mut self, n: usize) {
@@ -174,11 +200,15 @@ impl ChangeSet {
 
         let len = self.changes.len();
 
-        let mut changes_a = self.changes.into_iter();
-        let mut changes_b = other.changes.into_iter();
+        let original_len = self.len;
+        let mut changes_a = self.into_operations();
+        let mut changes_b = other.into_operations();
 
         let mut head_a = changes_a.next();
         let mut head_b = changes_b.next();
+        // Keep partially consumed insertions intact. Removing/splitting their
+        // prefix copies the remaining tail on every operation in `other`.
+        let mut insert_byte_start = 0;
 
         let mut changes = Self::with_capacity(len); // TODO: max(a, b), shrink_to_fit() afterwards
 
@@ -191,23 +221,23 @@ impl ChangeSet {
                     break;
                 }
                 // deletion in A
-                (Some(Delete(i)), b) => {
+                (Some((Delete(i), _)), b) => {
                     changes.delete(i);
                     head_a = changes_a.next();
                     head_b = b;
                 }
                 // insertion in B
-                (a, Some(Insert(current))) => {
-                    changes.insert(current);
+                (a, Some((Insert(current), chars))) => {
+                    changes.insert_with_len(current, chars);
                     head_a = a;
                     head_b = changes_b.next();
                 }
                 (None, val) | (val, None) => unreachable!("({:?})", val),
-                (Some(Retain(i)), Some(Retain(j))) => match i.cmp(&j) {
+                (Some((Retain(i), _)), Some((Retain(j), _))) => match i.cmp(&j) {
                     Ordering::Less => {
                         changes.retain(i);
                         head_a = changes_a.next();
-                        head_b = Some(Retain(j - i));
+                        head_b = Some((Retain(j - i), j - i));
                     }
                     Ordering::Equal => {
                         changes.retain(i);
@@ -216,61 +246,71 @@ impl ChangeSet {
                     }
                     Ordering::Greater => {
                         changes.retain(j);
-                        head_a = Some(Retain(i - j));
+                        head_a = Some((Retain(i - j), i - j));
                         head_b = changes_b.next();
                     }
                 },
-                (Some(Insert(mut s)), Some(Delete(j))) => {
-                    let len = s.chars().count();
+                (Some((Insert(s), len)), Some((Delete(j), _))) => {
                     match len.cmp(&j) {
                         Ordering::Less => {
+                            insert_byte_start = 0;
                             head_a = changes_a.next();
-                            head_b = Some(Delete(j - len));
+                            head_b = Some((Delete(j - len), j - len));
                         }
                         Ordering::Equal => {
-                            head_a = changes_a.next();
-                            head_b = changes_b.next();
-                        }
-                        Ordering::Greater => {
-                            // TODO: cover this with a test
-                            // figure out the byte index of the truncated string end
-                            let (pos, _) = s.char_indices().nth(j).unwrap();
-                            s.replace_range(0..pos, "");
-                            head_a = Some(Insert(s));
-                            head_b = changes_b.next();
-                        }
-                    }
-                }
-                (Some(Insert(s)), Some(Retain(j))) => {
-                    let len = s.chars().count();
-                    match len.cmp(&j) {
-                        Ordering::Less => {
-                            changes.insert(s);
-                            head_a = changes_a.next();
-                            head_b = Some(Retain(j - len));
-                        }
-                        Ordering::Equal => {
-                            changes.insert(s);
+                            insert_byte_start = 0;
                             head_a = changes_a.next();
                             head_b = changes_b.next();
                         }
                         Ordering::Greater => {
                             // figure out the byte index of the truncated string end
-                            let (pos, _) = s.char_indices().nth(j).unwrap();
-                            let mut before = s;
-                            let after = before.split_off(pos);
-
-                            changes.insert(before);
-                            head_a = Some(Insert(after));
+                            let (pos, _) = s[insert_byte_start..].char_indices().nth(j).unwrap();
+                            insert_byte_start += pos;
+                            head_a = Some((Insert(s), len - j));
                             head_b = changes_b.next();
                         }
                     }
                 }
-                (Some(Retain(i)), Some(Delete(j))) => match i.cmp(&j) {
+                (Some((Insert(s), len)), Some((Retain(j), _))) => {
+                    match len.cmp(&j) {
+                        Ordering::Less => {
+                            let fragment = if insert_byte_start == 0 {
+                                s
+                            } else {
+                                s[insert_byte_start..].into()
+                            };
+                            changes.insert_with_len(fragment, len);
+                            insert_byte_start = 0;
+                            head_a = changes_a.next();
+                            head_b = Some((Retain(j - len), j - len));
+                        }
+                        Ordering::Equal => {
+                            let fragment = if insert_byte_start == 0 {
+                                s
+                            } else {
+                                s[insert_byte_start..].into()
+                            };
+                            changes.insert_with_len(fragment, len);
+                            insert_byte_start = 0;
+                            head_a = changes_a.next();
+                            head_b = changes_b.next();
+                        }
+                        Ordering::Greater => {
+                            // figure out the byte index of the truncated string end
+                            let (pos, _) = s[insert_byte_start..].char_indices().nth(j).unwrap();
+                            let end = insert_byte_start + pos;
+                            changes.insert_with_len(s[insert_byte_start..end].into(), j);
+                            insert_byte_start = end;
+                            head_a = Some((Insert(s), len - j));
+                            head_b = changes_b.next();
+                        }
+                    }
+                }
+                (Some((Retain(i), _)), Some((Delete(j), _))) => match i.cmp(&j) {
                     Ordering::Less => {
                         changes.delete(i);
                         head_a = changes_a.next();
-                        head_b = Some(Delete(j - i));
+                        head_b = Some((Delete(j - i), j - i));
                     }
                     Ordering::Equal => {
                         changes.delete(j);
@@ -279,7 +319,7 @@ impl ChangeSet {
                     }
                     Ordering::Greater => {
                         changes.delete(j);
-                        head_a = Some(Retain(i - j));
+                        head_a = Some((Retain(i - j), i - j));
                         head_b = changes_b.next();
                     }
                 },
@@ -287,7 +327,7 @@ impl ChangeSet {
         }
 
         // starting len should still equal original starting len
-        debug_assert!(changes.len == self.len);
+        debug_assert!(changes.len == original_len);
 
         changes
     }
@@ -392,6 +432,7 @@ impl ChangeSet {
 
         let mut old_pos = 0;
         let mut new_pos = 0;
+        let mut inserted_idx = 0;
         let mut iter = self.changes.iter().enumerate().peekable();
 
         'outer: loop {
@@ -416,8 +457,9 @@ impl ChangeSet {
                                     Delete(i) => {
                                         old_pos -= i;
                                     }
-                                    Insert(ins) => {
-                                        new_pos -= ins.chars().count();
+                                    Insert(_) => {
+                                        inserted_idx -= 1;
+                                        new_pos -= self.inserted_chars[inserted_idx];
                                     }
                                 }
                                 if old_pos <= **pos {
@@ -464,6 +506,11 @@ impl ChangeSet {
                     map!(|pos, _| (old_end > pos).then_some(new_pos), i);
                 }
                 Insert(s) => {
+                    let chars = self.inserted_chars[inserted_idx];
+                    // Word associations need string traversal, but only once per
+                    // insertion rather than once for every mapped endpoint.
+                    let mut after_word = None;
+                    let mut before_word = None;
                     // a subsequent delete means a replace, consume it
                     if let Some((_, Delete(len))) = iter.peek() {
                         iter.next();
@@ -476,13 +523,18 @@ impl ChangeSet {
                                 if pos == old_pos && assoc.stay_at_gaps() {
                                     new_pos
                                 } else {
-                                    let ins = assoc.insert_offset(s);
+                                    let ins = assoc.insert_offset(
+                                        s,
+                                        chars,
+                                        &mut after_word,
+                                        &mut before_word,
+                                    );
                                     // if the deleted and inserted text have the exact same size
                                     // keep the relative offset into the new text
                                     if *len == ins && assoc.sticky() {
                                         new_pos + (pos - old_pos)
                                     } else {
-                                        new_pos + assoc.insert_offset(s)
+                                        new_pos + ins
                                     }
                                 }
                             }),
@@ -493,13 +545,20 @@ impl ChangeSet {
                         map!(
                             |pos, assoc: Assoc| (old_pos == pos).then(|| {
                                 // return position before inserted text
-                                new_pos + assoc.insert_offset(s)
+                                new_pos
+                                    + assoc.insert_offset(
+                                        s,
+                                        chars,
+                                        &mut after_word,
+                                        &mut before_word,
+                                    )
                             }),
                             i
                         );
                     }
 
-                    new_pos += s.chars().count();
+                    new_pos += chars;
+                    inserted_idx += 1;
                 }
             }
             old_pos = old_end;
@@ -933,6 +992,87 @@ mod test {
     use super::*;
     use crate::history::State;
 
+    fn assert_insert_lengths(changes: &ChangeSet) {
+        let actual: Vec<_> = changes
+            .changes
+            .iter()
+            .filter_map(|operation| match operation {
+                Operation::Insert(text) => Some(text.chars().count()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(changes.inserted_chars, actual);
+    }
+
+    #[test]
+    fn cached_insert_lengths_survive_unicode_splits_and_deletions() {
+        let original = Rope::from_str("tail");
+        let mut text = original.clone();
+        let mut accumulated = ChangeSet::new(text.slice(..));
+        for change in [
+            (0, 0, Some("😀世e\u{301}".into())),
+            (1, 2, Some("界".into())),
+            (0, 1, None),
+            (1, 2, Some("é😀".into())),
+            (2, 3, None),
+        ] {
+            let transaction = Transaction::change(&text, std::iter::once(change));
+            transaction.apply(&mut text);
+            accumulated = accumulated.compose(transaction.changes().clone());
+            assert_insert_lengths(&accumulated);
+            let mut combined = original.clone();
+            assert!(accumulated.apply(&mut combined));
+            assert_eq!(text, combined);
+            assert!(accumulated.invert(&original).apply(&mut combined));
+            assert_eq!(original, combined);
+        }
+    }
+
+    #[test]
+    fn compose_consumes_large_unicode_insertions_across_alternating_edits() {
+        let original = Rope::from_str("before after");
+        let inserted = "界😀e\u{301}\r\n".repeat(4096);
+        let first = ChangeSet::from_change(&original, (7, 7, Some(inserted.clone().into())));
+        let mut intermediate = original.clone();
+        assert!(first.apply(&mut intermediate));
+        let second = ChangeSet::from_changes(
+            &intermediate,
+            (0..inserted.chars().count() / 2).map(|i| {
+                // Inserting into the retained/deleted sequence also exercises
+                // preserving the first insertion's consumption offset.
+                (8 + i * 2, 9 + i * 2, (i % 7 == 0).then(|| "é".into()))
+            }),
+        );
+        let mut expected = intermediate;
+        assert!(second.apply(&mut expected));
+        let combined = first.compose(second);
+        assert_insert_lengths(&combined);
+        let mut actual = original.clone();
+        assert!(combined.apply(&mut actual));
+        assert_eq!(actual, expected);
+        assert!(combined.invert(&original).apply(&mut actual));
+        assert_eq!(actual, original);
+    }
+
+    #[test]
+    fn adjacent_unicode_insertions_keep_their_cached_length() {
+        let original = Rope::from_str("end");
+        let mut text = original.clone();
+        let mut accumulated = ChangeSet::new(text.slice(..));
+        for index in 0..128 {
+            let transaction = Transaction::change(
+                &text,
+                std::iter::once((index * 3, index * 3, Some("😀e\u{301}".into()))),
+            );
+            transaction.apply(&mut text);
+            accumulated = accumulated.compose(transaction.changes().clone());
+            assert_eq!(accumulated.inserted_chars, [(index + 1) * 3]);
+        }
+        let mut combined = original;
+        accumulated.apply(&mut combined);
+        assert_eq!(text, combined);
+    }
+
     #[test]
     fn composition() {
         use Operation::*;
@@ -945,12 +1085,14 @@ mod test {
                 Delete(2),
                 Insert("abc".into()),
             ],
+            inserted_chars: vec![6, 3],
             len: 8,
             len_after: 15,
         };
 
         let b = ChangeSet {
             changes: vec![Delete(10), Insert("世orld".into()), Retain(5)],
+            inserted_chars: vec![5],
             len: 15,
             len_after: 10,
         };
@@ -970,6 +1112,7 @@ mod test {
 
         let changes = ChangeSet {
             changes: vec![Retain(4), Insert("test".into()), Delete(5), Retain(3)],
+            inserted_chars: vec![4],
             len: 12,
             len_after: 11,
         };
@@ -999,6 +1142,7 @@ mod test {
         // maps inserts
         let cs = ChangeSet {
             changes: vec![Retain(4), Insert("!!".into()), Retain(4)],
+            inserted_chars: vec![2],
             len: 8,
             len_after: 10,
         };
@@ -1011,6 +1155,7 @@ mod test {
         // maps deletes
         let cs = ChangeSet {
             changes: vec![Retain(4), Delete(4), Retain(4)],
+            inserted_chars: vec![],
             len: 12,
             len_after: 8,
         };
@@ -1029,6 +1174,7 @@ mod test {
                 Insert("cd".into()),
                 Delete(2),
             ],
+            inserted_chars: vec![2, 2],
             len: 4,
             len_after: 4,
         };
@@ -1042,6 +1188,7 @@ mod test {
                 Insert("cd".into()),
                 Delete(2),
             ],
+            inserted_chars: vec![2, 2],
             len: 4,
             len_after: 4,
         };
@@ -1056,6 +1203,7 @@ mod test {
                 Retain(2), // cd
                 Insert("de ".into()),
             ],
+            inserted_chars: vec![3, 3],
             len: 4,
             len_after: 10,
         };
@@ -1070,6 +1218,7 @@ mod test {
                 Insert("e ".into()),
                 Delete(1), // <space>
             ],
+            inserted_chars: vec![2, 2],
             len: 5,
             len_after: 7,
         };
@@ -1085,11 +1234,59 @@ mod test {
                 Delete(1), // f
                 Retain(1), // <space>
             ],
+            inserted_chars: vec![1, 1],
             len: 5,
             len_after: 7,
         };
         assert_eq!(cs.map_pos(2, Assoc::BeforeWord), 1);
         assert_eq!(cs.map_pos(4, Assoc::AfterWord), 4);
+    }
+
+    #[test]
+    fn cached_insert_offsets_preserve_unicode_associations_and_unsorted_mapping() {
+        let doc = Rope::from_str("abcdef ghijkl");
+        let changes = ChangeSet::from_changes(
+            &doc,
+            [
+                (0, 6, Some("αβ! γδ".into())),
+                (7, 13, Some("😀ñ_ x界".into())),
+            ]
+            .into_iter(),
+        );
+        let original = [2, 9, 0, 8, 7, 4, 13, 2];
+        for (assoc, expected) in [
+            (Assoc::Before, [0, 7, 0, 7, 7, 0, 13, 0]),
+            (Assoc::After, [6, 13, 0, 13, 7, 6, 13, 6]),
+            (Assoc::BeforeSticky, [0, 7, 0, 7, 7, 0, 13, 0]),
+            (Assoc::AfterSticky, [2, 9, 0, 8, 7, 4, 13, 2]),
+            (Assoc::BeforeWord, [4, 11, 4, 11, 11, 4, 13, 4]),
+            (Assoc::AfterWord, [2, 7, 2, 7, 7, 2, 13, 2]),
+        ] {
+            let mut positions = original;
+            changes.update_positions(positions.iter_mut().map(|pos| (pos, assoc)));
+            assert_eq!(positions, expected, "{assoc:?}");
+        }
+    }
+
+    #[test]
+    fn large_unicode_replacement_maps_many_sticky_and_word_endpoints() {
+        let inserted = format!("{} {}", "界".repeat(10_000), "ñ".repeat(10_000));
+        let len = inserted.chars().count();
+        let doc = Rope::from_str(&"x".repeat(len));
+        let changes = ChangeSet::from_change(&doc, (0, len, Some(inserted.into())));
+        for (assoc, expected) in [
+            (Assoc::AfterWord, 10_000),
+            (Assoc::BeforeWord, 10_001),
+            (Assoc::After, len),
+            (Assoc::Before, 0),
+        ] {
+            let mut positions: Vec<_> = (1..len).collect();
+            changes.update_positions(positions.iter_mut().map(|pos| (pos, assoc)));
+            assert!(positions.iter().all(|&pos| pos == expected), "{assoc:?}");
+        }
+        let mut positions: Vec<_> = (0..=len).collect();
+        changes.update_positions(positions.iter_mut().map(|pos| (pos, Assoc::AfterSticky)));
+        assert!(positions.into_iter().enumerate().all(|(i, pos)| i == pos));
     }
 
     #[test]

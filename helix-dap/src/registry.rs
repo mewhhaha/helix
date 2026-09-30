@@ -34,6 +34,7 @@ impl Registry {
         &mut self,
         socket: Option<std::net::SocketAddr>,
         config: &DebugAdapterConfig,
+        supports_run_in_terminal: bool,
     ) -> Result<DebugAdapterId> {
         self.inner.try_insert_with_key(|id| {
             let result = match socket {
@@ -51,7 +52,7 @@ impl Registry {
             self.incoming.push(UnboundedReceiverStream::new(receiver));
 
             client.config = Some(config.clone());
-            block_on(client.initialize(config.name.clone()))?;
+            block_on(client.initialize(config.name.clone(), supports_run_in_terminal))?;
             client.quirks = config.quirks.clone();
 
             Ok(client)
@@ -80,6 +81,11 @@ impl Registry {
     }
 
     pub fn set_active_client(&mut self, id: DebugAdapterId) {
+        if self.current_client_id != Some(id) {
+            if let Some(client) = self.get_active_client_mut() {
+                client.invalidate_selection_requests();
+            }
+        }
         if self.get_client(id).is_some() {
             self.current_client_id = Some(id);
         } else {
@@ -88,6 +94,9 @@ impl Registry {
     }
 
     pub fn unset_active_client(&mut self) {
+        if let Some(client) = self.get_active_client_mut() {
+            client.invalidate_selection_requests();
+        }
         self.current_client_id = None;
     }
 
@@ -110,5 +119,50 @@ slotmap::new_key_type! {
 impl fmt::Display for DebugAdapterId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:?}", self.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::BufReader;
+
+    fn add_client(registry: &mut Registry) -> DebugAdapterId {
+        registry.inner.insert_with_key(|id| {
+            let (client, _incoming) = Client::streams(
+                Box::new(BufReader::new(tokio::io::empty())),
+                Box::new(tokio::io::sink()),
+                None,
+                id,
+                None,
+            )
+            .unwrap();
+            client
+        })
+    }
+
+    #[tokio::test]
+    async fn switching_adapters_away_and_back_invalidates_old_variables_selection() {
+        let mut registry = Registry::new();
+        let first = add_client(&mut registry);
+        let second = add_client(&mut registry);
+        registry.set_active_client(first);
+        let selected = registry.get_active_client().unwrap().selection_guard();
+        let stopped = registry.get_active_client().unwrap().stop_guard();
+        registry.set_active_client(first);
+        assert!(
+            selected.is_current(),
+            "reselecting the same adapter preserves valid work"
+        );
+        registry.set_active_client(second);
+        registry.set_active_client(first);
+        assert!(!selected.is_current());
+        assert!(
+            stopped.is_current(),
+            "thread stack caches still belong to the same stop"
+        );
+        let selected = registry.get_active_client().unwrap().selection_guard();
+        registry.unset_active_client();
+        assert!(!selected.is_current());
     }
 }

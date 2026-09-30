@@ -1,7 +1,7 @@
 use crate::{
     file_operations::FileOperationsInterest,
     find_lsp_workspace, jsonrpc,
-    transport::{Payload, Transport},
+    transport::{OutboundSender, Payload, Transport},
     Call, Error, LanguageServerId, OffsetEncoding, Result,
 };
 use log::info;
@@ -34,11 +34,67 @@ use std::{path::Path, process::Stdio};
 use tokio::{
     io::{BufReader, BufWriter},
     process::{Child, Command},
-    sync::{
-        mpsc::{channel, UnboundedReceiver, UnboundedSender},
-        Notify, OnceCell,
-    },
+    sync::{mpsc::UnboundedReceiver, Notify, OnceCell},
 };
+
+// Deleted text has no wire payload. Use Rope's indexed length metrics instead
+// of decoding every character just to find the end of the deletion.
+fn advance_position(
+    pos: lsp::Position,
+    text: helix_core::RopeSlice<'_>,
+    encoding: OffsetEncoding,
+) -> lsp::Position {
+    static UNICODE_LINES: OnceLock<bool> = OnceLock::new();
+    let unicode_lines = *UNICODE_LINES.get_or_init(|| Rope::from_str("\u{2028}").len_lines() > 1);
+    let mut lines = text.len_lines() - 1;
+    let mut tail_start = text.line_to_char(lines);
+    if unicode_lines {
+        // The optional Rope line model also recognizes non-LSP separators.
+        // Inspect line boundaries only, leaving the contents indexed.
+        lines = 0;
+        tail_start = 0;
+        let mut offset = 0;
+        for line in text.lines() {
+            offset += line.len_chars();
+            if line.len_chars() != 0 && matches!(line.char(line.len_chars() - 1), '\r' | '\n') {
+                lines += 1;
+                tail_start = offset;
+            }
+        }
+    } else {
+        // Default Rope indexes LF, including CRLF, but not standalone CR.
+        // Searching UTF-8 chunks for one ASCII byte avoids the old per-character
+        // decoding walk. This remaining CR scan is linear in deleted bytes.
+        let mut offset = 0;
+        let mut last_cr = None;
+        for chunk in text.chunks() {
+            for (index, _) in chunk.match_indices('\r') {
+                let next = offset + index + 1;
+                let next_byte = chunk
+                    .as_bytes()
+                    .get(index + 1)
+                    .copied()
+                    .or_else(|| (next < text.len_bytes()).then(|| text.byte(next)));
+                if next_byte != Some(b'\n') {
+                    lines += 1;
+                    last_cr = Some(next);
+                }
+            }
+            offset += chunk.len();
+        }
+        if let Some(last_cr) = last_cr {
+            tail_start = tail_start.max(text.byte_to_char(last_cr));
+        }
+    }
+    let tail = text.slice(tail_start..);
+    let character = match encoding {
+        OffsetEncoding::Utf8 => tail.len_bytes(),
+        OffsetEncoding::Utf16 => tail.len_utf16_cu(),
+        OffsetEncoding::Utf32 => tail.len_chars(),
+    } as u32
+        + if lines == 0 { pos.character } else { 0 };
+    lsp::Position::new(pos.line + lines as u32, character)
+}
 
 fn workspace_for_uri(uri: lsp::Url) -> WorkspaceFolder {
     lsp::WorkspaceFolder {
@@ -52,12 +108,49 @@ fn workspace_for_uri(uri: lsp::Url) -> WorkspaceFolder {
     }
 }
 
+pub(crate) fn request_with_timeout<R: lsp::request::Request>(
+    server_tx: &OutboundSender,
+    id: jsonrpc::Id,
+    params: &R::Params,
+    timeout: std::time::Duration,
+) -> impl Future<Output = Result<R::Result>>
+where
+    R::Params: serde::Serialize,
+{
+    // Enqueue before constructing the future so requests remain ordered with
+    // document changes even if the future is not polled immediately.
+    let request = serde_json::to_value(params)
+        .map_err(Error::from)
+        .and_then(|params| {
+            server_tx.request(jsonrpc::MethodCall {
+                jsonrpc: Some(jsonrpc::Version::V2),
+                id: id.clone(),
+                method: R::METHOD.to_string(),
+                params: Client::value_into_params(params),
+            })
+        });
+    async move {
+        let (mut receiver, mut guard) = request?;
+        match tokio::time::timeout(timeout, receiver.recv()).await {
+            Ok(response) => {
+                // Server errors and disconnects also finish the request. Only
+                // timeout or dropping this future should send cancellation.
+                guard.complete();
+                response
+                    .ok_or(Error::StreamClosed)?
+                    .and_then(|value| serde_json::from_value(value).map_err(Into::into))
+            }
+            Err(_) => Err(Error::Timeout(id)),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Client {
     id: LanguageServerId,
     name: String,
     _process: Child,
-    server_tx: UnboundedSender<Payload>,
+    server_tx: OutboundSender,
     request_counter: AtomicU64,
     pub(crate) capabilities: OnceCell<lsp::ServerCapabilities>,
     pub(crate) file_operation_interest: OnceLock<FileOperationsInterest>,
@@ -465,40 +558,12 @@ impl Client {
     where
         R::Params: serde::Serialize,
     {
-        let server_tx = self.server_tx.clone();
-        let id = self.next_request_id();
-
-        // It's important that this is not part of the future so that it gets executed right away
-        // and the request order stays consistent.
-        let rx = serde_json::to_value(params)
-            .map_err(Error::from)
-            .and_then(|params| {
-                let request = jsonrpc::MethodCall {
-                    jsonrpc: Some(jsonrpc::Version::V2),
-                    id: id.clone(),
-                    method: R::METHOD.to_string(),
-                    params: Self::value_into_params(params),
-                };
-                let (tx, rx) = channel::<Result<Value>>(1);
-                server_tx
-                    .send(Payload::Request {
-                        chan: tx,
-                        value: request,
-                    })
-                    .map_err(|e| Error::Other(e.into()))?;
-                Ok(rx)
-            });
-
-        async move {
-            use std::time::Duration;
-            use tokio::time::timeout;
-            // TODO: delay other calls until initialize success
-            timeout(Duration::from_secs(timeout_secs), rx?.recv())
-                .await
-                .map_err(|_| Error::Timeout(id))? // return Timeout
-                .ok_or(Error::StreamClosed)?
-                .and_then(|value| serde_json::from_value(value).map_err(Into::into))
-        }
+        request_with_timeout::<R>(
+            &self.server_tx,
+            self.next_request_id(),
+            params,
+            std::time::Duration::from_secs(timeout_secs),
+        )
     }
 
     /// Send a RPC notification to the language server.
@@ -727,6 +792,9 @@ impl Client {
                         dynamic_registration: Some(false),
                         resolve_support: None,
                     }),
+                    color_provider: Some(lsp::DocumentColorClientCapabilities {
+                        dynamic_registration: Some(false),
+                    }),
                     document_link: Some(lsp::DocumentLinkClientCapabilities {
                         dynamic_registration: Some(false),
                         tooltip_support: Some(false),
@@ -808,11 +876,10 @@ impl Client {
             method: <lsp::request::Shutdown as lsp::request::Request>::METHOD.to_string(),
             params: jsonrpc::Params::None,
         };
-        // The response receiver is dropped immediately; we do not wait for a reply.
-        let (chan, _) = tokio::sync::mpsc::channel(1);
+        // This untracked request is flushed without waiting for its reply.
         let _ = self.server_tx.send(Payload::Request {
-            chan,
-            value: request,
+            pending: None,
+            value: Arc::new(Mutex::new(Some(request))),
         });
         self.exit();
     }
@@ -989,38 +1056,6 @@ impl Client {
         //
         // Calculation is therefore a bunch trickier.
 
-        use helix_core::RopeSlice;
-        fn traverse(
-            pos: lsp::Position,
-            text: RopeSlice,
-            offset_encoding: OffsetEncoding,
-        ) -> lsp::Position {
-            let lsp::Position {
-                mut line,
-                mut character,
-            } = pos;
-
-            let mut chars = text.chars().peekable();
-            while let Some(ch) = chars.next() {
-                // LSP only considers \n, \r or \r\n as line endings
-                if ch == '\n' || ch == '\r' {
-                    // consume a \r\n
-                    if ch == '\r' && chars.peek() == Some(&'\n') {
-                        chars.next();
-                    }
-                    line += 1;
-                    character = 0;
-                } else {
-                    character += match offset_encoding {
-                        OffsetEncoding::Utf8 => ch.len_utf8() as u32,
-                        OffsetEncoding::Utf16 => ch.len_utf16() as u32,
-                        OffsetEncoding::Utf32 => 1,
-                    };
-                }
-            }
-            lsp::Position { line, character }
-        }
-
         let old_text = old_text.slice(..);
 
         while let Some(change) = iter.next() {
@@ -1036,7 +1071,8 @@ impl Client {
                 }
                 Delete(_) => {
                     let start = pos_to_lsp_pos(new_text, new_pos, offset_encoding);
-                    let end = traverse(start, old_text.slice(old_pos..old_end), offset_encoding);
+                    let end =
+                        advance_position(start, old_text.slice(old_pos..old_end), offset_encoding);
 
                     // deletion
                     changes.push(lsp::TextDocumentContentChangeEvent {
@@ -1053,8 +1089,11 @@ impl Client {
                     // a subsequent delete means a replace, consume it
                     let end = if let Some(Delete(len)) = iter.peek() {
                         old_end = old_pos + len;
-                        let end =
-                            traverse(start, old_text.slice(old_pos..old_end), offset_encoding);
+                        let end = advance_position(
+                            start,
+                            old_text.slice(old_pos..old_end),
+                            offset_encoding,
+                        );
 
                         iter.next();
 
@@ -1102,12 +1141,16 @@ impl Client {
 
         let changes = match sync_capabilities {
             lsp::TextDocumentSyncKind::FULL => {
-                vec![lsp::TextDocumentContentChangeEvent {
-                    // range = None -> whole document
-                    range: None,        //Some(Range)
-                    range_length: None, // u64 apparently deprecated
-                    text: new_text.to_string(),
-                }]
+                if let Err(err) = self
+                    .server_tx
+                    .full_document_change(text_document, new_text.clone())
+                {
+                    log::error!(
+                        "Failed to enqueue full document change for '{}': {err}",
+                        self.name
+                    );
+                }
+                return Some(());
             }
             lsp::TextDocumentSyncKind::INCREMENTAL => {
                 Self::changeset_to_changes(old_text, new_text, changes, self.offset_encoding())
@@ -1155,7 +1198,7 @@ impl Client {
 
         self.notify::<lsp::notification::DidSaveTextDocument>(lsp::DidSaveTextDocumentParams {
             text_document,
-            text: include_text.then_some(text.into()),
+            text: include_text.then(|| text.into()),
         });
         Some(())
     }
@@ -1812,5 +1855,76 @@ impl Client {
         self.notify::<lsp::notification::DidChangeWatchedFiles>(lsp::DidChangeWatchedFilesParams {
             changes,
         })
+    }
+}
+
+#[cfg(test)]
+mod span_metric_tests {
+    use super::*;
+
+    fn reference(
+        mut pos: lsp::Position,
+        text: helix_core::RopeSlice<'_>,
+        encoding: OffsetEncoding,
+    ) -> lsp::Position {
+        let mut chars = text.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if matches!(ch, '\r' | '\n') {
+                if ch == '\r' && chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                pos.line += 1;
+                pos.character = 0;
+            } else {
+                pos.character += match encoding {
+                    OffsetEncoding::Utf8 => ch.len_utf8() as u32,
+                    OffsetEncoding::Utf16 => ch.len_utf16() as u32,
+                    OffsetEncoding::Utf32 => 1,
+                };
+            }
+        }
+        pos
+    }
+
+    #[test]
+    fn indexed_span_metrics_match_protocol_line_endings_and_slice_boundaries() {
+        let text = Rope::from_str("aé😀\r\nb\rc\n\u{2028}d\u{0085}e");
+        for start in 0..=text.len_chars() {
+            for end in start..=text.len_chars() {
+                for encoding in [
+                    OffsetEncoding::Utf8,
+                    OffsetEncoding::Utf16,
+                    OffsetEncoding::Utf32,
+                ] {
+                    let slice = text.slice(start..end);
+                    let position = lsp::Position::new(3, 7);
+                    assert_eq!(
+                        advance_position(position, slice, encoding),
+                        reference(position, slice, encoding),
+                        "{start}..{end} {encoding:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_span_metrics_handle_crlf_across_rope_chunks() {
+        let text = Rope::from_str(&format!(
+            "{}\r\n{}\ré😀",
+            "a".repeat(2047),
+            "b".repeat(2048)
+        ));
+        for encoding in [
+            OffsetEncoding::Utf8,
+            OffsetEncoding::Utf16,
+            OffsetEncoding::Utf32,
+        ] {
+            let position = lsp::Position::new(2, 4);
+            assert_eq!(
+                advance_position(position, text.slice(..), encoding),
+                reference(position, text.slice(..), encoding)
+            );
+        }
     }
 }

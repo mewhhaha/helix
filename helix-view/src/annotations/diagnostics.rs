@@ -1,16 +1,33 @@
 use helix_core::diagnostic::Severity;
 use helix_core::doc_formatter::{FormattedGrapheme, TextFormat};
 use helix_core::text_annotations::LineAnnotation;
-use helix_core::{softwrapped_dimensions, Diagnostic, Position};
+use helix_core::{Diagnostic, Position};
 use serde::{Deserialize, Serialize};
 
 use crate::Document;
+use std::{
+    any::Any,
+    hash::{Hash, Hasher},
+    sync::Arc,
+};
 
 /// Describes the severity level of a [`Diagnostic`].
 #[derive(Debug, Clone, Copy, Eq, PartialEq, PartialOrd, Ord)]
 pub enum DiagnosticFilter {
     Disable,
     Enable(Severity),
+}
+
+impl Hash for DiagnosticFilter {
+    fn hash<H: Hasher>(&self, hasher: &mut H) {
+        match self {
+            Self::Disable => 0u8.hash(hasher),
+            Self::Enable(severity) => {
+                1u8.hash(hasher);
+                (*severity as u8).hash(hasher);
+            }
+        }
+    }
 }
 
 impl<'de> Deserialize<'de> for DiagnosticFilter {
@@ -48,7 +65,7 @@ impl Serialize for DiagnosticFilter {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
 pub struct InlineDiagnosticsConfig {
     pub cursor_line: DiagnosticFilter,
@@ -102,6 +119,7 @@ impl InlineDiagnosticsConfig {
             wrap_indicator_highlight: None,
             viewport_width: width,
             soft_wrap_at_text_width: true,
+            checkpoint_cache: None,
         }
     }
 }
@@ -258,6 +276,18 @@ pub(crate) struct InlineDiagnostics<'a> {
     state: InlineDiagnosticAccumulator<'a>,
     width: u16,
     horizontal_off: usize,
+    visual_row_start: usize,
+    cursor_row: Option<std::ops::Range<usize>>,
+}
+
+#[derive(Debug)]
+struct DiagnosticCheckpoint {
+    idx: usize,
+    cursor_line: bool,
+    stack: Vec<(usize, u16)>,
+    cursor: usize,
+    visual_row_start: usize,
+    cursor_row: Option<std::ops::Range<usize>>,
 }
 
 impl<'a> InlineDiagnostics<'a> {
@@ -273,12 +303,107 @@ impl<'a> InlineDiagnostics<'a> {
             state: InlineDiagnosticAccumulator::new(cursor, doc, config),
             width,
             horizontal_off,
+            visual_row_start: 0,
+            cursor_row: None,
         })
     }
 }
 
 impl LineAnnotation for InlineDiagnostics<'_> {
+    fn checkpoint_key(&self) -> Option<u64> {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.state
+            .doc
+            .diagnostics_layout_generation()
+            .hash(&mut hasher);
+        self.state.config.hash(&mut hasher);
+        self.width.hash(&mut hasher);
+        self.horizontal_off.hash(&mut hasher);
+        Some(hasher.finish())
+    }
+
+    fn checkpoint(&self) -> Option<Arc<dyn Any + Send + Sync>> {
+        // The rendering decoration also accumulates anchors from the visible
+        // traversal. Resume only before pending diagnostics/cursor-line state
+        // so that both traversals still observe those anchors themselves.
+        if !self.state.stack.is_empty() || self.state.cursor_line {
+            return None;
+        }
+        // Entries refer to this immutable diagnostic slice. Store indices,
+        // rather than borrowed diagnostics, so checkpoints can outlive a view.
+        let diagnostics = self.state.doc.diagnostics();
+        let stack = self
+            .state
+            .stack
+            .iter()
+            .map(|&(diagnostic, anchor)| {
+                let address = diagnostic as *const Diagnostic as usize;
+                diagnostics
+                    .binary_search_by_key(&address, |diag| diag as *const Diagnostic as usize)
+                    .ok()
+                    .map(|index| (index, anchor))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(Arc::new(DiagnosticCheckpoint {
+            idx: self.state.idx,
+            cursor_line: self.state.cursor_line,
+            stack,
+            cursor: self.state.cursor,
+            visual_row_start: self.visual_row_start,
+            cursor_row: self.cursor_row.clone(),
+        }))
+    }
+
+    fn checkpoint_is_valid(&self, state: &(dyn Any + Send + Sync), char_idx: usize) -> bool {
+        let Some(state) = state.downcast_ref::<DiagnosticCheckpoint>() else {
+            return false;
+        };
+        state.cursor == self.state.cursor
+            || state
+                .cursor_row
+                .as_ref()
+                .is_some_and(|row| row.contains(&self.state.cursor))
+            || (state.cursor >= char_idx && self.state.cursor >= char_idx)
+            || self.state.config.cursor_line == self.state.config.other_lines
+    }
+
+    fn checkpoint_next_anchor(&self, char_idx: usize) -> Option<usize> {
+        Some(self.state.next_anchor(char_idx))
+    }
+
+    fn restore_checkpoint(&mut self, state: &(dyn Any + Send + Sync)) -> bool {
+        let Some(state) = state.downcast_ref::<DiagnosticCheckpoint>() else {
+            return false;
+        };
+        let diagnostics = self.state.doc.diagnostics();
+        if state.idx > diagnostics.len()
+            || state
+                .stack
+                .iter()
+                .any(|&(index, _)| index >= diagnostics.len())
+        {
+            return false;
+        }
+        self.state.idx = state.idx;
+        self.state.cursor_line = state.cursor_line;
+        self.visual_row_start = state.visual_row_start;
+        self.cursor_row = state
+            .cursor_row
+            .clone()
+            .filter(|row| row.contains(&self.state.cursor));
+        self.state.stack.clear();
+        self.state.stack.extend(
+            state
+                .stack
+                .iter()
+                .map(|&(index, anchor)| (&diagnostics[index], anchor)),
+        );
+        true
+    }
+
     fn reset_pos(&mut self, char_idx: usize) -> usize {
+        self.visual_row_start = char_idx;
+        self.cursor_row = None;
         self.state.reset_pos(char_idx)
     }
 
@@ -293,21 +418,168 @@ impl LineAnnotation for InlineDiagnostics<'_> {
 
     fn insert_virtual_lines(
         &mut self,
-        _line_end_char_idx: usize,
+        line_end_char_idx: usize,
         _line_end_visual_pos: Position,
         _doc_line: usize,
     ) -> Position {
+        if self.state.cursor_line {
+            self.cursor_row = Some(self.visual_row_start..line_end_char_idx);
+        }
+        self.visual_row_start = line_end_char_idx;
         self.state.compute_line_diagnostics();
         let multi = self.state.has_multi(self.width);
+        let doc = self.state.doc;
         let diagostic_height: usize = self
             .state
             .stack
             .drain(..)
             .map(|(diag, anchor)| {
                 let text_fmt = self.state.config.text_fmt(anchor, self.width);
-                softwrapped_dimensions(diag.message.as_str().trim().into(), &text_fmt).0
+                doc.diagnostic_message_dimensions(diag.message.as_str().trim(), &text_fmt)
+                    .0
             })
             .sum();
         Position::new(multi as usize + diagostic_height, 0)
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_tests {
+    use super::*;
+    use crate::{editor::Config, View};
+    use arc_swap::ArcSwap;
+    use helix_core::{
+        diagnostic::{DiagnosticProvider, LanguageServerId},
+        doc_formatter::DocumentFormatter,
+        syntax,
+        text_annotations::TextAnnotations,
+        Rope, Selection, Transaction,
+    };
+
+    fn document() -> Document {
+        let mut config = Config::default();
+        config.soft_wrap.enable = Some(true);
+        Document::from(
+            Rope::from_str(&format!("{}\nlater line\n", "word ".repeat(4000))),
+            None,
+            Arc::new(ArcSwap::from_pointee(config)),
+            Arc::new(ArcSwap::from_pointee(syntax::Loader::default())),
+        )
+    }
+
+    fn diagnostic(start: usize, end: usize) -> Diagnostic {
+        Diagnostic {
+            range: helix_core::diagnostic::Range { start, end },
+            starts_at_word: false,
+            ends_at_word: false,
+            zero_width: false,
+            line: 0,
+            message: "warning on cursor row".into(),
+            severity: Some(Severity::Warning),
+            provider: DiagnosticProvider::Lsp {
+                server_id: LanguageServerId::default(),
+                identifier: None,
+            },
+            code: None,
+            tags: Vec::new(),
+            source: None,
+            data: None,
+        }
+    }
+
+    fn annotations(doc: &Document, cursor: usize, width: u16) -> TextAnnotations<'_> {
+        let mut annotations = TextAnnotations::default();
+        annotations.add_line_annotation(InlineDiagnostics::new(
+            doc,
+            cursor,
+            width,
+            0,
+            InlineDiagnosticsConfig {
+                max_diagnostics: 1,
+                ..InlineDiagnosticsConfig::default()
+            },
+        ));
+        annotations
+    }
+
+    fn assert_layout(doc: &Document, cursor: usize, width: u16, target: usize, expect_warm: bool) {
+        let annotations = annotations(doc, cursor, width);
+        let format = doc.text_format(width, None);
+        let formatter = DocumentFormatter::new_at_prev_checkpoint(
+            doc.text().slice(..),
+            &format,
+            &annotations,
+            target,
+        );
+        if expect_warm {
+            assert!(
+                formatter.next_char_pos() > target - 1500,
+                "lost compatible checkpoints"
+            );
+        }
+        let actual: Vec<_> = formatter
+            .map(|g| (g.char_idx, g.raw.to_string(), g.visual_pos))
+            .collect();
+        let mut plain = format.clone();
+        plain.checkpoint_cache = None;
+        let expected: Vec<_> = DocumentFormatter::new_at_prev_checkpoint(
+            doc.text().slice(..),
+            &plain,
+            &annotations,
+            0,
+        )
+        .filter(|g| g.char_idx >= actual[0].0)
+        .map(|g| (g.char_idx, g.raw.to_string(), g.visual_pos))
+        .collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn cursor_row_compatibility_split_widths_and_unrelated_edits_preserve_layout() {
+        let mut doc = document();
+        let view = View::new(doc.id(), Config::default().gutters);
+        doc.set_selection(view.id, Selection::point(0));
+        doc.replace_diagnostics([diagnostic(0, 1), diagnostic(20001, 20002)], &[], None);
+        for width in [80, 120] {
+            assert_layout(&doc, 0, width, 18000, false);
+        }
+        for width in [80, 120] {
+            assert_layout(&doc, 1, width, 18000, true);
+        }
+        // Moving into another wrapped row changes the cursor-line filter and must
+        // rebuild affected geometry; subsequent seeks can reuse that new state.
+        assert_layout(&doc, 100, 80, 18000, false);
+        assert_layout(&doc, 101, 80, 18000, true);
+        let end = doc.text().len_chars() - 1;
+        let edit = Transaction::change(doc.text(), [(end, end, Some("tail".into()))].into_iter());
+        assert!(doc.apply(&edit, view.id));
+        assert_layout(&doc, 101, 80, 18000, true);
+        // A diagnostic anchored before the edit can disappear when its range is
+        // deleted. Its earlier virtual rows must be invalidated as well.
+        let edit = Transaction::change(doc.text(), [(0, 150, None)].into_iter());
+        assert!(doc.apply(&edit, view.id));
+        assert_layout(&doc, 0, 80, 17800, false);
+    }
+
+    #[tokio::test]
+    async fn remapping_that_reorders_same_anchor_diagnostics_invalidates_earlier_rows() {
+        let mut doc = document();
+        let view = View::new(doc.id(), Config::default().gutters);
+        doc.set_selection(view.id, Selection::point(0));
+        let mut first = diagnostic(0, 20002);
+        first.ends_at_word = true;
+        first.message = "short".into();
+        let mut second = diagnostic(0, 20007);
+        second.message = "long wrapped warning ".repeat(50);
+        doc.replace_diagnostics([first, second], &[], None);
+        assert_layout(&doc, 0, 80, 18000, false);
+        assert_layout(&doc, 1, 80, 18000, true);
+        let edit = Transaction::change(
+            doc.text(),
+            [(20002, 20009, Some("word ".into()))].into_iter(),
+        );
+        assert!(doc.apply(&edit, view.id));
+        assert!(doc.diagnostics()[0].message.starts_with("long"));
+        assert_layout(&doc, 1, 80, 18000, false);
     }
 }

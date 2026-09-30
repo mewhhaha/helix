@@ -1,15 +1,17 @@
 use std::{
     borrow::Cow,
     cmp::Ordering,
+    collections::BTreeMap,
     ops::{Add, AddAssign, Sub, SubAssign},
 };
 
 use helix_stdx::rope::RopeSliceExt;
+use parking_lot::Mutex;
 
 use crate::{
     chars::char_is_line_ending,
     doc_formatter::{DocumentFormatter, TextFormat},
-    graphemes::{ensure_grapheme_boundary_prev, grapheme_width},
+    graphemes::{ensure_grapheme_boundary_prev, grapheme_width, prev_grapheme_boundary},
     line_ending::line_end_char_index,
     text_annotations::TextAnnotations,
     RopeSlice,
@@ -103,6 +105,163 @@ pub fn coords_at_pos(text: RopeSlice, pos: usize) -> Position {
     Position::new(line, col)
 }
 
+const COORD_CHECKPOINT_INTERVAL: usize = 1024;
+const MAX_COORD_LINES: usize = 8;
+const MAX_COORD_CHECKPOINTS_PER_LINE: usize = 512;
+
+#[derive(Debug, Default)]
+struct GraphemeColumns {
+    checkpoints: BTreeMap<usize, usize>,
+    last: Option<(usize, usize)>,
+    uncached: bool,
+    used: u64,
+}
+
+#[derive(Debug, Default)]
+struct GraphemeCoordinates {
+    len: Option<usize>,
+    lines: BTreeMap<usize, GraphemeColumns>,
+    last: Option<(usize, Position)>,
+    clock: u64,
+}
+
+/// Bounded raw grapheme-column checkpoints for one document.
+///
+/// Unlike visual layout, these coordinates are independent of wrapping, tabs'
+/// display width and annotations. Call [`Self::invalidate_after_change`] when
+/// text changes, including replacements that keep its length unchanged.
+#[derive(Debug, Default)]
+pub struct GraphemePositionCache(Mutex<GraphemeCoordinates>);
+
+impl GraphemePositionCache {
+    pub fn clear(&self) {
+        *self.0.lock() = GraphemeCoordinates::default();
+    }
+
+    /// Retain the unaffected prefix, including checkpoints on the edited line.
+    /// Dropping the previous grapheme also handles combining characters, CRLF,
+    /// regional indicators and other edits that join an existing cluster.
+    pub fn invalidate_after_change(
+        &self,
+        old_text: RopeSlice,
+        first_change: usize,
+        new_len: usize,
+    ) {
+        let mut cache = self.0.lock();
+        if cache.len != Some(old_text.len_chars()) {
+            *cache = GraphemeCoordinates::default();
+        } else {
+            let safe_pos = prev_grapheme_boundary(old_text, first_change);
+            let line_start = old_text.line_to_char(old_text.char_to_line(safe_pos));
+            cache.lines.retain(|start, line| {
+                if *start > line_start {
+                    return false;
+                }
+                if *start == line_start {
+                    line.checkpoints.retain(|pos, _| *pos <= safe_pos);
+                    if line.last.is_some_and(|(pos, _)| pos > safe_pos) {
+                        line.last = None;
+                    }
+                }
+                true
+            });
+            cache.last = None;
+        }
+        cache.len = Some(new_len);
+    }
+
+    pub fn coords_at_pos(&self, text: RopeSlice, pos: usize) -> Position {
+        let mut cache = self.0.lock();
+        if cache.len != Some(text.len_chars()) {
+            *cache = GraphemeCoordinates {
+                len: Some(text.len_chars()),
+                ..GraphemeCoordinates::default()
+            };
+        }
+        if let Some((last_pos, coords)) = cache.last {
+            if last_pos == pos {
+                return coords;
+            }
+        }
+
+        let row = text.char_to_line(pos);
+        let line_start = text.line_to_char(row);
+        let target = ensure_grapheme_boundary_prev(text, pos);
+        if !cache.lines.contains_key(&line_start) && cache.lines.len() == MAX_COORD_LINES {
+            let oldest = *cache
+                .lines
+                .iter()
+                .min_by_key(|(_, line)| line.used)
+                .unwrap()
+                .0;
+            cache.lines.remove(&oldest);
+        }
+        cache.clock = cache.clock.wrapping_add(1);
+        let used = cache.clock;
+        let line = cache.lines.entry(line_start).or_default();
+        line.used = used;
+        if line.uncached {
+            let coords = coords_at_pos(text, pos);
+            cache.last = Some((pos, coords));
+            return coords;
+        }
+        let (mut char_pos, mut col) = line
+            .checkpoints
+            .range(..=target)
+            .next_back()
+            .map(|(&pos, &col)| (pos, col))
+            .unwrap_or((line_start, 0));
+        let mut last_checkpoint = char_pos;
+        if let Some((last_pos, last_col)) = line.last {
+            if last_pos <= target && last_pos > char_pos {
+                (char_pos, col) = (last_pos, last_col);
+            }
+        }
+        // Keep the full rope as segmentation context. Slicing at a checkpoint
+        // could change regional-indicator pairing or other Unicode boundaries.
+        let mut graphemes = text.graphemes_at(text.char_to_byte(char_pos));
+        while char_pos < target {
+            let grapheme = graphemes.next().unwrap();
+            let chars = grapheme.len_chars();
+            char_pos += chars;
+            // The rope's forward segmenter and boundary lookup can disagree
+            // on long regional-indicator runs crossing chunk seams. Keep the
+            // existing raw-coordinate result instead of resuming inconsistent
+            // checkpoints. Unchanged queries are still memoized in this case.
+            let regional_indicator = grapheme
+                .chars()
+                .next()
+                .is_some_and(|ch| ('\u{1f1e6}'..='\u{1f1ff}').contains(&ch));
+            if char_pos > target
+                || (regional_indicator
+                    && (chars > 2
+                        || (chars == 1
+                            && char_pos < text.len_chars()
+                            && ('\u{1f1e6}'..='\u{1f1ff}').contains(&text.char(char_pos)))))
+            {
+                line.uncached = true;
+                line.checkpoints.clear();
+                line.last = None;
+                let coords = coords_at_pos(text, pos);
+                cache.last = Some((pos, coords));
+                return coords;
+            }
+            col += 1;
+            if char_pos - last_checkpoint >= COORD_CHECKPOINT_INTERVAL {
+                line.checkpoints.insert(char_pos, col);
+                if line.checkpoints.len() > MAX_COORD_CHECKPOINTS_PER_LINE {
+                    line.checkpoints.pop_first();
+                }
+                last_checkpoint = char_pos;
+            }
+        }
+        line.last = Some((target, col));
+        let coords = Position::new(row, col);
+        cache.last = Some((pos, coords));
+        coords
+    }
+}
+
 /// Convert a character index to (line, column) coordinates visually.
 ///
 /// Takes \t, double-width characters (CJK) into account as well as text
@@ -138,9 +297,8 @@ pub fn visual_coords_at_pos(text: RopeSlice, pos: usize, tab_width: usize) -> Po
 /// Returns the visual offset from the start of the first visual line
 /// in the block that contains anchor.
 /// Text is always wrapped at blocks, they usually correspond to
-/// actual line breaks but for very long lines
-/// softwrapping positions are estimated with an O(1) algorithm
-/// to ensure consistent performance for large lines (currently unimplemented)
+/// actual line breaks. Cached layout checkpoints avoid rescanning a long
+/// physical line for repeated queries.
 ///
 /// Usually you want to use `visual_offset_from_anchor` instead but this function
 /// can be useful (and faster) if
@@ -154,9 +312,16 @@ pub fn visual_offset_from_block(
     annotations: &TextAnnotations,
 ) -> (Position, usize) {
     let mut last_pos = Position::default();
+    let target = if pos <= text.len_chars()
+        && text.char_to_line(pos) == text.char_to_line(anchor.min(text.len_chars()))
+    {
+        pos
+    } else {
+        anchor
+    };
     let mut formatter =
-        DocumentFormatter::new_at_prev_checkpoint(text, text_fmt, annotations, anchor);
-    let block_start = formatter.next_char_pos();
+        DocumentFormatter::new_at_prev_checkpoint(text, text_fmt, annotations, target);
+    let block_start = formatter.block_start();
 
     while let Some(grapheme) = formatter.next() {
         last_pos = grapheme.visual_pos;
@@ -195,13 +360,38 @@ pub fn visual_offset_from_anchor(
     annotations: &TextAnnotations,
     max_rows: usize,
 ) -> Result<(Position, usize), VisualOffsetError> {
+    if pos >= anchor
+        && pos <= text.len_chars()
+        && text.char_to_line(pos) == text.char_to_line(anchor.min(text.len_chars()))
+        && !annotations.has_line_annotations()
+    {
+        let target_formatter =
+            DocumentFormatter::new_at_prev_checkpoint(text, text_fmt, annotations, pos);
+        if target_formatter.next_char_pos() > target_formatter.block_start() {
+            let (anchor_pos, block_start) =
+                visual_offset_from_block(text, anchor, anchor, text_fmt, annotations);
+            let (mut target_pos, _) =
+                visual_offset_from_block(text, anchor, pos, text_fmt, annotations);
+            target_pos.row -= anchor_pos.row;
+            if target_pos.row < max_rows || pos == anchor {
+                return Ok((target_pos, block_start));
+            }
+        }
+    }
+    let start = if pos < anchor
+        && text.char_to_line(pos) == text.char_to_line(anchor.min(text.len_chars()))
+    {
+        pos
+    } else {
+        anchor
+    };
     let mut formatter =
-        DocumentFormatter::new_at_prev_checkpoint(text, text_fmt, annotations, anchor);
+        DocumentFormatter::new_at_prev_checkpoint(text, text_fmt, annotations, start);
     let mut anchor_line = None;
     let mut found_pos = None;
     let mut last_pos = Position::default();
 
-    let block_start = formatter.next_char_pos();
+    let block_start = formatter.block_start();
     if pos < block_start {
         return Err(VisualOffsetError::PosBeforeAnchorRow);
     }
@@ -416,11 +606,16 @@ pub fn char_idx_at_visual_block_offset(
     text_fmt: &TextFormat,
     annotations: &TextAnnotations,
 ) -> (usize, usize) {
-    let mut formatter =
-        DocumentFormatter::new_at_prev_checkpoint(text, text_fmt, annotations, anchor);
-    let mut last_char_idx = formatter.next_char_pos();
-    let mut found_non_virtual_on_row = false;
-    let mut last_row = 0;
+    let mut formatter = DocumentFormatter::new_at_visual_checkpoint(
+        text,
+        text_fmt,
+        annotations,
+        anchor,
+        Position::new(row, column),
+    );
+    let (mut last_char_idx, mut last_row) = formatter.previous_document_position();
+    let mut found_non_virtual_on_row =
+        formatter.next_char_pos() > formatter.block_start() && last_row == row;
     for grapheme in &mut formatter {
         match grapheme.visual_pos.row.cmp(&row) {
             Ordering::Equal => {
@@ -459,6 +654,125 @@ mod test {
     fn test_ordering() {
         // (0, 5) is less than (1, 0)
         assert!(Position::new(0, 5) < Position::new(1, 0));
+    }
+
+    #[test]
+    fn cached_raw_coordinates_match_unicode_graphemes_in_both_directions() {
+        let text = Rope::from_str(&format!(
+            "{}\r\n{}\n{}",
+            "界e\u{301}🇵🇱\t👩\u{200d}💻".repeat(500),
+            "🇦🇧🇨".repeat(1200),
+            "किमपि".repeat(600),
+        ));
+        let cache = GraphemePositionCache::default();
+        let mut positions: Vec<_> = (0..text.len_chars()).step_by(137).collect();
+        positions.extend([0, 1, 2, 3, 4, 5, text.len_chars()]);
+        positions.extend((1000..1028).chain(4090..4105));
+        for pos in positions
+            .iter()
+            .copied()
+            .chain(positions.iter().copied().rev())
+        {
+            assert_eq!(
+                cache.coords_at_pos(text.slice(..), pos),
+                coords_at_pos(text.slice(..), pos),
+                "{pos}"
+            );
+            assert_eq!(
+                cache.coords_at_pos(text.slice(..), pos),
+                coords_at_pos(text.slice(..), pos),
+                "repeated {pos}"
+            );
+        }
+        assert!(cache
+            .0
+            .lock()
+            .lines
+            .values()
+            .any(|line| !line.checkpoints.is_empty()));
+    }
+
+    #[test]
+    fn raw_coordinate_edits_retain_only_safe_prefix_checkpoints() {
+        use crate::ChangeSet;
+        let original = Rope::from_str(&format!(
+            "{}🇦🇧🇨🇩e\u{301}\r\n{}",
+            "a".repeat(5000),
+            "b".repeat(3000),
+        ));
+        for change in [
+            (4096, 4096, Some("\u{301}".into())),
+            (4096, 4097, Some("界".into())),
+            (5001, 5002, Some("🇿".into())),
+            (5004, 5005, Some("👩\u{200d}💻".into())),
+            (5006, 5007, None),
+            (4096, 5008, Some("\n".into())),
+        ] {
+            let cache = GraphemePositionCache::default();
+            cache.coords_at_pos(original.slice(..), 5006);
+            cache.coords_at_pos(original.slice(..), original.len_chars());
+            let changes = ChangeSet::from_change(&original, change.clone());
+            let mut edited = original.clone();
+            assert!(changes.apply(&mut edited));
+            cache.invalidate_after_change(original.slice(..), change.0, edited.len_chars());
+            {
+                let state = cache.0.lock();
+                assert_eq!(state.lines.len(), 1);
+                let safe_pos = prev_grapheme_boundary(original.slice(..), change.0);
+                let checkpoints = &state.lines[&0].checkpoints;
+                assert!(!checkpoints.is_empty());
+                assert!(checkpoints.keys().all(|&pos| pos <= safe_pos));
+            }
+            for pos in (0..edited.len_chars())
+                .step_by(173)
+                .chain([edited.len_chars()])
+            {
+                assert_eq!(
+                    cache.coords_at_pos(edited.slice(..), pos),
+                    coords_at_pos(edited.slice(..), pos),
+                    "{change:?}, {pos}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn raw_coordinate_cache_bounds_retained_lines_and_checkpoints() {
+        let cache = GraphemePositionCache::default();
+        let text = Rope::from_str(&format!(
+            "{}\n{}",
+            "x".repeat(600_000),
+            "short\n".repeat(20)
+        ));
+        cache.coords_at_pos(text.slice(..), 600_000);
+        assert_eq!(
+            cache.0.lock().lines[&0].checkpoints.len(),
+            MAX_COORD_CHECKPOINTS_PER_LINE
+        );
+        for line in 1..text.len_lines() {
+            cache.coords_at_pos(text.slice(..), text.line_to_char(line));
+        }
+        assert_eq!(cache.0.lock().lines.len(), MAX_COORD_LINES);
+        assert!(!cache.0.lock().lines.contains_key(&0));
+    }
+
+    #[test]
+    fn small_cursor_moves_still_record_sparse_raw_checkpoints() {
+        let text = Rope::from_str(&"a".repeat(4000));
+        let cache = GraphemePositionCache::default();
+        for pos in (0..4000).step_by(7) {
+            assert_eq!(
+                cache.coords_at_pos(text.slice(..), pos),
+                Position::new(0, pos)
+            );
+        }
+        assert!(cache.0.lock().lines[&0].checkpoints.len() >= 3);
+        for pos in (0..4000).step_by(7).rev() {
+            assert_eq!(
+                cache.coords_at_pos(text.slice(..), pos),
+                Position::new(0, pos)
+            );
+        }
     }
 
     #[test]

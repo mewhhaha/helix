@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     str,
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
 use anyhow::{anyhow, Result};
@@ -271,6 +272,7 @@ impl Loader {
 #[derive(Clone, Debug, Default)]
 pub struct Theme {
     name: String,
+    cache_key: usize,
 
     // UI styles are stored in a HashMap
     styles: HashMap<String, Style>,
@@ -386,6 +388,11 @@ fn default_rainbow() -> Vec<Style> {
     ]
 }
 impl Theme {
+    /// Identity of these immutable theme styles. Clones retain the same key.
+    pub fn cache_key(&self) -> usize {
+        self.cache_key
+    }
+
     /// To allow `Highlight` to represent arbitrary RGB colors without turning it into an enum,
     /// we interpret the last 256^3 numbers as RGB.
     const RGB_START: u32 = (u32::MAX << (8 + 8 + 8)) - 1 - (u32::MAX - Highlight::MAX);
@@ -496,6 +503,10 @@ impl Theme {
             .collect();
 
         let theme = Self {
+            cache_key: {
+                static NEXT_KEY: AtomicUsize = AtomicUsize::new(1);
+                NEXT_KEY.fetch_add(1, Ordering::Relaxed)
+            },
             styles,
             scopes,
             highlights,

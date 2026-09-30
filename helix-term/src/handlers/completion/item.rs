@@ -1,4 +1,5 @@
 use std::mem;
+use std::sync::Arc;
 
 use helix_core::completion::CompletionProvider;
 use helix_lsp::{lsp, LanguageServerId};
@@ -72,6 +73,40 @@ impl LspCompletionItem {
 pub enum CompletionItem {
     Lsp(LspCompletionItem),
     Other(helix_core::CompletionItem),
+    Word(WordCompletionItem),
+}
+
+#[derive(Debug)]
+pub struct WordEditContext {
+    pub rope: helix_core::Rope,
+    pub selection: helix_core::Selection,
+    pub edit_diff: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct WordCompletionItem {
+    pub label: String,
+    pub context: Arc<WordEditContext>,
+}
+
+impl PartialEq for WordCompletionItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.label == other.label && Arc::ptr_eq(&self.context, &other.context)
+    }
+}
+
+impl WordCompletionItem {
+    pub fn transaction(&self) -> helix_core::Transaction {
+        let context = &self.context;
+        helix_core::Transaction::change_by_selection(&context.rope, &context.selection, |range| {
+            let cursor = range.cursor(context.rope.slice(..));
+            (
+                cursor.saturating_sub(context.edit_diff),
+                cursor,
+                Some(self.label.as_str().into()),
+            )
+        })
+    }
 }
 
 impl CompletionItem {
@@ -80,6 +115,7 @@ impl CompletionItem {
         match self {
             CompletionItem::Lsp(item) => item.filter_text(),
             CompletionItem::Other(item) => &item.label,
+            CompletionItem::Word(item) => &item.label,
         }
     }
 }
@@ -108,6 +144,7 @@ impl CompletionItem {
             CompletionItem::Lsp(item) => item.provider_priority,
             // sorting path completions after LSP for now
             CompletionItem::Other(_) => 1,
+            CompletionItem::Word(_) => 1,
         }
     }
 
@@ -115,6 +152,7 @@ impl CompletionItem {
         match self {
             CompletionItem::Lsp(item) => CompletionProvider::Lsp(item.provider),
             CompletionItem::Other(item) => item.provider,
+            CompletionItem::Word(_) => CompletionProvider::Word,
         }
     }
 
@@ -122,6 +160,7 @@ impl CompletionItem {
         match self {
             CompletionItem::Lsp(LspCompletionItem { item, .. }) => item.preselect.unwrap_or(false),
             CompletionItem::Other(_) => false,
+            CompletionItem::Word(_) => false,
         }
     }
 }

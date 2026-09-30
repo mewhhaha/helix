@@ -47,3 +47,34 @@ pub fn fuzzy_match<T: AsRef<str>>(
     );
     pattern.match_list(items, &mut matcher)
 }
+
+/// Match a background scan with its own matcher, stopping obsolete work without
+/// holding the matcher used by interactive menus.
+pub fn fuzzy_match_cancelable<T: AsRef<str>>(
+    pattern: &str,
+    items: impl IntoIterator<Item = T>,
+    mut is_canceled: impl FnMut() -> bool,
+) -> Option<Vec<(T, u16)>> {
+    let mut matcher = nucleo::Matcher::new(Config::DEFAULT);
+    let pattern = Atom::new(
+        pattern,
+        CaseMatching::Smart,
+        Normalization::Smart,
+        AtomKind::Fuzzy,
+        false,
+    );
+    let mut buffer = Vec::new();
+    let mut matches = Vec::new();
+    for (i, item) in items.into_iter().enumerate() {
+        if i % 64 == 0 && is_canceled() {
+            return None;
+        }
+        if let Some(score) = pattern.score(
+            nucleo::Utf32Str::new(item.as_ref(), &mut buffer),
+            &mut matcher,
+        ) {
+            matches.push((item, score));
+        }
+    }
+    (!is_canceled()).then_some(matches)
+}

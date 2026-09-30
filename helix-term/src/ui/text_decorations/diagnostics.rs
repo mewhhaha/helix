@@ -45,6 +45,7 @@ impl Styles {
 
 pub struct InlineDiagnostics<'a> {
     state: InlineDiagnosticAccumulator<'a>,
+    doc: &'a Document,
     eol_diagnostics: DiagnosticFilter,
     styles: Styles,
 }
@@ -59,6 +60,7 @@ impl<'a> InlineDiagnostics<'a> {
     ) -> Self {
         InlineDiagnostics {
             state: InlineDiagnosticAccumulator::new(cursor, doc, config),
+            doc,
             styles: Styles::new(theme),
             eol_diagnostics,
         }
@@ -75,8 +77,9 @@ const VER_BAR: &str = "│";
 
 struct Renderer<'a, 'b> {
     renderer: &'a mut TextRenderer<'b>,
-    first_row: u16,
-    row: u16,
+    first_row: usize,
+    row: usize,
+    doc: &'a Document,
     config: &'a InlineDiagnosticsConfig,
     styles: &'a Styles,
 }
@@ -86,7 +89,23 @@ impl Renderer<'_, '_> {
         self.draw_decoration_at(g, severity, col, self.row)
     }
 
-    fn draw_decoration_at(&mut self, g: &'static str, severity: Severity, col: u16, row: u16) {
+    fn visible_rows(&self, rows: std::ops::Range<usize>) -> std::ops::Range<usize> {
+        rows.start.max(self.renderer.offset.row)
+            ..rows.end.min(
+                self.renderer
+                    .offset
+                    .row
+                    .saturating_add(self.renderer.viewport.height as usize),
+            )
+    }
+
+    fn draw_decoration_at(&mut self, g: &'static str, severity: Severity, col: u16, row: usize) {
+        if !self.visible_rows(row..row.saturating_add(1)).contains(&row) {
+            return;
+        }
+        let Ok(row) = u16::try_from(row) else {
+            return;
+        };
         self.renderer.draw_decoration_grapheme(
             Grapheme::new_decoration(g),
             self.styles.severity_style(severity),
@@ -137,35 +156,46 @@ impl Renderer<'_, '_> {
 
         let text_col = col + self.config.prefix_len + 1;
         let text_fmt = self.config.text_fmt(text_col, self.renderer.viewport.width);
-        let annotations = TextAnnotations::default();
-        let formatter = DocumentFormatter::new_at_prev_checkpoint(
-            diag.message.as_str().trim().into(),
-            &text_fmt,
-            &annotations,
-            0,
-        );
-        let mut last_row = 0;
-        let style = self.styles.severity_style(severity);
-        for grapheme in formatter {
-            last_row = grapheme.visual_pos.row;
-            self.renderer.draw_decoration_grapheme(
-                grapheme.raw,
-                style,
-                self.row + grapheme.visual_pos.row as u16,
-                text_col + grapheme.visual_pos.col as u16,
+        let height = self
+            .doc
+            .diagnostic_message_dimensions(diag.message.as_str().trim(), &text_fmt)
+            .0;
+        let end = self.row.saturating_add(height);
+        let visible = self.visible_rows(self.row..end);
+        if !visible.is_empty() {
+            let annotations = TextAnnotations::default();
+            let formatter = DocumentFormatter::new_at_prev_checkpoint(
+                diag.message.as_str().trim().into(),
+                &text_fmt,
+                &annotations,
+                0,
             );
-        }
-        self.row += 1;
-        // height is last_row + 1 and extra_rows is height - 1
-        let extra_lines = last_row;
-        if let Some(next_severity) = next_severity {
-            for _ in 0..extra_lines {
-                self.draw_decoration(VER_BAR, next_severity, col);
-                self.row += 1;
+            let style = self.styles.severity_style(severity);
+            for grapheme in formatter {
+                let row = self.row.saturating_add(grapheme.visual_pos.row);
+                if row >= visible.end {
+                    break;
+                }
+                if row < visible.start {
+                    continue;
+                }
+                let (Ok(row), Ok(col)) = (
+                    u16::try_from(row),
+                    u16::try_from(text_col as usize + grapheme.visual_pos.col),
+                ) else {
+                    continue;
+                };
+                self.renderer
+                    .draw_decoration_grapheme(grapheme.raw, style, row, col);
             }
-        } else {
-            self.row += extra_lines as u16;
         }
+        if let Some(next_severity) = next_severity {
+            for row in self.visible_rows(self.row.saturating_add(1)..end) {
+                self.draw_decoration_at(VER_BAR, next_severity, col, row);
+            }
+        }
+        // Layout must still reserve the entire message, including invisible rows.
+        self.row = end;
     }
 
     fn draw_multi_diagnostics(&mut self, stack: &mut Vec<(&Diagnostic, u16)>) {
@@ -230,7 +260,7 @@ impl Renderer<'_, '_> {
         let mut last_anchor = self.renderer.viewport.width;
         while let Some((diag, anchor)) = stack.next() {
             if anchor != last_anchor {
-                for row in self.first_row..self.row {
+                for row in self.visible_rows(self.first_row..self.row) {
                     self.draw_decoration_at(VER_BAR, diag.severity(), anchor, row);
                 }
             }
@@ -273,8 +303,9 @@ impl Decoration for InlineDiagnostics<'_> {
         if let Some((eol_diagnostic, _)) = eol_diagnostic {
             let mut renderer = Renderer {
                 renderer,
-                first_row: pos.visual_line,
-                row: pos.visual_line,
+                first_row: pos.visual_line as usize,
+                row: pos.visual_line as usize,
+                doc: self.doc,
                 config: &self.state.config,
                 styles: &self.styles,
             };
@@ -284,15 +315,16 @@ impl Decoration for InlineDiagnostics<'_> {
         self.state.compute_line_diagnostics();
         let mut renderer = Renderer {
             renderer,
-            first_row: pos.visual_line + virt_off.row as u16,
-            row: pos.visual_line + virt_off.row as u16,
+            first_row: pos.visual_line as usize + virt_off.row,
+            row: pos.visual_line as usize + virt_off.row,
+            doc: self.doc,
             config: &self.state.config,
             styles: &self.styles,
         };
         renderer.draw_multi_diagnostics(&mut self.state.stack);
         renderer.draw_diagnostics(&mut self.state.stack);
         let horizontal_off = renderer.row - renderer.first_row;
-        Position::new(horizontal_off as usize, col_off as usize)
+        Position::new(horizontal_off, col_off as usize)
     }
 
     fn reset_pos(&mut self, pos: usize) -> usize {
@@ -310,5 +342,108 @@ impl Decoration for InlineDiagnostics<'_> {
     ) -> usize {
         self.state
             .proccess_anchor(grapheme, renderer.viewport.width, renderer.offset.col)
+    }
+}
+
+#[cfg(test)]
+mod rendering_tests {
+    use std::sync::Arc;
+
+    use arc_swap::ArcSwap;
+    use helix_core::{diagnostic::DiagnosticProvider, syntax, Rope};
+    use helix_view::{editor::Config, graphics::Rect};
+    use tui::buffer::Buffer;
+
+    use super::*;
+
+    fn document() -> Document {
+        Document::from(
+            Rope::from_str("x\n"),
+            None,
+            Arc::new(ArcSwap::from_pointee(Config::default())),
+            Arc::new(ArcSwap::from_pointee(syntax::Loader::default())),
+        )
+    }
+
+    fn diagnostic(message: String) -> Diagnostic {
+        Diagnostic {
+            range: helix_core::diagnostic::Range { start: 0, end: 1 },
+            starts_at_word: false,
+            ends_at_word: false,
+            zero_width: false,
+            line: 0,
+            message,
+            severity: Some(Severity::Warning),
+            code: None,
+            provider: DiagnosticProvider::Lsp {
+                server_id: helix_core::diagnostic::LanguageServerId::default(),
+                identifier: None,
+            },
+            tags: Vec::new(),
+            source: None,
+            data: None,
+        }
+    }
+
+    #[test]
+    fn long_diagnostics_reserve_full_height_and_draw_only_visible_rows() {
+        let doc = document();
+        let theme = Theme::default();
+        let config = InlineDiagnosticsConfig::default();
+        let styles = Styles::new(&theme);
+        let area = Rect::new(0, 0, 80, 3);
+        let mut surface = Buffer::empty(area);
+        {
+            let mut text_renderer =
+                TextRenderer::new(&mut surface, &doc, &theme, Position::new(0, 0), area);
+            let mut renderer = Renderer {
+                renderer: &mut text_renderer,
+                first_row: 1,
+                row: 1,
+                doc: &doc,
+                config: &config,
+                styles: &styles,
+            };
+            let diagnostic = diagnostic("x\n".repeat(70_000));
+            renderer.draw_diagnostic(&diagnostic, 0, Some(Severity::Error));
+            assert_eq!(renderer.row, 70_001);
+            assert_eq!(
+                renderer.visible_rows(renderer.first_row..renderer.row),
+                1..3
+            );
+            let previous = renderer.row;
+            renderer.draw_diagnostic(&diagnostic, 0, None);
+            assert_eq!(renderer.row, previous + 70_000);
+        }
+        assert_eq!(surface[(2, 1)].symbol.as_str(), "x");
+        assert_eq!(surface[(2, 2)].symbol.as_str(), "x");
+        assert_eq!(surface[(0, 2)].symbol.as_str(), VER_BAR);
+    }
+
+    #[test]
+    fn vertically_offset_diagnostic_rows_use_the_entire_viewport() {
+        let doc = document();
+        let theme = Theme::default();
+        let config = InlineDiagnosticsConfig::default();
+        let styles = Styles::new(&theme);
+        let area = Rect::new(0, 0, 80, 3);
+        let mut surface = Buffer::empty(area);
+        {
+            let mut text_renderer =
+                TextRenderer::new(&mut surface, &doc, &theme, Position::new(2, 0), area);
+            let mut renderer = Renderer {
+                renderer: &mut text_renderer,
+                first_row: 1,
+                row: 1,
+                doc: &doc,
+                config: &config,
+                styles: &styles,
+            };
+            renderer.draw_diagnostic(&diagnostic("one\ntwo\nthree\nfour".into()), 0, None);
+            assert_eq!(renderer.row, 5);
+        }
+        assert_eq!(surface[(2, 0)].symbol.as_str(), "t");
+        assert_eq!(surface[(2, 1)].symbol.as_str(), "t");
+        assert_eq!(surface[(2, 2)].symbol.as_str(), "f");
     }
 }

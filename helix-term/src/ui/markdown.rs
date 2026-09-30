@@ -5,7 +5,10 @@ use tui::{
     text::{Span, Spans, Text},
 };
 
-use std::sync::Arc;
+use std::{
+    cell::{Cell, OnceCell, RefCell},
+    sync::Arc,
+};
 
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
@@ -14,15 +17,148 @@ use helix_core::{
     RopeSlice, Syntax,
 };
 use helix_view::{
-    graphics::{Margin, Rect, Style},
+    graphics::{Color, Margin, Rect, Style},
     theme::Modifier,
     Theme,
 };
 
+use super::color::{css_color_ranges, parse_css_color};
+
+fn preview_background(theme: Option<&Theme>) -> Option<Color> {
+    theme.and_then(|theme| {
+        theme
+            .get("ui.popup")
+            .bg
+            .filter(|color| matches!(color, Color::Rgb(..)))
+            .or_else(|| {
+                theme
+                    .get("ui.background")
+                    .bg
+                    .filter(|color| matches!(color, Color::Rgb(..)))
+            })
+    })
+}
+
+/// Split the existing syntax spans rather than replacing their styles. A CSS
+/// color frequently crosses span boundaries (e.g. the `#` and its hex digits).
+fn decorate_colors<'a>(
+    text: &mut Text<'a>,
+    colors: &[(std::ops::Range<usize>, Color)],
+    swatches: bool,
+    values: bool,
+) {
+    if colors.is_empty() {
+        return;
+    }
+    let mut pos = 0;
+    let mut color_index = 0;
+    for line in &mut text.lines {
+        let mut output = Vec::new();
+        for span in std::mem::take(&mut line.0) {
+            let mut offset = 0;
+            while offset < span.content.len() {
+                while colors
+                    .get(color_index)
+                    .is_some_and(|(range, _)| range.end <= pos)
+                {
+                    color_index += 1;
+                }
+                let available = span.content.len() - offset;
+                let (length, color) = match colors.get(color_index) {
+                    Some((range, color)) if range.start <= pos => {
+                        if swatches && range.start == pos {
+                            output.push(Span::styled("■ ", span.style.fg(*color)));
+                        }
+                        ((range.end - pos).min(available), Some(*color))
+                    }
+                    Some((range, _)) => ((range.start - pos).min(available), None),
+                    None => (available, None),
+                };
+                let style = match color.filter(|_| values) {
+                    Some(color) => span.style.fg(color),
+                    None => span.style,
+                };
+                output.push(Span::styled(
+                    span.content[offset..offset + length].to_owned(),
+                    style,
+                ));
+                offset += length;
+                pos += length;
+            }
+        }
+        line.0 = output;
+        pos += 1; // The newline separating rendered lines.
+    }
+}
+
+fn color_code_block(
+    text: &mut Text<'_>,
+    language: &str,
+    theme: Option<&Theme>,
+    swatches: bool,
+    values: bool,
+) {
+    let language = language.split_whitespace().next().unwrap_or_default();
+    let css = ["css", "scss", "sass", "less"]
+        .iter()
+        .any(|css| language.eq_ignore_ascii_case(css));
+    let plain = language.is_empty() || language.eq_ignore_ascii_case("plaintext");
+    if !css && !plain {
+        return;
+    }
+    let background = preview_background(theme);
+    if plain {
+        let source = text
+            .lines
+            .iter()
+            .map(|line| {
+                line.0
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if parse_css_color(&source, background).is_none() {
+            return;
+        }
+    }
+    // Syntax rendering expands tabs. Apply the same expansion when measuring
+    // the popup without a theme, and when no grammar is installed.
+    for span in text.lines.iter_mut().flat_map(|line| &mut line.0) {
+        if span.content.contains('\t') {
+            span.content = span.content.replace('\t', "    ").into();
+        }
+    }
+    let source = text
+        .lines
+        .iter()
+        .map(|line| {
+            line.0
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let colors = if css {
+        css_color_ranges(&source, background)
+    } else {
+        // Some servers return a resolved value without identifying it as CSS.
+        parse_css_color(source.trim(), background)
+            .map(|color| {
+                let start = source.len() - source.trim_start().len();
+                vec![(start..source.trim_end().len(), color)]
+            })
+            .unwrap_or_default()
+    };
+    decorate_colors(text, &colors, swatches, values);
+}
+
 fn styled_multiline_text<'a>(text: &str, style: Style) -> Text<'a> {
     let spans: Vec<_> = text
         .lines()
-        .map(|line| Span::styled(line.to_string(), style))
+        .map(|line| Span::styled(line.replace('\t', "    "), style))
         .map(Spans::from)
         .collect();
     Text::from(spans)
@@ -141,10 +277,35 @@ pub struct Markdown {
     contents: String,
 
     config_loader: Arc<ArcSwap<syntax::Loader>>,
+    color_swatches: bool,
+    color_values: bool,
+    layout_cache: OnceCell<Arc<Text<'static>>>,
+    rendered_cache: RefCell<Option<RenderedMarkdown>>,
+    measured_size: Cell<Option<(u16, (u16, u16))>>,
 }
 
-// TODO: pre-render and self reference via Pin
-// better yet, just use Tendril + subtendril for references
+struct RenderedMarkdown {
+    theme: usize,
+    loader: Arc<syntax::Loader>,
+    scopes: Arc<Vec<String>>,
+    text: Arc<Text<'static>>,
+}
+
+fn owned_text(text: Text<'_>) -> Arc<Text<'static>> {
+    Arc::new(Text::from(
+        text.lines
+            .into_iter()
+            .map(|line| {
+                Spans::from(
+                    line.0
+                        .into_iter()
+                        .map(|span| Span::styled(span.content.into_owned(), span.style))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>(),
+    ))
+}
 
 impl Markdown {
     const TEXT_STYLE: &'static str = "ui.text";
@@ -166,10 +327,62 @@ impl Markdown {
         Self {
             contents,
             config_loader,
+            color_swatches: false,
+            color_values: false,
+            layout_cache: OnceCell::new(),
+            rendered_cache: RefCell::new(None),
+            measured_size: Cell::new(None),
         }
     }
 
-    pub fn parse(&self, theme: Option<&Theme>) -> tui::text::Text<'_> {
+    pub fn with_color_previews(mut self, swatches: bool, values: bool) -> Self {
+        self.color_swatches = swatches;
+        self.color_values = values;
+        self.layout_cache.take();
+        self.rendered_cache.get_mut().take();
+        self.measured_size.set(None);
+        self
+    }
+
+    /// Reuse immutable rendered content until its theme or syntax configuration changes.
+    pub fn parse(&self, theme: Option<&Theme>) -> Arc<Text<'static>> {
+        let Some(theme) = theme else {
+            return Arc::clone(self.layout_cache.get_or_init(|| {
+                owned_text(self.parse_uncached(None, &self.config_loader.load()))
+            }));
+        };
+        let loader = self.config_loader.load_full();
+        let scopes = Arc::clone(&loader.scopes());
+        if let Some(cached) = self.rendered_cache.borrow().as_ref() {
+            if cached.theme == theme.cache_key()
+                && Arc::ptr_eq(&cached.loader, &loader)
+                && Arc::ptr_eq(&cached.scopes, &scopes)
+            {
+                return Arc::clone(&cached.text);
+            }
+        }
+        let text = owned_text(self.parse_uncached(Some(theme), &loader));
+        *self.rendered_cache.borrow_mut() = Some(RenderedMarkdown {
+            theme: theme.cache_key(),
+            loader,
+            scopes,
+            text: Arc::clone(&text),
+        });
+        text
+    }
+
+    pub fn dimensions(&self, max_width: u16) -> (u16, u16) {
+        if let Some((width, dimensions)) = self.measured_size.get() {
+            if width == max_width {
+                return dimensions;
+            }
+        }
+        let dimensions = super::text::required_size(&self.parse(None), max_width);
+        self.measured_size.set(Some((max_width, dimensions)));
+        dimensions
+    }
+
+    fn parse_uncached(&self, theme: Option<&Theme>, loader: &syntax::Loader) -> Text<'_> {
         fn push_line<'a>(spans: &mut Vec<Span<'a>>, lines: &mut Vec<Spans<'a>>) {
             let spans = std::mem::take(spans);
             if !spans.is_empty() {
@@ -198,6 +411,19 @@ impl Markdown {
         let get_theme = |key: &str| -> Style { theme.map(|t| t.get(key)).unwrap_or_default() };
         let text_style = get_theme(Self::TEXT_STYLE);
         let code_style = get_theme(Self::BLOCK_STYLE);
+        if (self.color_swatches || self.color_values)
+            && parse_css_color(&self.contents, preview_background(theme)).is_some()
+        {
+            let mut text = styled_multiline_text(&self.contents, text_style);
+            color_code_block(
+                &mut text,
+                "plaintext",
+                theme,
+                self.color_swatches,
+                self.color_values,
+            );
+            return text;
+        }
         let numbered_list_style = get_theme(Self::NUMBERED_LIST_STYLE);
         let unnumbered_list_style = get_theme(Self::UNNUMBERED_LIST_STYLE);
         let rule_style = get_theme(Self::RULE_STYLE);
@@ -299,13 +525,17 @@ impl Markdown {
                             CodeBlockKind::Fenced(language) => language,
                             CodeBlockKind::Indented => "",
                         };
-                        let tui_text = highlighted_code_block(
-                            &text,
-                            language,
-                            theme,
-                            &self.config_loader.load(),
-                            None,
-                        );
+                        let mut tui_text =
+                            highlighted_code_block(&text, language, theme, loader, None);
+                        if self.color_swatches || self.color_values {
+                            color_code_block(
+                                &mut tui_text,
+                                language,
+                                theme,
+                                self.color_swatches,
+                                self.color_values,
+                            );
+                        }
                         lines.extend(tui_text.lines);
                     } else {
                         let style = match tags.last() {
@@ -327,7 +557,19 @@ impl Markdown {
                         spans.push(Span::styled(text, style));
                     }
                 }
-                Event::Code(text) | Event::Html(text) => {
+                Event::Code(text) => {
+                    let color = (self.color_swatches || self.color_values)
+                        .then(|| parse_css_color(&text, preview_background(theme)))
+                        .flatten();
+                    if let Some(color) = color.filter(|_| self.color_swatches) {
+                        spans.push(Span::styled("■ ", code_style.fg(color)));
+                    }
+                    let style = color
+                        .filter(|_| self.color_values)
+                        .map_or(code_style, |color| code_style.fg(color));
+                    spans.push(Span::styled(text, style));
+                }
+                Event::Html(text) => {
                     spans.push(Span::styled(text, code_style));
                 }
                 Event::SoftBreak | Event::HardBreak => {
@@ -381,12 +623,228 @@ impl Component for Markdown {
 
     fn required_size(&mut self, viewport: (u16, u16)) -> Option<(u16, u16)> {
         let padding = 2;
-        let contents = self.parse(None);
-
         // TODO: account for tab width
         let max_text_width = (viewport.0.saturating_sub(padding)).min(120);
-        let (width, height) = crate::ui::text::required_size(&contents, max_text_width);
+        let (width, height) = self.dimensions(max_text_width);
 
         Some((width + padding, height + padding))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn markdown(contents: &str) -> Markdown {
+        let loader = syntax::Loader::new(syntax::config::Configuration {
+            language: Vec::new(),
+            language_server: Default::default(),
+        })
+        .unwrap();
+        Markdown::new(contents.to_owned(), Arc::new(ArcSwap::from_pointee(loader)))
+    }
+
+    fn visible(text: &Text<'_>) -> String {
+        text.lines
+            .iter()
+            .map(|line| {
+                line.0
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn colors_are_opt_in_and_preferences_are_independent() {
+        let source = "```css\n.x { color: #f00; }\n```";
+        let disabled_markdown = markdown(source);
+        let disabled = disabled_markdown.parse(None);
+        assert_eq!(visible(&disabled), ".x { color: #f00; }");
+        for (swatches, values) in [(false, false), (true, false), (false, true), (true, true)] {
+            let markdown = markdown(source).with_color_previews(swatches, values);
+            let text = markdown.parse(None);
+            assert_eq!(visible(&text).contains('■'), swatches);
+            let value = text.lines[0].0.iter().find(|span| span.content == "#f00");
+            if swatches || values {
+                assert_eq!(
+                    value.unwrap().style.fg,
+                    values.then_some(Color::Rgb(255, 0, 0))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tailwind_hover_comments_and_named_values() {
+        let markdown = markdown("```css\n.bg-red-500 { background-color: var(--color-red-500) /* oklch(63.7% 0.237 25.331) = #fb2c36 */; color: rebeccapurple; }\n```")
+            .with_color_previews(true, true);
+        let text = markdown.parse(None);
+        assert_eq!(visible(&text).matches('■').count(), 3);
+        assert!(visible(&text).contains("/* ■ oklch(63.7% 0.237 25.331) = ■ #fb2c36 */"));
+        assert!(text.lines[0].0.iter().any(
+            |span| span.content == "#fb2c36" && span.style.fg == Some(Color::Rgb(251, 44, 54))
+        ));
+    }
+
+    #[test]
+    fn exact_inline_plaintext_and_bare_colors() {
+        for source in [
+            "`#abc`",
+            "```plaintext\n#abc\n```",
+            "```\n#abc\n```",
+            "#abc",
+            "red",
+            "`oklab(0.5 0.1 0.1)`",
+        ] {
+            let markdown = markdown(source).with_color_previews(true, true);
+            assert_eq!(
+                visible(&markdown.parse(None)).matches('■').count(),
+                1,
+                "{source}"
+            );
+        }
+        for source in [
+            "plain #abc prose",
+            "`color: #abc`",
+            "```plaintext\ncolor: #abc;\n```",
+            "```rust\nlet red = \"#abc\";\n```",
+            "`bad`",
+            "`var(--red)`",
+        ] {
+            let markdown = markdown(source).with_color_previews(true, true);
+            assert!(!visible(&markdown.parse(None)).contains('■'), "{source}");
+        }
+    }
+
+    #[test]
+    fn decorations_preserve_split_syntax_styles_and_unicode() {
+        let style = Style::default()
+            .bg(Color::Rgb(1, 2, 3))
+            .fg(Color::Blue)
+            .add_modifier(Modifier::BOLD)
+            .underline_color(Color::Green);
+        let second = style.add_modifier(Modifier::ITALIC);
+        let mut text = Text::from(Spans::from(vec![
+            Span::styled(".é { color: ", style),
+            Span::styled("#", style),
+            Span::styled("ff00", second),
+            Span::styled("00; }", style),
+        ]));
+        let source = visible(&text);
+        let colors = css_color_ranges(&source, None);
+        decorate_colors(&mut text, &colors, true, true);
+        assert_eq!(visible(&text), ".é { color: ■ #ff0000; }");
+        assert_eq!(text.lines[0].0[0].style, style);
+        assert!(text.lines[0]
+            .0
+            .iter()
+            .any(|span| span.content == "ff00" && span.style == second.fg(Color::Rgb(255, 0, 0))));
+        assert_eq!(text.lines[0].0.last().unwrap().style, style);
+    }
+
+    #[test]
+    fn multiline_values_and_tabs_have_the_same_measured_layout() {
+        let markdown =
+            markdown("```css\n.é {\n\tcolor: rgb(\n\t\t255 0 0\n\t);\n\tbackground: #00f;\n}\n```")
+                .with_color_previews(true, true);
+        let theme = Theme::default();
+        let measured = markdown.parse(None);
+        let rendered = markdown.parse(Some(&theme));
+        assert_eq!(visible(&measured), visible(&rendered));
+        assert_eq!(visible(&rendered).matches('■').count(), 2);
+        assert!(visible(&rendered).contains("    color: ■ rgb(\n        255 0 0\n    );"));
+        assert!(rendered.lines[2]
+            .0
+            .iter()
+            .any(|span| span.content == "        255 0 0"
+                && span.style.fg == Some(Color::Rgb(255, 0, 0))));
+        assert_eq!(measured.width(), rendered.width());
+    }
+
+    #[test]
+    fn alpha_uses_popup_then_editor_background() {
+        let theme: Theme = toml::from_str(
+            "\"ui.popup\" = { bg = \"#0000ff\" }\n\"ui.background\" = { bg = \"#00ff00\" }",
+        )
+        .unwrap();
+        let markdown = markdown("`rgb(255 0 0 / 50%)`").with_color_previews(true, true);
+        let text = markdown.parse(Some(&theme));
+        assert!(text.lines[0]
+            .0
+            .iter()
+            .all(|span| span.style.fg == Some(Color::Rgb(128, 0, 128))));
+        let background: Theme = toml::from_str("\"ui.background\" = { bg = \"#00ff00\" }").unwrap();
+        assert_eq!(
+            preview_background(Some(&background)),
+            Some(Color::Rgb(0, 255, 0))
+        );
+        let indexed_popup: Theme = toml::from_str(
+            "\"ui.popup\" = { bg = \"blue\" }\n\"ui.background\" = { bg = \"#00ff00\" }",
+        )
+        .unwrap();
+        assert_eq!(
+            preview_background(Some(&indexed_popup)),
+            Some(Color::Rgb(0, 255, 0))
+        );
+    }
+
+    #[test]
+    fn parsed_text_and_dimensions_are_reused_across_frames() {
+        let markdown = markdown("**αβ** `#f00`\n\n```css\n.x { color: #0f0; }\n```")
+            .with_color_previews(true, true);
+        let theme = Theme::default();
+        let first_layout = markdown.parse(None);
+        let first_render = markdown.parse(Some(&theme));
+        assert!(Arc::ptr_eq(&first_layout, &markdown.parse(None)));
+        assert!(Arc::ptr_eq(&first_render, &markdown.parse(Some(&theme))));
+        assert_eq!(visible(&first_layout), visible(&first_render));
+        let wide = markdown.dimensions(120);
+        assert_eq!(wide, markdown.dimensions(120));
+        assert_eq!(markdown.measured_size.get(), Some((120, wide)));
+        let narrow = markdown.dimensions(4);
+        assert!(narrow.1 > wide.1);
+        assert_eq!(markdown.measured_size.get(), Some((4, narrow)));
+    }
+
+    #[test]
+    fn cached_styles_invalidate_for_theme_loader_and_scope_changes() {
+        let markdown = markdown("`rgb(255 0 0 / 50%)`").with_color_previews(true, true);
+        let blue: Theme = toml::from_str("\"ui.popup\" = { bg = \"#0000ff\" }").unwrap();
+        let green: Theme = toml::from_str("\"ui.popup\" = { bg = \"#00ff00\" }").unwrap();
+        let first = markdown.parse(Some(&blue));
+        assert!(Arc::ptr_eq(&first, &markdown.parse(Some(&blue.clone()))));
+        let changed = markdown.parse(Some(&green));
+        assert!(!Arc::ptr_eq(&first, &changed));
+        assert_eq!(first.lines[0].0[0].style.fg, Some(Color::Rgb(128, 0, 128)));
+        assert_eq!(
+            changed.lines[0].0[0].style.fg,
+            Some(Color::Rgb(128, 128, 0))
+        );
+        markdown
+            .config_loader
+            .load()
+            .set_scopes(vec!["ui.text".into()]);
+        let scopes_changed = markdown.parse(Some(&green));
+        assert!(!Arc::ptr_eq(&changed, &scopes_changed));
+        markdown
+            .config_loader
+            .store(Arc::new(syntax::Loader::default()));
+        assert!(!Arc::ptr_eq(&scopes_changed, &markdown.parse(Some(&green))));
+    }
+
+    #[test]
+    fn changing_color_options_invalidates_layout_and_rendered_caches() {
+        let markdown = markdown("`#f00`").with_color_previews(true, true);
+        let theme = Theme::default();
+        let old = markdown.parse(Some(&theme));
+        let old_size = markdown.dimensions(120);
+        let markdown = markdown.with_color_previews(false, false);
+        let new = markdown.parse(Some(&theme));
+        assert!(!Arc::ptr_eq(&old, &new));
+        assert_eq!(visible(&new), "#f00");
+        assert_eq!(markdown.dimensions(120).0 + 2, old_size.0);
     }
 }

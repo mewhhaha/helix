@@ -326,10 +326,12 @@ impl Application {
                 Some(event) = input_stream.next() => {
                     self.handle_terminal_events(event).await;
                 }
-                Some(callback) = self.jobs.callbacks.recv() => {
-                    if let Some(job) = self.jobs.handle_callback(&mut self.editor, &mut self.compositor, Ok(Some(callback))) {
-                        self.jobs.add(job);
-                    }
+                Some(callback) = Jobs::next_callback(
+                    &mut self.jobs.callbacks,
+                    &mut self.jobs.wait_futures,
+                    &mut self.jobs.poll_wait_futures_first,
+                ) => {
+                    self.jobs.handle_callback_batch(&mut self.editor, &mut self.compositor, callback);
                     self.render().await;
                 }
                 Some(msg) = self.jobs.status_messages.recv() => {
@@ -342,12 +344,6 @@ impl Application {
                     // TODO: show multiple status messages at once to avoid clobbering
                     self.editor.status_msg = Some((msg.message, severity));
                     helix_event::request_redraw();
-                }
-                Some(callback) = self.jobs.wait_futures.next() => {
-                    if let Some(job) = self.jobs.handle_callback(&mut self.editor, &mut self.compositor, callback) {
-                        self.jobs.add(job);
-                    }
-                    self.render().await;
                 }
                 event = self.editor.wait_event() => {
                     let _idle_handled = self.handle_editor_event(event).await;
@@ -386,6 +382,9 @@ impl Application {
             ConfigEvent::Update(editor_config) => {
                 let mut app_config = (*self.config.load().clone()).clone();
                 app_config.editor = *editor_config;
+                if old_editor_config.workspace_trust != app_config.editor.workspace_trust {
+                    self.refresh_workspace_trust(&app_config.editor.workspace_trust);
+                }
                 if let Err(err) = self.terminal.reconfigure((&app_config.editor).into()) {
                     self.editor.set_error(err.to_string());
                 };
@@ -414,15 +413,29 @@ impl Application {
         }
     }
 
+    fn refresh_workspace_trust(&mut self, config: &helix_view::editor::WorkspaceTrustConfig) {
+        // Trust policy clones held by pending Git status scans are snapshots.
+        // Stop the scan before applying a changed policy or explicit revocation.
+        if let Some(picker) =
+            self.compositor.find::<ui::overlay::Overlay<
+                ui::Picker<helix_vcs::FileChange, crate::commands::FileChangeData>,
+            >>()
+        {
+            picker.content.cancel_background_task();
+        }
+        self.editor.workspace_trust.set_config(config.into());
+        let documents: Vec<_> = self.editor.documents().map(|doc| doc.id()).collect();
+        for document in documents {
+            self.editor.request_vcs_refresh(document);
+        }
+    }
+
     fn refresh_config(&mut self) {
         let mut refresh_config = || -> Result<(), Error> {
             let default_config = Config::load_default()
                 .map_err(|err| anyhow::anyhow!("Failed to load config: {}", err))?;
-
             // Apply any change to editor.workspace_trust before reading local language config.
-            self.editor
-                .workspace_trust
-                .set_config((&default_config.editor.workspace_trust).into());
+            self.refresh_workspace_trust(&default_config.editor.workspace_trust);
 
             // Update the syntax language loader before setting the theme. Setting the theme will
             // call `Loader::set_scopes` which must be done before the documents are re-parsed for
@@ -648,7 +661,7 @@ impl Application {
         };
 
         self.editor
-            .set_doc_path(doc_save_event.doc_id, &doc_save_event.path);
+            .set_doc_path_after_save(doc_save_event.doc_id, &doc_save_event.path);
         // TODO: fix being overwritten by lsp
         self.editor.set_status(format!(
             "'{}' written, {lines}L {size}",

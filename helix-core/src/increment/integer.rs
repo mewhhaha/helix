@@ -48,7 +48,7 @@ pub fn increment(selected_text: &str, amount: i64) -> Option<String> {
             (true, false) => number.len() - 1,
             (false, true) => number.len() + 1,
             _ => number.len(),
-        } - separator_rtl_indexes.len();
+        };
 
         if number.starts_with('0') || number.starts_with("-0") {
             format!("{:01$}", new_value, format_length)
@@ -95,16 +95,31 @@ pub fn increment(selected_text: &str, amount: i64) -> Option<String> {
 
     // Add in additional separators if necessary.
     if new_text.len() > selected_text.len() && !separator_rtl_indexes.is_empty() {
-        let spacing = match separator_rtl_indexes.as_slice() {
-            [.., b, a] => a - b - 1,
-            _ => separator_rtl_indexes[0],
+        // Treat consecutive separators as a single group, preserving its width.
+        // Otherwise adjacent separators would give a spacing of zero.
+        let last = separator_rtl_indexes.len() - 1;
+        let mut group_start = last;
+        while group_start > 0
+            && separator_rtl_indexes[group_start] - separator_rtl_indexes[group_start - 1] == 1
+        {
+            group_start -= 1;
+        }
+        let separators = "_".repeat(last - group_start + 1);
+        let spacing = if group_start > 0 {
+            separator_rtl_indexes[group_start] - separator_rtl_indexes[group_start - 1] - 1
+        } else {
+            separator_rtl_indexes[0]
         };
 
-        let prefix_length = if radix == 10 { 0 } else { 2 };
+        let prefix_length = if radix == 10 {
+            usize::from(new_text.starts_with('-'))
+        } else {
+            2
+        };
         if let Some(mut index) = new_text.find(SEPARATOR) {
-            while index - prefix_length > spacing {
+            while index.saturating_sub(prefix_length) > spacing {
                 index -= spacing;
-                new_text.insert(index, SEPARATOR);
+                new_text.insert_str(index, &separators);
             }
         }
     }
@@ -231,5 +246,25 @@ mod test {
         assert_eq!(increment("9_", 1), None);
         assert_eq!(increment("_9", 1), None);
         assert_eq!(increment("_9_", 1), None);
+    }
+
+    #[test]
+    fn test_increment_with_repeated_separators() {
+        let tests = [
+            ("999__999", 1, "1__000__000"),
+            ("999__999__999", 1, "1__000__000__000"),
+            ("-999__999", -1, "-1__000__000"),
+            ("-99__999", -1, "-100__000"),
+            ("0xFFFF__FFFF", 1, "0x1__0000__0000"),
+            ("0o777__777", 1, "0o1__000__000"),
+            ("0b1111__1111", 1, "0b1__0000__0000"),
+            ("0___1", 1, "0___2"),
+            ("0___1", -2, "-0___1"),
+            ("01__002", 1, "01__003"),
+        ];
+
+        for (original, amount, expected) in tests {
+            assert_eq!(increment(original, amount).unwrap(), expected);
+        }
     }
 }

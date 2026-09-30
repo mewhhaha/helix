@@ -5,7 +5,7 @@
 use crate::{
     graphemes::{
         ensure_grapheme_boundary_next, ensure_grapheme_boundary_prev, next_grapheme_boundary,
-        prev_grapheme_boundary,
+        prev_grapheme_boundary, GraphemeBoundaryCursor,
     },
     line_ending::get_line_ending,
     movement::Direction,
@@ -659,9 +659,47 @@ impl Selection {
     //    very end of the document.
     // 3. Ranges are non-overlapping.
     // 4. Ranges are sorted by their position in the text.
-    pub fn ensure_invariants(self, text: RopeSlice) -> Self {
-        self.transform(|r| r.min_width_1(text).grapheme_aligned(text))
-            .normalize()
+    pub fn ensure_invariants(mut self, text: RopeSlice) -> Self {
+        if self.len() == 1 {
+            return self.transform(|r| r.min_width_1(text).grapheme_aligned(text));
+        }
+        #[derive(Clone, Copy)]
+        enum Alignment {
+            Floor,
+            Ceil,
+            Next,
+        }
+        let mut endpoints = Vec::with_capacity(self.len() * 2);
+        for (index, range) in self.ranges.iter().enumerate() {
+            let (anchor, head) = if range.is_empty() {
+                (Alignment::Floor, Alignment::Next)
+            } else if range.anchor < range.head {
+                (Alignment::Floor, Alignment::Ceil)
+            } else {
+                (Alignment::Ceil, Alignment::Floor)
+            };
+            endpoints.push((range.anchor, index, true, anchor));
+            endpoints.push((range.head, index, false, head));
+        }
+        endpoints.sort_unstable_by_key(|&(pos, ..)| pos);
+        let mut cursor = GraphemeBoundaryCursor::new(text, endpoints[0].0);
+        for (pos, index, anchor, alignment) in endpoints {
+            let mapped = match alignment {
+                Alignment::Floor => cursor.bounds(pos).0,
+                Alignment::Ceil => cursor.ceil(pos),
+                Alignment::Next => cursor.next(pos),
+            };
+            let range = &mut self.ranges[index];
+            if anchor {
+                if mapped != range.anchor {
+                    range.old_visual_position = None;
+                }
+                range.anchor = mapped;
+            } else {
+                range.head = mapped;
+            }
+        }
+        self.normalize()
     }
 
     /// Transforms the selection into all of the left-side head positions,
@@ -883,6 +921,108 @@ pub fn split_on_matches(text: RopeSlice, selection: &Selection, regex: &rope::Re
 mod test {
     use super::*;
     use crate::Rope;
+
+    quickcheck::quickcheck! {
+        fn batched_alignment_matches_independent_unicode_boundaries(
+            input: String, endpoints: Vec<(u16, u16)>
+        ) -> bool {
+            if endpoints.is_empty() { return true; }
+            let text = Rope::from(input);
+            let limit = text.len_chars() + 1;
+            let ranges: SmallVec<_> = endpoints.into_iter().map(|(anchor, head)| Range {
+                anchor: anchor as usize % limit,
+                head: head as usize % limit,
+                old_visual_position: Some((3, 7)),
+            }).collect();
+            let primary = ranges.len() / 2;
+            let selection = Selection::new(ranges, primary);
+            let expected = selection.clone().transform(|range| {
+                range.min_width_1(text.slice(..)).grapheme_aligned(text.slice(..))
+            });
+            selection.ensure_invariants(text.slice(..)) == expected
+        }
+    }
+
+    #[test]
+    fn batched_alignment_preserves_ri_context_across_rope_chunks_and_sparse_gaps() {
+        for input in [
+            "🇦".repeat(513),
+            format!(
+                "{}e\u{301}\r\n{}👩\u{200d}💻",
+                "x".repeat(2000),
+                "🇦".repeat(257)
+            ),
+            "👩\u{200d}💻e\u{301}\r\n".repeat(400),
+            "क्\u{200d}ष".repeat(400),
+            "\u{600}a\u{301}🇦🇧".repeat(400),
+        ] {
+            let text = Rope::from(input);
+            let selection: Selection = (0..=text.len_chars())
+                .step_by(3)
+                .map(|pos| {
+                    let end = (pos + 1).min(text.len_chars());
+                    if pos % 2 == 0 {
+                        Range::new(pos, end)
+                    } else {
+                        Range::new(end, pos)
+                    }
+                })
+                .collect();
+            let expected = selection.clone().transform(|range| {
+                range
+                    .min_width_1(text.slice(..))
+                    .grapheme_aligned(text.slice(..))
+            });
+            assert_eq!(selection.ensure_invariants(text.slice(..)), expected);
+
+            let sparse: Selection = [
+                Range::point(0),
+                Range::point(text.len_chars().saturating_sub(1)),
+            ]
+            .into_iter()
+            .collect();
+            let expected = sparse.clone().transform(|range| {
+                range
+                    .min_width_1(text.slice(..))
+                    .grapheme_aligned(text.slice(..))
+            });
+            assert_eq!(sparse.ensure_invariants(text.slice(..)), expected);
+        }
+    }
+
+    #[test]
+    fn batched_alignment_accepts_temporary_forward_and_backward_endpoints_past_eof() {
+        for input in ["abc\ndef\n", "e\u{301}\r\n👩\u{200d}💻", "\u{600}x🇦🇧"] {
+            let text = Rope::from(input);
+            let eof = text.len_chars();
+            for last in [Range::new(eof - 1, eof + 1), Range::new(eof + 1, eof - 1)] {
+                let selection = Selection::new(smallvec![Range::new(0, 1), last], 1);
+                assert_eq!(selection.len(), 2);
+                let expected = selection.clone().transform(|range| {
+                    range
+                        .min_width_1(text.slice(..))
+                        .grapheme_aligned(text.slice(..))
+                });
+                assert_eq!(selection.ensure_invariants(text.slice(..)), expected);
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "grapheme position is out of bounds")]
+    fn batched_boundary_queries_reject_out_of_bounds_positions_without_looping() {
+        let text = Rope::from("abc");
+        let mut cursor = GraphemeBoundaryCursor::new(text.slice(..), 0);
+        cursor.bounds(text.len_chars() + 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "grapheme position is out of bounds")]
+    fn batched_ceil_queries_reject_more_than_one_character_past_eof() {
+        let text = Rope::from("abc");
+        let mut cursor = GraphemeBoundaryCursor::new(text.slice(..), 0);
+        cursor.ceil(text.len_chars() + 2);
+    }
 
     #[test]
     #[should_panic]

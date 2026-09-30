@@ -29,6 +29,13 @@ pub fn request_redraw() {
     REDRAW_NOTIFY.notify_one();
 }
 
+/// Captures this runtime's redraw notification for use from worker threads
+/// that do not have a Tokio runtime context.
+pub fn redraw_callback() -> impl Fn() + Send + Sync + 'static {
+    let notify: &'static Notify = &REDRAW_NOTIFY;
+    move || notify.notify_one()
+}
+
 /// Returns a future that will yield once a redraw has been asynchronously
 /// requested using [`request_redraw`].
 pub fn redraw_requested() -> impl Future<Output = ()> {
@@ -58,5 +65,25 @@ pub struct RequestRedrawOnDrop;
 impl Drop for RequestRedrawOnDrop {
     fn drop(&mut self) {
         request_redraw();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn captured_redraw_callback_can_notify_from_outside_the_runtime() {
+        let callback = redraw_callback();
+        std::thread::spawn(move || {
+            assert!(tokio::runtime::Handle::try_current().is_err());
+            callback();
+        })
+        .join()
+        .expect("the redraw callback must work without a runtime context");
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), redraw_requested())
+            .await
+            .expect("the originating runtime must receive the redraw notification");
     }
 }
