@@ -44,6 +44,8 @@ pub struct EditorView {
     spinners: ProgressSpinners,
     /// Tracks if the terminal window is focused by reaction to terminal focus events
     terminal_focused: bool,
+    /// The primary cursor is drawn by the terminal graphics layer.
+    graphics_cursor: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -67,11 +69,20 @@ impl EditorView {
             completion: None,
             spinners: ProgressSpinners::default(),
             terminal_focused: true,
+            graphics_cursor: false,
         }
     }
 
     pub fn spinners_mut(&mut self) -> &mut ProgressSpinners {
         &mut self.spinners
+    }
+
+    pub(crate) fn cursor_smear_allowed(&self) -> bool {
+        self.terminal_focused && self.completion.is_none()
+    }
+
+    pub(crate) fn set_graphics_cursor(&mut self, enabled: bool) {
+        self.graphics_cursor = enabled;
     }
 
     pub fn render_view(
@@ -172,7 +183,7 @@ impl EditorView {
                 view,
                 theme,
                 &config.cursor_shape,
-                self.terminal_focused,
+                self.terminal_focused && !self.graphics_cursor,
             ));
             if let Some(overlay) = Self::highlight_focused_view_elements(view, doc, theme) {
                 overlays.push(overlay);
@@ -1707,6 +1718,7 @@ impl Component for EditorView {
 
     fn cursor(&self, _area: Rect, editor: &Editor) -> (Option<Position>, CursorKind) {
         match editor.cursor() {
+            (pos, _) if self.graphics_cursor => (pos, CursorKind::Hidden),
             // all block cursors are drawn manually
             (pos, CursorKind::Block) => {
                 if self.terminal_focused {

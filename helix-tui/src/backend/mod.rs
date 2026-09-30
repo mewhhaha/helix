@@ -1,5 +1,6 @@
 //! Provides interface for controlling the terminal
 
+use helix_core::Position;
 use std::io;
 
 use crate::{buffer::Cell, terminal::Config};
@@ -20,7 +21,50 @@ mod crossterm;
 pub use self::crossterm::CrosstermBackend;
 
 mod test;
-pub use self::test::TestBackend;
+pub use self::test::{RecordedCursorImage, TestBackend};
+
+#[cfg(all(feature = "termina", not(windows)))]
+mod kitty;
+
+/// The measured size of one terminal cell in pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CellSize {
+    pub width: u16,
+    pub height: u16,
+}
+
+/// A tightly packed, straight-alpha RGBA image anchored to a terminal cell.
+#[derive(Debug, Clone, Copy)]
+pub struct CursorImage<'a> {
+    pub position: Position,
+    pub offset_x: u16,
+    pub offset_y: u16,
+    pub width: u32,
+    pub height: u32,
+    pub rgba: &'a [u8],
+}
+
+impl CursorImage<'_> {
+    pub(crate) fn validate(&self) -> io::Result<()> {
+        let len = usize::try_from(self.width)
+            .ok()
+            .and_then(|width| width.checked_mul(usize::try_from(self.height).ok()?))
+            .and_then(|pixels| pixels.checked_mul(4));
+        if self.width == 0
+            || self.height == 0
+            || len != Some(self.rgba.len())
+            || self.rgba.len() > 16 * 1024 * 1024
+            || self.position.row.checked_add(1).is_none()
+            || self.position.col.checked_add(1).is_none()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid cursor RGBA image",
+            ));
+        }
+        Ok(())
+    }
+}
 
 /// Representation of a terminal backend.
 pub trait Backend {
@@ -55,4 +99,16 @@ pub trait Backend {
     fn supports_true_color(&self) -> bool;
     fn get_theme_mode(&self) -> Option<helix_view::theme::Mode>;
     fn set_background_color(&mut self, color: Option<Color>) -> io::Result<()>;
+
+    /// Returns measured cell dimensions when cursor graphics are enabled and supported.
+    /// Backends without graphics support never emit image commands.
+    fn cursor_graphics_cell_size(&self) -> Option<CellSize> {
+        None
+    }
+
+    /// Replaces the backend's cursor image, or deletes only that image for `None`.
+    /// Implementations preserve the terminal cursor position and text cells.
+    fn draw_cursor_graphics(&mut self, _image: Option<&CursorImage<'_>>) -> io::Result<()> {
+        Ok(())
+    }
 }

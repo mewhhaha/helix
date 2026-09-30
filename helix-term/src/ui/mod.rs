@@ -1,5 +1,6 @@
 pub(crate) mod color;
 mod completion;
+pub(crate) mod cursor_graphics;
 mod document;
 pub(crate) mod editor;
 mod info;

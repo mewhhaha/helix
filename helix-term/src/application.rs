@@ -11,13 +11,15 @@ use helix_view::{
     align_view,
     document::{DocumentOpenError, DocumentSavedEventResult},
     editor::{ConfigEvent, EditorEvent},
-    graphics::Rect,
+    graphics::{Color, CursorKind, Rect},
     theme,
     tree::Layout,
-    Align, Editor,
+    view::ViewPosition,
+    Align, DocumentId, Editor, ViewId,
 };
 use serde_json::json;
-use tui::backend::Backend;
+use tui::backend::{Backend, CellSize};
+use tui::buffer::Cell;
 
 use crate::{
     args::Args,
@@ -34,7 +36,22 @@ use std::{
     io::{stdin, IsTerminal},
     path::Path,
     sync::Arc,
+    time::Duration,
 };
+
+type CursorSmearIdentity = (ViewId, DocumentId, ViewPosition, helix_view::document::Mode);
+type CursorSmearEditorIdentity = (ViewId, DocumentId, helix_view::document::Mode);
+
+const CURSOR_SMEAR_FRAME_INTERVAL: Duration = Duration::from_micros(16_667);
+
+struct CursorSmearFrame {
+    area: Rect,
+    cell_size: CellSize,
+    identity: CursorSmearIdentity,
+    bounds: Rect,
+    color: Color,
+    next_frame: tokio::time::Instant,
+}
 
 #[cfg_attr(windows, allow(unused_imports))]
 use anyhow::{Context, Error};
@@ -67,6 +84,10 @@ type TerminalEvent = crossterm::event::Event;
 
 type Terminal = tui::terminal::Terminal<TerminalBackend>;
 
+#[cfg(all(test, feature = "integration"))]
+#[path = "application/cursor_smear_tests.rs"]
+mod cursor_smear_tests;
+
 pub struct Application {
     compositor: Compositor,
     terminal: Terminal,
@@ -79,6 +100,9 @@ pub struct Application {
     lsp_progress: LspProgressMap,
 
     theme_mode: Option<theme::Mode>,
+    cursor_smear: ui::cursor_graphics::CursorGraphics<CursorSmearEditorIdentity>,
+    cursor_smear_last_position: Option<(CursorSmearIdentity, usize)>,
+    cursor_smear_frame: Option<CursorSmearFrame>,
 }
 
 #[cfg(feature = "integration")]
@@ -253,6 +277,9 @@ impl Application {
             jobs,
             lsp_progress: LspProgressMap::new(),
             theme_mode,
+            cursor_smear: Default::default(),
+            cursor_smear_last_position: None,
+            cursor_smear_frame: None,
         };
 
         Ok(app)
@@ -264,31 +291,275 @@ impl Application {
             self.compositor.full_redraw = false;
         }
 
-        let mut cx = crate::compositor::Context {
-            editor: &mut self.editor,
-            jobs: &mut self.jobs,
-            scroll: None,
-        };
-
         helix_event::start_frame();
-        cx.editor.needs_redraw = false;
-
+        self.editor.needs_redraw = false;
         let area = self
             .terminal
             .autoresize()
             .expect("Unable to determine terminal size");
-
-        // TODO: need to recalculate view tree if necessary
-
-        let surface = self.terminal.current_buffer_mut();
-
-        self.compositor.render(area, surface, &mut cx);
+        let cell_size = self.terminal.backend().cursor_graphics_cell_size();
+        let graphics_context = cell_size.and_then(|cell_size| {
+            self.cursor_smear_context()
+                .map(|(identity, bounds)| (identity, bounds, cell_size))
+        });
+        let graphics_enabled = graphics_context.is_some()
+            && !(self.editor.config().auto_info && self.editor.autoinfo.is_some());
+        self.compositor
+            .find::<ui::EditorView>()
+            .unwrap()
+            .set_graphics_cursor(graphics_enabled);
+        self.compositor.render(
+            area,
+            self.terminal.current_buffer_mut(),
+            &mut crate::compositor::Context {
+                editor: &mut self.editor,
+                jobs: &mut self.jobs,
+                scroll: None,
+            },
+        );
+        // Rendering can resize the editor tree (for example when bufferline
+        // visibility changes), so observe the final viewport and scroll offset.
+        let graphics_context = if graphics_context.is_some() {
+            cell_size.and_then(|cell_size| {
+                self.cursor_smear_context()
+                    .map(|(identity, bounds)| (identity, bounds, cell_size))
+            })
+        } else {
+            None
+        };
         let (pos, kind) = self.compositor.cursor(area, &self.editor);
-        // reset cursor cache
+        let cursor = pos.map(|pos| (pos.col as u16, pos.row as u16));
+        let now = tokio::time::Instant::now();
+        let mut graphics_drawn = false;
+        if let Some((identity, bounds, cell_size)) = graphics_context {
+            let shape = self
+                .editor
+                .config()
+                .cursor_shape
+                .from_mode(self.editor.mode());
+            let visible_pos = pos.filter(|pos| {
+                pos.col >= bounds.left() as usize
+                    && pos.col < bounds.right() as usize
+                    && pos.row >= bounds.top() as usize
+                    && pos.row < bounds.bottom() as usize
+            });
+            let width_cells = visible_pos
+                .map(|pos| {
+                    self.terminal
+                        .current_buffer_mut()
+                        .get(pos.col as u16, pos.row as u16)
+                        .map_or(1, |cell| cell.width().max(1) as u16)
+                })
+                .unwrap_or(1);
+            let (view, doc) = current_ref!(self.editor);
+            let document_cursor = doc
+                .selection(view.id)
+                .primary()
+                .cursor(doc.text().slice(..));
+            if self
+                .cursor_smear_last_position
+                .is_some_and(|(previous, cursor)| {
+                    previous.2 != identity.2 && cursor == document_cursor
+                })
+            {
+                // Scrolling alone moves the text underneath a stationary document
+                // cursor. Cursor jumps may scroll too, and still animate on screen.
+                self.cursor_smear.clear();
+                self.cursor_smear_last_position = None;
+            }
+            self.cursor_smear_last_position = Some((identity, document_cursor));
+            self.cursor_smear.update(
+                pos,
+                bounds,
+                (identity.0, identity.1, identity.3),
+                &self.editor.config().cursor_smear,
+                cell_size,
+                shape,
+                width_cells,
+                now.into_std(),
+            );
+            if graphics_enabled {
+                let cursor_cell = visible_pos.and_then(|pos| {
+                    self.terminal
+                        .current_buffer_mut()
+                        .get(pos.col as u16, pos.row as u16)
+                        .cloned()
+                });
+                let (color, foreground) = self.cursor_smear_colors(cursor_cell.as_ref());
+                if shape == CursorKind::Block {
+                    if let Some(pos) = visible_pos {
+                        let surface = self.terminal.current_buffer_mut();
+                        for col in pos.col as u16
+                            ..(pos.col as u16)
+                                .saturating_add(width_cells)
+                                .min(bounds.right())
+                        {
+                            let Some(cell) = surface.get_mut(col, pos.row as u16) else {
+                                continue;
+                            };
+                            // Kitty z=-1 draws above cell backgrounds but below glyphs.
+                            // Keep the cursor's contrast color without its cell background.
+                            if cell
+                                .modifier
+                                .contains(helix_view::graphics::Modifier::REVERSED)
+                            {
+                                cell.bg = foreground;
+                            } else {
+                                cell.fg = foreground;
+                            }
+                        }
+                    }
+                }
+                if let Some(image) = self.cursor_smear.frame(color, now.into_std()) {
+                    self.terminal
+                        .draw_with_cursor_graphics(cursor, CursorKind::Hidden, Some(&image))
+                        .unwrap();
+                    graphics_drawn = true;
+                }
+                self.cursor_smear_frame =
+                    self.cursor_smear
+                        .is_active(now.into_std())
+                        .then_some(CursorSmearFrame {
+                            area,
+                            cell_size,
+                            identity,
+                            bounds,
+                            color,
+                            next_frame: now + CURSOR_SMEAR_FRAME_INTERVAL,
+                        });
+            } else {
+                // Prefix help temporarily owns the screen. Keep the current
+                // logical cursor as the origin for the completed movement.
+                self.cursor_smear.pause();
+            }
+        }
+        if !graphics_drawn {
+            if graphics_context.is_none() || graphics_enabled {
+                self.cursor_smear.clear();
+                self.cursor_smear_last_position = None;
+            }
+            self.cursor_smear_frame = None;
+            if graphics_enabled {
+                // Invalid or clipped image geometry must leave an ordinary cursor.
+                self.compositor
+                    .find::<ui::EditorView>()
+                    .unwrap()
+                    .set_graphics_cursor(false);
+                self.compositor.render(
+                    area,
+                    self.terminal.current_buffer_mut(),
+                    &mut crate::compositor::Context {
+                        editor: &mut self.editor,
+                        jobs: &mut self.jobs,
+                        scroll: None,
+                    },
+                );
+                let (pos, kind) = self.compositor.cursor(area, &self.editor);
+                self.terminal
+                    .draw(pos.map(|pos| (pos.col as u16, pos.row as u16)), kind)
+                    .unwrap();
+            } else {
+                self.terminal.draw(cursor, kind).unwrap();
+            }
+        }
         self.editor.cursor_cache.reset();
+    }
 
-        let pos = pos.map(|pos| (pos.col as u16, pos.row as u16));
-        self.terminal.draw(pos, kind).unwrap();
+    fn cursor_smear_context(&mut self) -> Option<(CursorSmearIdentity, Rect)> {
+        let config = self.editor.config();
+        if !config.cursor_smear.enabled
+            || self.compositor.layer_count() != 1
+            || !self
+                .compositor
+                .find::<ui::EditorView>()
+                .is_some_and(|view| view.cursor_smear_allowed())
+        {
+            return None;
+        }
+        let (view, doc) = current_ref!(self.editor);
+        Some((
+            (
+                view.id,
+                doc.id(),
+                doc.view_offset(view.id),
+                self.editor.mode(),
+            ),
+            view.inner_area(doc),
+        ))
+    }
+
+    fn cursor_smear_colors(&self, cell: Option<&Cell>) -> (Color, Color) {
+        use helix_view::{document::Mode, graphics::Modifier};
+        let theme = &self.editor.theme;
+        let scope = match self.editor.mode() {
+            Mode::Normal => "ui.cursor.primary.normal",
+            Mode::Insert => "ui.cursor.primary.insert",
+            Mode::Select => "ui.cursor.primary.select",
+        };
+        let style = theme
+            .try_get_exact(scope)
+            .or_else(|| theme.try_get("ui.cursor.primary"))
+            .unwrap_or_else(|| theme.get("ui.selection"));
+        // Cursor styles may inherit a syntax foreground or selection background.
+        // Resolve both before reversing, just as the ordinary cell cursor does.
+        let mut cell = cell.cloned().unwrap_or_default();
+        cell.set_style(style);
+        let usable = |color: Option<Color>| color.filter(|color| *color != Color::Reset);
+        let fg = usable(Some(cell.fg))
+            .or_else(|| usable(theme.get("ui.text").fg))
+            .unwrap_or(Color::White);
+        let bg = usable(Some(cell.bg))
+            .or_else(|| usable(theme.get("ui.background").bg))
+            .unwrap_or(Color::Black);
+        let (background, foreground) = if cell.modifier.contains(Modifier::REVERSED) {
+            (fg, bg)
+        } else {
+            (bg, fg)
+        };
+        let color = theme
+            .try_get_exact("ui.cursor.smear")
+            .and_then(|style| usable(style.bg).or_else(|| usable(style.fg)))
+            .unwrap_or(background);
+        (color, foreground)
+    }
+
+    async fn render_cursor_smear(&mut self) {
+        let Some(frame) = &self.cursor_smear_frame else {
+            return;
+        };
+        let expected_context = (frame.identity, frame.bounds);
+        let area = frame.area;
+        let cell_size = frame.cell_size;
+        // A pending resize or UI transition needs a fresh compositor frame.
+        if self.terminal.size() != area
+            || self.terminal.backend().cursor_graphics_cell_size() != Some(cell_size)
+            || self.cursor_smear_context() != Some(expected_context)
+            || (self.editor.config().auto_info && self.editor.autoinfo.is_some())
+        {
+            self.render().await;
+            return;
+        }
+        self.paint_cursor_smear(tokio::time::Instant::now());
+    }
+
+    fn paint_cursor_smear(&mut self, now: tokio::time::Instant) {
+        let Some(frame) = &mut self.cursor_smear_frame else {
+            return;
+        };
+        if let Some(image) = self.cursor_smear.frame(frame.color, now.into_std()) {
+            // Only pixels change between animation frames. Leave text, redraw
+            // notifications, and the editor's idle deadline untouched.
+            self.terminal.draw_cursor_graphics(Some(&image)).unwrap();
+        } else {
+            self.terminal.draw_cursor_graphics(None).unwrap();
+            helix_event::request_redraw();
+        }
+        if self.cursor_smear.is_active(now.into_std()) {
+            frame.next_frame = now + CURSOR_SMEAR_FRAME_INTERVAL;
+        } else {
+            // The settled cursor remains visible, with no animation timer.
+            self.cursor_smear_frame = None;
+        }
     }
 
     pub async fn event_loop<S>(&mut self, input_stream: &mut S)
@@ -314,6 +585,10 @@ impl Application {
             }
 
             use futures_util::StreamExt;
+            let next_cursor_frame = self
+                .cursor_smear_frame
+                .as_ref()
+                .map(|frame| frame.next_frame);
 
             tokio::select! {
                 biased;
@@ -359,6 +634,16 @@ impl Application {
                         }
                     }
                 }
+                _ = async {
+                    if let Some(deadline) = next_cursor_frame {
+                        tokio::time::sleep_until(deadline).await;
+                    }
+                }, if next_cursor_frame.is_some() => {
+                    self.render_cursor_smear().await;
+                    // Animation frames must not trigger completion/LSP idle work,
+                    // reset input idle timers, or drain pending redraw notifications.
+                    continue;
+                }
             }
 
             // for integration tests only, reset the idle timer after every
@@ -371,6 +656,8 @@ impl Application {
     }
 
     pub fn handle_config_events(&mut self, config_event: ConfigEvent) {
+        self.cursor_smear.clear();
+        self.cursor_smear_last_position = None;
         let old_editor_config = self.editor.config();
 
         match config_event {
@@ -1285,6 +1572,9 @@ impl Application {
 
     fn restore_term(&mut self) -> std::io::Result<()> {
         use helix_view::graphics::CursorKind;
+        self.cursor_smear.clear();
+        self.cursor_smear_last_position = None;
+        self.cursor_smear_frame = None;
         self.terminal
             .backend_mut()
             .show_cursor(CursorKind::Block)

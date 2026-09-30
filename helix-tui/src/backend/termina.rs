@@ -1,4 +1,11 @@
-use std::io::{self, Write as _};
+use std::{
+    io::{self, Write as _},
+    sync::{
+        atomic::AtomicBool,
+        atomic::{AtomicU32, Ordering},
+        Arc,
+    },
+};
 
 use helix_view::{
     editor::KittyKeyboardProtocolConfig,
@@ -17,7 +24,19 @@ use termina::{
 
 use crate::{buffer::Cell, terminal::Config};
 
-use super::Backend;
+use super::{kitty, Backend, CellSize, CursorImage};
+
+fn supports_cursor_graphics(term: Option<&str>, program: Option<&str>, multiplexed: bool) -> bool {
+    !multiplexed
+        && (matches!(term, Some("xterm-kitty" | "xterm-ghostty"))
+            || matches!(program, Some("kitty" | "ghostty")))
+}
+
+fn cell_size(size: WindowSize) -> Option<CellSize> {
+    let width = size.pixel_width?.checked_div(size.cols)?;
+    let height = size.pixel_height?.checked_div(size.rows)?;
+    (width != 0 && height != 0).then_some(CellSize { width, height })
+}
 
 // These macros are helpers to set/unset modes like bracketed paste or enter/exit the alternate
 // screen.
@@ -56,6 +75,8 @@ struct Capabilities {
     /// OSC11 / OSC111 - change the terminal's background color.
     dynamic_background_color: bool,
     theme_mode: Option<theme::Mode>,
+    /// Conservative advertised support: Termina cannot currently parse APC query replies.
+    cursor_graphics: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +105,8 @@ pub struct TerminaBackend {
     /// The terminal emulator's background color. This is queried when claiming the terminal so
     /// that custom colors set outside of Helix with OSC11 are restored when Helix exits.
     original_background_color: Option<RgbColor>,
+    cursor_image_id: u32,
+    cursor_image_active: Arc<AtomicBool>,
 }
 
 impl TerminaBackend {
@@ -99,6 +122,13 @@ impl TerminaBackend {
 
         let mut capabilities = Capabilities::default();
         let mut original_background_color = None;
+        capabilities.cursor_graphics = supports_cursor_graphics(
+            std::env::var("TERM").ok().as_deref(),
+            std::env::var("TERM_PROGRAM").ok().as_deref(),
+            ["TMUX", "STY", "ZELLIJ"]
+                .iter()
+                .any(|name| std::env::var_os(name).is_some()),
+        );
         let start = Instant::now();
 
         // HACK: emitting OSC11 / OSC111 seems to break SGR and cause flickering in tmux.
@@ -228,7 +258,18 @@ impl TerminaBackend {
         // relied on `Drop`, the backtrace would be lost because it is printed before we would
         // clear and exit the alternate screen.
         let hook_reset_cursor_command = reset_cursor_command.clone();
+        static NEXT_IMAGE: AtomicU32 = AtomicU32::new(1);
+        let cursor_image_id = std::process::id()
+            .wrapping_mul(0x9e37_79b9)
+            .wrapping_add(NEXT_IMAGE.fetch_add(1, Ordering::Relaxed))
+            .max(1);
+        let cursor_image_active = Arc::new(AtomicBool::new(false));
+        let hook_image_active = cursor_image_active.clone();
         terminal.set_panic_hook(move |term| {
+            let _ = write!(term, "{}", decreset!(SynchronizedOutput));
+            if hook_image_active.swap(false, Ordering::Relaxed) {
+                let _ = kitty::delete_image(term, cursor_image_id);
+            }
             let _ = write!(
                 term,
                 "{}{}{}{}{}{}{}{}{}{}{}{}",
@@ -255,6 +296,8 @@ impl TerminaBackend {
             is_synchronized_output_set: false,
             background_color: None,
             original_background_color,
+            cursor_image_id,
+            cursor_image_active,
         })
     }
 
@@ -448,10 +491,15 @@ impl Backend for TerminaBackend {
             }
         }
         self.capabilities.extended_underlines |= self.config.force_enable_extended_underlines;
+        if self.config.cursor_graphics != config.cursor_graphics {
+            self.draw_cursor_graphics(None)?;
+        }
         Ok(())
     }
 
     fn restore(&mut self) -> io::Result<()> {
+        self.draw_cursor_graphics(None)?;
+        self.end_sychronized_render()?;
         self.disable_extensions()?;
         self.disable_mouse_capture()?;
         write!(
@@ -584,6 +632,7 @@ impl Backend for TerminaBackend {
     }
 
     fn clear(&mut self) -> io::Result<()> {
+        self.draw_cursor_graphics(None)?;
         write!(
             self.terminal,
             "{}",
@@ -610,6 +659,41 @@ impl Backend for TerminaBackend {
 
     fn supports_true_color(&self) -> bool {
         self.capabilities.true_color
+    }
+
+    fn cursor_graphics_cell_size(&self) -> Option<CellSize> {
+        if !self.config.cursor_graphics || !self.capabilities.cursor_graphics {
+            return None;
+        }
+        let size = self.terminal.get_dimensions().ok()?;
+        cell_size(size)
+    }
+
+    fn draw_cursor_graphics(&mut self, image: Option<&CursorImage<'_>>) -> io::Result<()> {
+        let Some(image) = image else {
+            if self.cursor_image_active.load(Ordering::Relaxed) {
+                kitty::delete_image(&mut self.terminal, self.cursor_image_id)?;
+                self.cursor_image_active.store(false, Ordering::Relaxed);
+            }
+            return Ok(());
+        };
+        let Some(size) = self.cursor_graphics_cell_size() else {
+            return self.draw_cursor_graphics(None);
+        };
+        let area = self.size()?;
+        if image.position.row >= usize::from(area.height)
+            || image.position.col >= usize::from(area.width)
+            || image.offset_x >= size.width
+            || image.offset_y >= size.height
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cursor image outside terminal",
+            ));
+        }
+        // Mark before writing so a partial transfer is also deleted during cleanup.
+        self.cursor_image_active.store(true, Ordering::Relaxed);
+        kitty::draw_image(&mut self.terminal, self.cursor_image_id, image)
     }
 
     fn get_theme_mode(&self) -> Option<theme::Mode> {
@@ -644,6 +728,8 @@ impl Drop for TerminaBackend {
         // Avoid resetting the terminal while panicking because we set a panic hook above in
         // `Self::new`.
         if !std::thread::panicking() {
+            let _ = self.draw_cursor_graphics(None);
+            let _ = self.end_sychronized_render();
             let _ = self.disable_extensions();
             let _ = self.disable_mouse_capture();
             let _ = write!(
@@ -719,4 +805,71 @@ fn diff_modifiers(from: Modifier, to: Modifier) -> SgrModifiers {
     }
 
     modifiers
+}
+
+#[cfg(test)]
+mod cursor_graphics_tests {
+    use super::*;
+
+    #[test]
+    fn advertised_graphics_support_rejects_other_terminals_and_multiplexers() {
+        assert!(supports_cursor_graphics(Some("xterm-kitty"), None, false));
+        assert!(supports_cursor_graphics(Some("xterm-ghostty"), None, false));
+        assert!(supports_cursor_graphics(
+            Some("xterm-256color"),
+            Some("ghostty"),
+            false
+        ));
+        assert!(!supports_cursor_graphics(
+            Some("xterm-256color"),
+            None,
+            false
+        ));
+        assert!(!supports_cursor_graphics(
+            Some("xterm-kitty"),
+            Some("kitty"),
+            true
+        ));
+        assert!(!supports_cursor_graphics(
+            Some("xterm-ghostty"),
+            Some("ghostty"),
+            true
+        ));
+    }
+
+    #[test]
+    fn pixel_metrics_require_nonzero_dimensions_and_follow_live_font_metrics() {
+        let size = WindowSize {
+            cols: 80,
+            rows: 24,
+            pixel_width: Some(640),
+            pixel_height: Some(384),
+        };
+        assert_eq!(
+            cell_size(size),
+            Some(CellSize {
+                width: 8,
+                height: 16
+            })
+        );
+        assert_eq!(cell_size(WindowSize { cols: 0, ..size }), None);
+        assert_eq!(cell_size(WindowSize { rows: 0, ..size }), None);
+        let unmeasured = WindowSize {
+            pixel_width: Some(0),
+            pixel_height: Some(0),
+            ..size
+        };
+        assert_eq!(cell_size(unmeasured), None);
+        assert_eq!(
+            cell_size(WindowSize {
+                pixel_width: Some(800),
+                pixel_height: Some(480),
+                ..size
+            }),
+            Some(CellSize {
+                width: 10,
+                height: 20
+            })
+        );
+    }
 }

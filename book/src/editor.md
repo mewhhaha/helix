@@ -5,6 +5,7 @@
 - [`[editor.statusline]` Section](#editorstatusline-section)
 - [`[editor.lsp]` Section](#editorlsp-section)
 - [`[editor.cursor-shape]` Section](#editorcursor-shape-section)
+- [`[editor.cursor-smear]` Section](#editorcursor-smear-section)
 - [`[editor.file-picker]` Section](#editorfile-picker-section)
 - [`[editor.file-explorer]` Section](#editorfile-explorer-section)
 - [`[editor.buffer-picker]` Section](#editorbuffer-picker-section)
@@ -39,6 +40,7 @@
 | `line-number` | Line number display: `absolute` simply shows each line's number, while `relative` shows the distance from the current line. When unfocused or in insert mode, `relative` will still show absolute line numbers | `"absolute"` |
 | `cursorline` | Highlight all lines with a cursor | `false` |
 | `cursorcolumn` | Highlight all columns with a cursor | `false` |
+| `cursor-smear` | Configure the optional graphics cursor animation; see the [cursor smear section](#editorcursor-smear-section). | Disabled |
 | `continue-comments` | if helix should automatically add a line comment token if you create a new line inside a comment. | `true` |
 | `gutters` | Gutters to display: Available are `diagnostics` and `diff` and `line-numbers` and `spacer` and `code-action-hint`, note that `diagnostics` also includes other features like breakpoints, 1-width padding will be inserted if gutters is non-empty | `["diagnostics", "spacer", "line-numbers", "spacer", "diff"]` |
 | `auto-completion` | Enable automatic pop up of auto-completion | `true` |
@@ -199,6 +201,38 @@ Valid values for these options are `block`, `bar`, `underline`, or `hidden`.
 [normal mode]: ./keymap.md#normal-mode
 [insert mode]: ./keymap.md#insert-mode
 [select mode]: ./keymap.md#select--extend-mode
+
+### `[editor.cursor-smear]` Section
+
+Draws the focused editor cursor as a pixel image using the
+[Kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/).
+Its corners stretch and settle after movement. The primary cursor remains visible
+at rest and follows the mode's [cursor shape](#editorcursor-shape-section).
+Selections and secondary cursors keep their usual styles.
+
+It is disabled by default and supported only in direct Kitty and Ghostty
+sessions with available terminal cell pixel dimensions. tmux, GNU Screen,
+Zellij, and other terminals use Helix's ordinary cursor. Terminal image rendering
+must be enabled; Ghostty's `image-storage-limit = 0` disables images.
+
+Cursor jumps, including `gw` jumps that scroll the target into view, animate.
+Scrolling without moving the cursor, view changes, mode changes, and popups reset
+the animation. Automatic key-prefix help pauses graphics and retains the cursor
+position for the completed command. Frames update about 60 times per second
+during movement and stop when the cursor settles.
+
+| Key | Description | Default |
+| --- | --- | --- |
+| `enabled` | Enable the graphics cursor and movement animation. | `false` |
+| `duration` | Animation duration in milliseconds, clamped to `16`–`1000`. | `120` |
+| `max-distance` | Maximum corner travel in terminal column widths, clamped to `1`–`256`. Farther jumps animate with a shorter stretch near the destination. | `40` |
+
+Distance is the straight-line distance in terminal column widths, calculated
+from the actual pixel dimensions of terminal cells.
+
+See [configuration](./configuration.md) for an example. The optional
+[`ui.cursor.smear`](./themes.md) theme entry overrides the graphics cursor's
+color, using `bg` or, when omitted, `fg`.
 
 ### `[editor.file-picker]` Section
 

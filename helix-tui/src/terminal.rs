@@ -1,7 +1,10 @@
 //! Terminal interface provided through the [Terminal] type.
 //! Frontend for [Backend]
 
-use crate::{backend::Backend, buffer::Buffer};
+use crate::{
+    backend::{Backend, CursorImage},
+    buffer::Buffer,
+};
 use helix_view::editor::{Config as EditorConfig, KittyKeyboardProtocolConfig};
 use helix_view::graphics::{CursorKind, Rect};
 use std::io;
@@ -26,6 +29,7 @@ pub struct Config {
     pub enable_mouse_capture: bool,
     pub force_enable_extended_underlines: bool,
     pub kitty_keyboard_protocol: KittyKeyboardProtocolConfig,
+    pub cursor_graphics: bool,
 }
 
 impl From<&EditorConfig> for Config {
@@ -34,6 +38,7 @@ impl From<&EditorConfig> for Config {
             enable_mouse_capture: config.mouse,
             force_enable_extended_underlines: config.undercurl,
             kitty_keyboard_protocol: config.kitty_keyboard_protocol,
+            cursor_graphics: config.cursor_smear.enabled,
         }
     }
 }
@@ -169,6 +174,7 @@ where
         self.buffers[self.current].resize(area);
         self.buffers[1 - self.current].resize(area);
         self.viewport.area = area;
+        self.draw_cursor_graphics(None)?;
         self.clear()
     }
 
@@ -188,6 +194,16 @@ where
         cursor_position: Option<(u16, u16)>,
         cursor_kind: CursorKind,
     ) -> io::Result<()> {
+        self.draw_with_cursor_graphics(cursor_position, cursor_kind, None)
+    }
+
+    /// Presents text, cursor state, and a pixel cursor image in one synchronized frame.
+    pub fn draw_with_cursor_graphics(
+        &mut self,
+        cursor_position: Option<(u16, u16)>,
+        cursor_kind: CursorKind,
+        image: Option<&CursorImage<'_>>,
+    ) -> io::Result<()> {
         // // Autoresize - otherwise we get glitches if shrinking or potential desync between widgets
         // // and the terminal (if growing), which may OOB.
         // self.autoresize()?;
@@ -200,29 +216,37 @@ where
         // let cursor_position = frame.cursor_position;
 
         // One synchronized frame for the whole draw
-        self.backend.start_sync()?;
-
-        // Draw to stdout
-        self.flush()?;
-
-        if let Some((x, y)) = cursor_position {
-            self.set_cursor(x, y)?;
-        }
-
-        match cursor_kind {
-            CursorKind::Hidden => self.hide_cursor()?,
-            kind => self.show_cursor(kind)?,
-        }
-
-        self.backend.end_sync()?;
+        self.synchronized(|terminal| {
+            terminal.flush()?;
+            terminal.backend.draw_cursor_graphics(image)?;
+            if let Some((x, y)) = cursor_position {
+                terminal.set_cursor(x, y)?;
+            }
+            match cursor_kind {
+                CursorKind::Hidden => terminal.hide_cursor(),
+                kind => terminal.show_cursor(kind),
+            }
+        })?;
 
         // Swap buffers
         self.buffers[1 - self.current].reset();
         self.current = 1 - self.current;
 
-        // Flush
-        self.backend.flush()?;
         Ok(())
+    }
+
+    /// Presents an animation frame without diffing or swapping the text buffers.
+    pub fn draw_cursor_graphics(&mut self, image: Option<&CursorImage<'_>>) -> io::Result<()> {
+        self.synchronized(|terminal| terminal.backend.draw_cursor_graphics(image))
+    }
+
+    fn synchronized(&mut self, draw: impl FnOnce(&mut Self) -> io::Result<()>) -> io::Result<()> {
+        self.backend.start_sync()?;
+        let result = draw(self);
+        // Always release synchronized output, including when image/text writes fail.
+        let end = self.backend.end_sync();
+        let flush = self.backend.flush();
+        result.and(end).and(flush)
     }
 
     #[inline]
@@ -260,5 +284,102 @@ where
     /// Queries the real size of the backend.
     pub fn size(&self) -> Rect {
         self.backend.size().unwrap_or(DEFAULT_TERMINAL_SIZE)
+    }
+}
+
+#[cfg(test)]
+mod cursor_graphics_tests {
+    use super::*;
+    use crate::backend::{CellSize, TestBackend};
+    use helix_core::Position;
+
+    fn image() -> CursorImage<'static> {
+        CursorImage {
+            position: Position::new(1, 2),
+            offset_x: 1,
+            offset_y: 2,
+            width: 2,
+            height: 1,
+            rgba: &[255, 0, 0, 255, 0, 255, 0, 32],
+        }
+    }
+
+    #[test]
+    fn image_only_frames_preserve_text_and_native_cursor_position() {
+        let mut backend = TestBackend::new(10, 5);
+        backend.set_cursor_graphics_cell_size(Some(CellSize {
+            width: 8,
+            height: 16,
+        }));
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .current_buffer_mut()
+            .get_mut(2, 1)
+            .unwrap()
+            .set_symbol("界");
+        terminal
+            .draw_with_cursor_graphics(Some((4, 3)), CursorKind::Hidden, Some(&image()))
+            .unwrap();
+        let text = terminal.backend().buffer().clone();
+        let draws = terminal.backend().draw_calls();
+        assert!(!terminal.backend().cursor_visible());
+        assert_eq!(terminal.backend().cursor_position(), (4, 3));
+        let mut moved = image();
+        moved.position.col += 1;
+        terminal.draw_cursor_graphics(Some(&moved)).unwrap();
+        assert_eq!(terminal.backend().buffer(), &text);
+        assert_eq!(terminal.backend().draw_calls(), draws);
+        assert_eq!(terminal.backend().cursor_position(), (4, 3));
+        assert_eq!(terminal.backend().cursor_image().unwrap().rgba[7], 32);
+        assert_eq!(terminal.backend().graphics_frame_count(), 2);
+        assert!(terminal.backend().graphics_frames_synchronized());
+        assert!(!terminal.backend().synchronized_output_active());
+    }
+
+    #[test]
+    fn regular_draw_resize_and_restore_remove_owned_cursor_image() {
+        let mut backend = TestBackend::new(10, 5);
+        backend.set_cursor_graphics_cell_size(Some(CellSize {
+            width: 8,
+            height: 16,
+        }));
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw_cursor_graphics(Some(&image())).unwrap();
+        terminal.draw(Some((2, 1)), CursorKind::Block).unwrap();
+        assert!(terminal.backend().cursor_image().is_none());
+        assert!(terminal.backend().cursor_visible());
+        terminal.draw_cursor_graphics(Some(&image())).unwrap();
+        terminal.resize(Rect::new(0, 0, 8, 4)).unwrap();
+        assert!(terminal.backend().cursor_image().is_none());
+        terminal.draw_cursor_graphics(Some(&image())).unwrap();
+        terminal.restore().unwrap();
+        assert!(terminal.backend().cursor_image().is_none());
+        assert_eq!(terminal.backend().graphics_delete_count(), 3);
+    }
+
+    #[test]
+    fn malformed_image_releases_synchronized_output_and_unsupported_backend_ignores_it() {
+        let mut terminal = Terminal::new(TestBackend::new(10, 5)).unwrap();
+        terminal.draw(Some((2, 1)), CursorKind::Block).unwrap();
+        terminal.draw_cursor_graphics(Some(&image())).unwrap();
+        assert_eq!(terminal.backend().graphics_frame_count(), 0);
+        assert!(terminal.backend().cursor_visible());
+        terminal
+            .backend_mut()
+            .set_cursor_graphics_cell_size(Some(CellSize {
+                width: 8,
+                height: 16,
+            }));
+        let mut malformed = image();
+        malformed.width = 4;
+        assert_eq!(
+            terminal
+                .draw_cursor_graphics(Some(&malformed))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert!(!terminal.backend().synchronized_output_active());
+        assert!(terminal.backend().cursor_image().is_none());
     }
 }

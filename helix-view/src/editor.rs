@@ -370,6 +370,8 @@ pub struct Config {
     pub statusline: StatusLineConfig,
     /// Shape for cursor in each mode
     pub cursor_shape: CursorShapeConfig,
+    /// Optional animated trail following the focused editor cursor.
+    pub cursor_smear: CursorSmearConfig,
     /// Set to `true` to override automatic detection of terminal truecolor support in the event of a false negative. Defaults to `false`.
     pub true_color: bool,
     /// Set to `true` to override automatic detection of terminal undercurl support in the event of a false negative. Defaults to `false`.
@@ -809,6 +811,29 @@ pub enum StatusLineElement {
     CodeActionHint,
 }
 
+/// Configuration for the optional Kitty/Ghostty graphics cursor. Bounds are applied when animating.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
+pub struct CursorSmearConfig {
+    /// Enable the graphics cursor when the terminal supports it. Defaults to false.
+    pub enabled: bool,
+    /// Corner animation duration in milliseconds, clamped to 16..=1000 when used.
+    pub duration: u64,
+    /// Maximum corner travel in column widths, clamped to 1..=256 when used.
+    /// Longer jumps animate with a shorter deformation near the destination.
+    pub max_distance: u16,
+}
+
+impl Default for CursorSmearConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            duration: 120,
+            max_distance: 40,
+        }
+    }
+}
+
 // Cursor shape is read and used on every rendered frame and so needs
 // to be fast. Therefore we avoid a hashmap and use an enum indexed array.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1208,6 +1233,7 @@ impl Default for Config {
             file_explorer: FileExplorerConfig::default(),
             statusline: StatusLineConfig::default(),
             cursor_shape: CursorShapeConfig::default(),
+            cursor_smear: CursorSmearConfig::default(),
             true_color: false,
             undercurl: false,
             search: SearchConfig::default(),
@@ -1345,6 +1371,44 @@ impl<'a> IntoIterator for &'a mut Diagnostics {
     fn into_iter(self) -> Self::IntoIter {
         self.counts.set(None);
         self.entries.iter_mut()
+    }
+}
+
+#[cfg(test)]
+mod cursor_smear_config_tests {
+    use super::*;
+
+    #[test]
+    fn existing_and_partial_cursor_configs_roundtrip_without_enabling_a_default_trail() {
+        #[derive(Serialize, Deserialize)]
+        struct FileConfig {
+            editor: Config,
+        }
+
+        let existing: FileConfig =
+            toml::from_str("[editor]\nscrolloff = 7\n[editor.cursor-shape]\ninsert = 'bar'\n")
+                .unwrap();
+        assert!(!existing.editor.cursor_smear.enabled);
+        assert_eq!(
+            existing.editor.cursor_shape.from_mode(Mode::Insert),
+            CursorKind::Bar
+        );
+
+        let partial: FileConfig = toml::from_str(
+            "[editor]\nscrolloff = 7\n[editor.cursor-smear]\nenabled = true\nduration = 180\n",
+        )
+        .unwrap();
+        assert!(partial.editor.cursor_smear.enabled);
+        assert_eq!(partial.editor.cursor_smear.duration, 180);
+        assert_eq!(partial.editor.cursor_smear.max_distance, 40);
+        let serialized = toml::to_string(&partial).unwrap();
+        let restored: FileConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(restored.editor, partial.editor);
+        assert!(
+            toml::from_str::<FileConfig>("[editor.cursor-smear]\nenabled = true\nduraton = 180\n")
+                .is_err(),
+            "unknown animation options must not silently enable defaults"
+        );
     }
 }
 

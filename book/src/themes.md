@@ -317,6 +317,7 @@ These scopes are used for theming the editor interface:
 | `ui.cursor.primary.normal`        |                                                                                                |
 | `ui.cursor.primary.insert`        |                                                                                                |
 | `ui.cursor.primary.select`        |                                                                                                |
+| `ui.cursor.smear`                 | Optional [graphics cursor](./editor.md#editorcursor-smear-section) color; uses `bg`, then `fg` when `bg` is omitted. |
 | `ui.debug.breakpoint`             | Breakpoint indicator, found in the gutter                                                      |
 | `ui.debug.active`                 | Indicator for the line at which debugging execution is paused at, found in the gutter          |
 | `ui.gutter`                       | Gutter                                                                                         |
