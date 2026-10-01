@@ -1,3 +1,8 @@
+mod diagnostic_batch;
+mod event_batch;
+
+use event_batch::next_ready;
+
 use arc_swap::{access::Map, ArcSwap};
 use futures_util::Stream;
 use helix_core::{diagnostic::Severity, pos_at_coords, syntax, Range, Selection};
@@ -18,7 +23,7 @@ use helix_view::{
     Align, DocumentId, Editor, ViewId,
 };
 use serde_json::json;
-use tui::backend::{Backend, CellSize};
+use tui::backend::{Backend, CellSize, WindowMetrics};
 use tui::buffer::Cell;
 
 use crate::{
@@ -103,6 +108,7 @@ pub struct Application {
     cursor_smear: ui::cursor_graphics::CursorGraphics<CursorSmearEditorIdentity>,
     cursor_smear_last_position: Option<(CursorSmearIdentity, usize)>,
     cursor_smear_frame: Option<CursorSmearFrame>,
+    pending_lsp_messages: std::collections::VecDeque<diagnostic_batch::PreparedMessage>,
 }
 
 #[cfg(feature = "integration")]
@@ -280,6 +286,7 @@ impl Application {
             cursor_smear: Default::default(),
             cursor_smear_last_position: None,
             cursor_smear_frame: None,
+            pending_lsp_messages: Default::default(),
         };
 
         Ok(app)
@@ -293,11 +300,12 @@ impl Application {
 
         helix_event::start_frame();
         self.editor.needs_redraw = false;
-        let area = self
+        let metrics = self
             .terminal
-            .autoresize()
+            .autoresize_with_metrics()
             .expect("Unable to determine terminal size");
-        let cell_size = self.terminal.backend().cursor_graphics_cell_size();
+        let area = metrics.area;
+        let cell_size = metrics.cell_size;
         let graphics_context = cell_size.and_then(|cell_size| {
             self.cursor_smear_context()
                 .map(|(identity, bounds)| (identity, bounds, cell_size))
@@ -412,7 +420,12 @@ impl Application {
                 }
                 if let Some(image) = self.cursor_smear.frame(color, now.into_std()) {
                     self.terminal
-                        .draw_with_cursor_graphics(cursor, CursorKind::Hidden, Some(&image))
+                        .draw_with_cursor_graphics_and_metrics(
+                            cursor,
+                            CursorKind::Hidden,
+                            Some(&image),
+                            metrics,
+                        )
                         .unwrap();
                     graphics_drawn = true;
                 }
@@ -531,27 +544,32 @@ impl Application {
         let area = frame.area;
         let cell_size = frame.cell_size;
         // A pending resize or UI transition needs a fresh compositor frame.
-        if self.terminal.size() != area
-            || self.terminal.backend().cursor_graphics_cell_size() != Some(cell_size)
+        let metrics = self.terminal.backend().window_metrics().ok();
+        if metrics
+            .is_none_or(|metrics| metrics.area != area || metrics.cell_size != Some(cell_size))
             || self.cursor_smear_context() != Some(expected_context)
             || (self.editor.config().auto_info && self.editor.autoinfo.is_some())
         {
             self.render().await;
             return;
         }
-        self.paint_cursor_smear(tokio::time::Instant::now());
+        self.paint_cursor_smear(tokio::time::Instant::now(), metrics.unwrap());
     }
 
-    fn paint_cursor_smear(&mut self, now: tokio::time::Instant) {
+    fn paint_cursor_smear(&mut self, now: tokio::time::Instant, metrics: WindowMetrics) {
         let Some(frame) = &mut self.cursor_smear_frame else {
             return;
         };
         if let Some(image) = self.cursor_smear.frame(frame.color, now.into_std()) {
             // Only pixels change between animation frames. Leave text, redraw
             // notifications, and the editor's idle deadline untouched.
-            self.terminal.draw_cursor_graphics(Some(&image)).unwrap();
+            self.terminal
+                .draw_cursor_graphics_with_metrics(Some(&image), metrics)
+                .unwrap();
         } else {
-            self.terminal.draw_cursor_graphics(None).unwrap();
+            self.terminal
+                .draw_cursor_graphics_with_metrics(None, metrics)
+                .unwrap();
             helix_event::request_redraw();
         }
         if self.cursor_smear.is_active(now.into_std()) {
@@ -599,7 +617,7 @@ impl Application {
                     };
                 }
                 Some(event) = input_stream.next() => {
-                    self.handle_terminal_events(event).await;
+                    self.handle_terminal_event_batch(event, input_stream).await;
                 }
                 Some(callback) = Jobs::next_callback(
                     &mut self.jobs.callbacks,
@@ -618,6 +636,10 @@ impl Application {
                     };
                     // TODO: show multiple status messages at once to avoid clobbering
                     self.editor.status_msg = Some((msg.message, severity));
+                    helix_event::request_redraw();
+                }
+                Some(message) = async { self.pending_lsp_messages.pop_front() }, if !self.pending_lsp_messages.is_empty() => {
+                    self.handle_prepared_language_server_message(message).await;
                     helix_event::request_redraw();
                 }
                 event = self.editor.wait_event() => {
@@ -970,7 +992,7 @@ impl Application {
                 self.render().await;
             }
             EditorEvent::LanguageServerMessage((id, call)) => {
-                self.handle_language_server_message(call, id).await;
+                self.handle_language_server_batch((id, call)).await;
                 // limit render calls for fast language server messages
                 helix_event::request_redraw();
             }
@@ -997,7 +1019,65 @@ impl Application {
         false
     }
 
+    async fn handle_terminal_event_batch<S>(
+        &mut self,
+        first: std::io::Result<TerminalEvent>,
+        input: &mut S,
+    ) where
+        S: Stream<Item = std::io::Result<TerminalEvent>> + Unpin,
+    {
+        if !matches!(&first, Ok(TerminalEvent::Key(_))) || !self.can_batch_terminal_keys() {
+            self.handle_terminal_events(first).await;
+            return;
+        }
+        let started = std::time::Instant::now();
+        let mut redraw = self.handle_terminal_event(first);
+        for _ in 1..64 {
+            if self.editor.should_close()
+                || !self.can_batch_terminal_keys()
+                || started.elapsed() >= std::time::Duration::from_millis(2)
+            {
+                break;
+            }
+            let Some(event) = next_ready(input).await else {
+                break;
+            };
+            // Resize, paste and focus changes form a presentation boundary.
+            if !matches!(&event, Ok(TerminalEvent::Key(_))) {
+                if redraw && !self.editor.should_close() {
+                    self.render().await;
+                }
+                self.handle_terminal_events(event).await;
+                return;
+            }
+            redraw |= self.handle_terminal_event(event);
+        }
+        if redraw && !self.editor.should_close() {
+            self.render().await;
+        }
+        // Let background hooks drain their bounded queues before the next
+        // input batch, including on a single-thread runtime.
+        tokio::task::yield_now().await;
+    }
+
+    fn can_batch_terminal_keys(&mut self) -> bool {
+        // Menus, prompts and completion popups can initialize or refresh their
+        // matches during rendering. Preserve that presentation between keys.
+        self.compositor.is_single_layer::<ui::EditorView>()
+            && self
+                .compositor
+                .find::<ui::EditorView>()
+                .is_some_and(|view| view.completion.is_none())
+    }
+
     pub async fn handle_terminal_events(&mut self, event: std::io::Result<TerminalEvent>) {
+        let redraw = self.handle_terminal_event(event);
+        if redraw && !self.editor.should_close() {
+            self.render().await;
+        }
+    }
+
+    fn handle_terminal_event(&mut self, event: std::io::Result<TerminalEvent>) -> bool {
         #[cfg(not(windows))]
         use termina::escape::csi;
 
@@ -1069,9 +1149,69 @@ impl Application {
             event => self.compositor.handle_event(&event.into(), &mut cx),
         };
 
-        if should_redraw && !self.editor.should_close() {
-            self.render().await;
+        should_redraw
+    }
+
+    async fn handle_language_server_batch(&mut self, first: (LanguageServerId, helix_lsp::Call)) {
+        let mut messages = vec![first];
+        for _ in 1..64 {
+            let Some(message) = next_ready(&mut self.editor.language_servers.incoming).await else {
+                break;
+            };
+            messages.push(message);
         }
+        self.pending_lsp_messages
+            .extend(diagnostic_batch::coalesce(messages));
+        if let Some(message) = self.pending_lsp_messages.pop_front() {
+            self.handle_prepared_language_server_message(message).await;
+        }
+    }
+
+    async fn handle_prepared_language_server_message(
+        &mut self,
+        message: diagnostic_batch::PreparedMessage,
+    ) {
+        match message {
+            diagnostic_batch::PreparedMessage::Diagnostics(server, params) => {
+                self.handle_publish_diagnostics(server, params)
+            }
+            diagnostic_batch::PreparedMessage::Call(server, call) => {
+                self.handle_language_server_message(call, server).await
+            }
+            diagnostic_batch::PreparedMessage::Malformed(error) => {
+                log::error!("failed to parse publishDiagnostics: {error}")
+            }
+        }
+    }
+
+    fn handle_publish_diagnostics(
+        &mut self,
+        server_id: LanguageServerId,
+        params: lsp::PublishDiagnosticsParams,
+    ) {
+        let uri = match params.uri.try_into() {
+            Ok(uri) => uri,
+            Err(error) => {
+                log::error!("{error}");
+                return;
+            }
+        };
+        let Some(server) = self.editor.language_server_by_id(server_id) else {
+            return;
+        };
+        if !server.is_initialized() {
+            log::error!(
+                "Discarding publishDiagnostic notification sent by an uninitialized server: {}",
+                server.name()
+            );
+            return;
+        }
+        let provider = helix_core::diagnostic::DiagnosticProvider::Lsp {
+            server_id,
+            identifier: None,
+        };
+        self.editor
+            .handle_lsp_diagnostics(&provider, uri, params.version, params.diagnostics);
     }
 
     pub async fn handle_language_server_message(
@@ -1127,28 +1267,7 @@ impl Application {
                         });
                     }
                     Notification::PublishDiagnostics(params) => {
-                        let uri = match helix_core::Uri::try_from(params.uri) {
-                            Ok(uri) => uri,
-                            Err(err) => {
-                                log::error!("{err}");
-                                return;
-                            }
-                        };
-                        let language_server = language_server!();
-                        if !language_server.is_initialized() {
-                            log::error!("Discarding publishDiagnostic notification sent by an uninitialized server: {}", language_server.name());
-                            return;
-                        }
-                        let provider = helix_core::diagnostic::DiagnosticProvider::Lsp {
-                            server_id,
-                            identifier: None,
-                        };
-                        self.editor.handle_lsp_diagnostics(
-                            &provider,
-                            uri,
-                            params.version,
-                            params.diagnostics,
-                        );
+                        self.handle_publish_diagnostics(server_id, params)
                     }
                     Notification::ShowMessage(params) => {
                         self.handle_show_message(params.typ, params.message);

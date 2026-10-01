@@ -33,6 +33,7 @@ struct DiffInner {
     diff_base: Rope,
     doc: Rope,
     hunks: Vec<Hunk>,
+    generation: u64,
 }
 
 /// Representation of a diff that can be updated.
@@ -69,6 +70,11 @@ impl DiffHandle {
     /// Switch base and modified texts' roles
     pub fn invert(&mut self) {
         self.inverted = !self.inverted;
+    }
+
+    /// Changes whenever a background diff is published or the diff is inverted.
+    pub fn render_key(&self) -> (u64, bool) {
+        (self.diff.read().generation, self.inverted)
     }
 
     /// Load the actual diff

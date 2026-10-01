@@ -42,10 +42,15 @@ RUSTFLAGS="-C target-feature=-crt-static"
    # Optimized
    cargo install \
       --profile opt \
-      --config 'build.rustflags=["-C", "target-cpu=native"]' \
+      --config 'target."cfg(all())".rustflags=["-C", "target-cpu=native"]' \
       --path helix-term \
       --locked
    ```
+
+   From the repository root, `cargo install-native` runs the optimized command above.
+   Target flags merge with the repository's required flags; `build.rustflags` is
+   ignored when target flags are configured. The native build is optimized for
+   the CPU of the machine building it.
 
    Either command will create the `hx` executable and construct the tree-sitter
    grammars in the local `runtime` folder.

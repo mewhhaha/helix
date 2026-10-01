@@ -1,7 +1,7 @@
 use std::{collections::HashSet, time::Duration};
 
 use futures_util::{stream::FuturesUnordered, StreamExt};
-use helix_core::{syntax::config::LanguageServerFeature, Assoc};
+use helix_core::syntax::config::LanguageServerFeature;
 use helix_event::{cancelable_future, register_hook};
 use helix_view::{
     document::DocumentLink,
@@ -108,18 +108,10 @@ fn request_document_links(editor: &mut Editor, doc_id: DocumentId) {
     });
 }
 
-fn attach_document_links(editor: &mut Editor, doc_id: DocumentId, mut links: Vec<DocumentLink>) {
-    let Some(doc) = editor.documents.get_mut(&doc_id) else {
-        return;
-    };
-
-    if links.is_empty() {
-        doc.document_links.clear();
-        return;
+fn attach_document_links(editor: &mut Editor, doc_id: DocumentId, links: Vec<DocumentLink>) {
+    if let Some(doc) = editor.documents.get_mut(&doc_id) {
+        doc.set_document_links(links);
     }
-
-    links.sort_by_key(|link| (link.start, link.end));
-    doc.document_links = links;
 }
 
 pub(super) fn register_hooks(handlers: &Handlers) {
@@ -130,12 +122,7 @@ pub(super) fn register_hooks(handlers: &Handlers) {
 
     let tx = handlers.document_links.clone();
     register_hook!(move |event: &mut DocumentDidChange<'_>| {
-        event
-            .changes
-            .update_positions(event.doc.document_links.iter_mut().flat_map(|link| {
-                std::iter::once((&mut link.start, Assoc::After))
-                    .chain(std::iter::once((&mut link.end, Assoc::After)))
-            }));
+        event.doc.map_document_links(event.changes);
 
         if !event.ghost_transaction {
             event.doc.document_link_controller.cancel();
@@ -158,7 +145,7 @@ pub(super) fn register_hooks(handlers: &Handlers) {
     register_hook!(move |event: &mut LanguageServerExited<'_>| {
         for doc in event.editor.documents_mut() {
             if doc.supports_language_server(event.server_id) {
-                doc.document_links.clear();
+                doc.set_document_links(Vec::new());
             }
         }
 

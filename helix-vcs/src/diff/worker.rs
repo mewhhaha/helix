@@ -78,6 +78,8 @@ impl DiffWorker {
         diff.doc = doc;
         diff.hunks.clear();
         diff.hunks.extend(self.diff_alloc.hunks());
+        static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        diff.generation = GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         drop(diff);
         self.diff_finished_notify.notify_waiters();
     }

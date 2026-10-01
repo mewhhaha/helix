@@ -1399,12 +1399,12 @@ fn goto_file_impl(cx: &mut Context, action: Action) {
     let mut resolve_requests = Vec::new();
     let mut fallback_ranges = Vec::new();
 
-    if doc.document_links.is_empty() {
+    if doc.document_links().is_empty() {
         fallback_ranges.extend_from_slice(&selections);
     } else {
         for selection in &selections {
             let mut matched = false;
-            for link in &doc.document_links {
+            for link in doc.document_links() {
                 if !selection_overlaps_document_link(selection, link) {
                     continue;
                 }
@@ -2737,7 +2737,8 @@ fn global_search(cx: &mut Context) {
             config
                 .style
                 .stylize(Some(&item.path), Some(item.line_start))
-        }),
+        })
+        .cached(),
         PickerColumn::hidden("contents"),
     ];
 
@@ -3413,7 +3414,8 @@ fn buffer_picker(cx: &mut Context) {
         PickerColumn::new("path", |meta: &BufferMeta, config: &PathStyleConfig| {
             config.stylize(meta.path.as_deref(), None)
         }),
-    ];
+    ]
+    .map(|column| column.cached());
 
     let initial_cursor = if cx
         .editor
@@ -3507,7 +3509,8 @@ fn jumplist_picker(cx: &mut Context) {
             }
         }),
         ui::PickerColumn::new("contents", |item: &JumpMeta, _| item.text.as_str().into()),
-    ];
+    ]
+    .map(|column| column.cached());
 
     let picker = Picker::new(
         columns,

@@ -12,7 +12,7 @@ use helix_core::encoding::Encoding;
 use helix_core::snippets::{ActiveSnippet, SnippetRenderCtx};
 use helix_core::syntax::config::LanguageServerFeature;
 use helix_core::text_annotations::{InlineAnnotation, Overlay, TextAnnotations};
-use helix_event::TaskController;
+use helix_event::{TaskController, TaskHandle};
 use helix_lsp::util::lsp_pos_to_pos;
 use helix_stdx::faccess::{copy_metadata, readonly};
 use helix_vcs::{DiffHandle, DiffProviderRegistry};
@@ -40,7 +40,8 @@ use helix_core::{
     indent::{auto_detect_indent_style, IndentStyle},
     line_ending::auto_detect_line_ending,
     syntax::{self, config::LanguageConfiguration},
-    ChangeSet, Diagnostic, LineEnding, Range, Rope, RopeBuilder, Selection, Syntax, Transaction,
+    Assoc, ChangeSet, Diagnostic, LineEnding, Range, Rope, RopeBuilder, Selection, Syntax,
+    Transaction,
 };
 
 use crate::{
@@ -259,6 +260,7 @@ pub enum DiagnosticHighlightKind {
 pub struct DiagnosticSnapshot {
     pub counts: DiagnosticCounts,
     ranges: [Arc<Vec<std::ops::Range<usize>>>; 7],
+    max_end: usize,
 }
 
 #[cfg(test)]
@@ -366,6 +368,137 @@ mod diagnostic_snapshot_tests {
         );
     }
 
+    #[tokio::test]
+    async fn edits_after_diagnostics_reuse_the_snapshot_but_boundary_edits_remap() {
+        let mut doc = document();
+        let view = ViewId::default();
+        doc.ensure_view_init(view);
+        doc.replace_diagnostics(
+            [
+                diagnostic(2, 4, Some(Severity::Warning)),
+                diagnostic(4, 4, Some(Severity::Error)),
+            ],
+            &[],
+            None,
+        );
+        let generation = doc.diagnostics_generation();
+        let ranges = doc
+            .diagnostic_snapshot()
+            .ranges(DiagnosticHighlightKind::Warning)
+            .clone();
+        let transaction = Transaction::change(doc.text(), [(5, 5, Some("\n".into()))].into_iter());
+        assert!(doc.apply(&transaction, view));
+        assert_eq!(doc.diagnostics_generation(), generation);
+        assert!(Arc::ptr_eq(
+            &ranges,
+            doc.diagnostic_snapshot()
+                .ranges(DiagnosticHighlightKind::Warning)
+        ));
+        assert_eq!(doc.diagnostics()[1].line, 0);
+
+        let transaction = Transaction::change(doc.text(), [(4, 4, Some("\n".into()))].into_iter());
+        assert!(doc.apply(&transaction, view));
+        assert_ne!(doc.diagnostics_generation(), generation);
+        assert_eq!(doc.diagnostics()[1].range.start, 5);
+        assert_eq!(doc.diagnostics()[1].line, 1);
+        let transaction = Transaction::change(doc.text(), [(0, 0, Some("\n".into()))].into_iter());
+        assert!(doc.apply(&transaction, view));
+        assert_eq!(doc.diagnostics()[0].range.start, 3);
+        assert_eq!(doc.diagnostics()[0].line, 1);
+    }
+
+    #[tokio::test]
+    async fn inlay_requests_reuse_coverage_and_cancel_on_edits_and_view_removal() {
+        let mut doc = document();
+        let first_view = ViewId::default();
+        let mut views = slotmap::SlotMap::<ViewId, ()>::with_key();
+        let second_view = views.insert(());
+        doc.ensure_view_init(first_view);
+        doc.ensure_view_init(second_view);
+        let id = DocumentInlayHintsId {
+            first_line: 0,
+            last_line: 3,
+            version: doc.version(),
+            server_id: LanguageServerId::default(),
+            length_limit: None,
+        };
+        let visible = DocumentInlayHintsId {
+            first_line: 1,
+            last_line: 2,
+            ..id
+        };
+        let first = doc.request_inlay_hints(first_view, id, visible).unwrap();
+        assert!(doc.request_inlay_hints(first_view, id, visible).is_none());
+        let second = doc.request_inlay_hints(second_view, id, visible).unwrap();
+        doc.set_inlay_hints(first_view, DocumentInlayHints::empty_with_id(id));
+        assert!(doc.request_inlay_hints(first_view, id, visible).is_none());
+        let distant = DocumentInlayHintsId {
+            first_line: 5,
+            last_line: 8,
+            ..id
+        };
+        let pending = doc
+            .request_inlay_hints(first_view, distant, distant)
+            .unwrap();
+        assert!(doc.request_inlay_hints(first_view, id, visible).is_none());
+        assert!(
+            pending.is_canceled(),
+            "returning to cached coverage cancels an obsolete viewport request"
+        );
+        let transaction = Transaction::change(doc.text(), [(0, 0, Some("x".into()))].into_iter());
+        assert!(doc.apply(&transaction, first_view));
+        assert!(first.is_canceled());
+        assert!(second.is_canceled());
+        let new_id = DocumentInlayHintsId {
+            version: doc.version(),
+            ..id
+        };
+        let pending = doc.request_inlay_hints(first_view, new_id, new_id).unwrap();
+        doc.remove_view(first_view);
+        assert!(pending.is_canceled());
+        let pending = doc
+            .request_inlay_hints(second_view, new_id, new_id)
+            .unwrap();
+        doc.reset_all_inlay_hints();
+        assert!(pending.is_canceled());
+    }
+
+    #[tokio::test]
+    async fn link_and_reference_snapshots_survive_remapping_without_mutation() {
+        let mut doc = document();
+        let view = ViewId::default();
+        doc.ensure_view_init(view);
+        let link = |start, end| DocumentLink {
+            start,
+            end,
+            link: lsp::DocumentLink {
+                range: lsp::Range::default(),
+                target: None,
+                tooltip: None,
+                data: None,
+            },
+            language_server_id: LanguageServerId::default(),
+        };
+        doc.set_document_links(vec![link(6, 8), link(1, 4), link(3, 6), link(9, 9)]);
+        doc.set_document_highlights(view, vec![6..8, 1..4, 2..3]);
+        let links = doc.document_link_ranges().clone();
+        let references = doc.document_highlight_ranges(view).unwrap().clone();
+        assert_eq!(links.as_slice(), std::slice::from_ref(&(1..8)));
+        let transaction = Transaction::change(doc.text(), [(0, 0, Some("x".into()))].into_iter());
+        // The link hook lives in helix-term; exercise the same public mapping here.
+        doc.map_document_links(transaction.changes());
+        assert!(doc.apply(&transaction, view));
+        assert_eq!(links.as_slice(), std::slice::from_ref(&(1..8)));
+        assert_eq!(
+            doc.document_link_ranges().as_slice(),
+            std::slice::from_ref(&(2..9))
+        );
+        assert_eq!(references.as_slice(), &[1..4, 6..8]);
+        assert_eq!(doc.document_highlights(view), Some([2..5, 7..9].as_slice()));
+        doc.set_document_links(Vec::new());
+        assert!(doc.document_link_ranges().is_empty());
+    }
+
     #[test]
     fn partial_provider_updates_and_cleanup_refresh_the_snapshot() {
         let mut doc = document();
@@ -430,6 +563,7 @@ impl Default for DiagnosticSnapshot {
         Self {
             counts: DiagnosticCounts::default(),
             ranges: std::array::from_fn(|_| empty.clone()),
+            max_end: 0,
         }
     }
 }
@@ -476,9 +610,8 @@ pub struct Document {
     pub(crate) document_highlights: HashMap<ViewId, DocumentHighlights>,
     /// LSP code action hints for each view.
     pub(crate) code_action_hints: HashSet<ViewId>,
-    /// Set to `true` when the document is updated, reset to `false` on the next inlay hints
-    /// update from the LSP
-    pub inlay_hints_oudated: bool,
+    /// Pending requests, canceled on edits, annotation resets and view removal.
+    inlay_hint_requests: HashMap<ViewId, InlayHintRequest>,
 
     path: Option<PathBuf>,
     relative_path: OnceCell<Option<PathBuf>>,
@@ -526,6 +659,7 @@ pub struct Document {
 
     last_saved_revision: usize,
     version: i32, // should be usize?
+    selection_generation: u64,
     pub(crate) modified_since_accessed: bool,
 
     pub(crate) diagnostics: Vec<Diagnostic>,
@@ -549,7 +683,8 @@ pub struct Document {
     /// Annotations for LSP document color swatches
     pub color_swatches: Option<DocumentColorSwatches>,
     /// Cached LSP document links for navigation (e.g. goto_file).
-    pub document_links: Vec<DocumentLink>,
+    document_links: Vec<DocumentLink>,
+    document_link_ranges: Arc<Vec<std::ops::Range<usize>>>,
     // NOTE: ideally this would live on the handler for color swatches. This is blocked on a
     // large refactor that would make `&mut Editor` available on the `DocumentDidChange` event.
     pub color_swatch_controller: TaskController,
@@ -590,7 +725,7 @@ impl DocumentColorSwatches {
 /// Highlight ranges returned by LSP `textDocument/documentHighlight` for a view.
 #[derive(Debug, Clone, Default)]
 pub struct DocumentHighlights {
-    pub ranges: Vec<std::ops::Range<usize>>,
+    pub ranges: Arc<Vec<std::ops::Range<usize>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -679,6 +814,24 @@ pub struct DocumentInlayHintsId {
     pub first_line: usize,
     /// Last line for which the inlay hints were requested.
     pub last_line: usize,
+    pub version: i32,
+    pub server_id: LanguageServerId,
+    pub length_limit: Option<std::num::NonZeroU8>,
+}
+
+impl DocumentInlayHintsId {
+    pub fn covers(&self, other: &Self) -> bool {
+        self.version == other.version
+            && self.server_id == other.server_id
+            && self.length_limit == other.length_limit
+            && self.first_line <= other.first_line
+            && self.last_line >= other.last_line
+    }
+}
+
+struct InlayHintRequest {
+    id: DocumentInlayHintsId,
+    controller: TaskController,
 }
 
 use std::{fmt, mem};
@@ -688,7 +841,6 @@ impl fmt::Debug for Document {
             .field("id", &self.id)
             .field("text", &self.text)
             .field("selections", &self.selections)
-            .field("inlay_hints_oudated", &self.inlay_hints_oudated)
             .field("text_annotations", &self.inlay_hints)
             .field("view_data", &self.view_data)
             .field("path", &self.path)
@@ -1143,7 +1295,7 @@ impl Document {
             grapheme_position_cache: helix_core::GraphemePositionCache::default(),
             selections: HashMap::default(),
             inlay_hints: HashMap::default(),
-            inlay_hints_oudated: false,
+            inlay_hint_requests: HashMap::new(),
             view_data: Default::default(),
             indent_style: DEFAULT_INDENT,
             editor_config: EditorConfig::default(),
@@ -1159,6 +1311,7 @@ impl Document {
             diagnostics_generation: 0,
             diagnostics_layout_generation: 0,
             version: 0,
+            selection_generation: 0,
             history: Cell::new(History::default()),
             savepoints: Vec::new(),
             last_saved_time: SystemTime::now(),
@@ -1177,6 +1330,7 @@ impl Document {
             code_action_hints: HashSet::new(),
             color_swatches: None,
             document_links: Vec::new(),
+            document_link_ranges: Arc::default(),
             color_swatch_controller: TaskController::new(),
             document_highlight_controllers: HashMap::new(),
             code_action_controllers: HashMap::new(),
@@ -1843,12 +1997,22 @@ impl Document {
     /// Select text within the [`Document`].
     pub fn set_selection(&mut self, view_id: ViewId, selection: Selection) {
         // TODO: use a transaction?
+        self.bump_selection_generation(view_id);
         self.selections
             .insert(view_id, selection.ensure_invariants(self.text().slice(..)));
         helix_event::dispatch(SelectionDidChange {
             doc: self,
             view: view_id,
         })
+    }
+
+    fn bump_selection_generation(&mut self, view: ViewId) {
+        self.selection_generation = self.selection_generation.wrapping_add(1);
+        self.view_data_mut(view).selection_generation = self.selection_generation;
+    }
+
+    pub fn selection_generation(&self, view: ViewId) -> u64 {
+        self.view_data(view).selection_generation
     }
 
     /// Find the origin selection of the text in a document, i.e. where
@@ -1889,6 +2053,7 @@ impl Document {
         self.selections.remove(&view_id);
         self.view_data.remove(&view_id);
         self.inlay_hints.remove(&view_id);
+        self.inlay_hint_requests.remove(&view_id);
         self.jump_labels.remove(&view_id);
         self.document_highlights.remove(&view_id);
         self.document_highlight_controllers.remove(&view_id);
@@ -1913,6 +2078,7 @@ impl Document {
 
         if changes.is_empty() {
             if let Some(selection) = transaction.selection() {
+                self.bump_selection_generation(view_id);
                 self.selections.insert(
                     view_id,
                     selection.clone().ensure_invariants(self.text.slice(..)),
@@ -1994,57 +2160,65 @@ impl Document {
             diff_handle.update_document(self.text.clone(), false);
         }
 
-        // map diagnostics over changes too
-        changes.update_positions(self.diagnostics.iter_mut().map(|diagnostic| {
-            let assoc = if diagnostic.starts_at_word {
-                Assoc::BeforeWord
-            } else {
-                Assoc::After
-            };
-            (&mut diagnostic.range.start, assoc)
-        }));
-        changes.update_positions(self.diagnostics.iter_mut().filter_map(|diagnostic| {
-            if diagnostic.zero_width {
-                // for zero width diagnostics treat the diagnostic as a point
-                // rather than a range
-                return None;
-            }
-            let assoc = if diagnostic.ends_at_word {
-                Assoc::AfterWord
-            } else {
-                Assoc::Before
-            };
-            Some((&mut diagnostic.range.end, assoc))
-        }));
-        let mut removed_diagnostic_start = usize::MAX;
-        self.diagnostics.retain_mut(|diagnostic| {
-            if diagnostic.zero_width {
-                diagnostic.range.end = diagnostic.range.start
-            } else if diagnostic.range.start >= diagnostic.range.end {
-                removed_diagnostic_start = removed_diagnostic_start.min(diagnostic.range.start);
-                return false;
-            }
-            diagnostic.line = self.text.char_to_line(diagnostic.range.start);
-            true
-        });
+        // Edits strictly after every diagnostic cannot change positions, lines or
+        // ordering. Keep the shared snapshot and its generation in that case.
+        if !self.diagnostics.is_empty() && first_change <= self.diagnostic_snapshot.max_end {
+            // map diagnostics over changes too
+            changes.update_positions(self.diagnostics.iter_mut().map(|diagnostic| {
+                let assoc = if diagnostic.starts_at_word {
+                    Assoc::BeforeWord
+                } else {
+                    Assoc::After
+                };
+                (&mut diagnostic.range.start, assoc)
+            }));
+            changes.update_positions(self.diagnostics.iter_mut().filter_map(|diagnostic| {
+                if diagnostic.zero_width {
+                    // for zero width diagnostics treat the diagnostic as a point
+                    // rather than a range
+                    return None;
+                }
+                let assoc = if diagnostic.ends_at_word {
+                    Assoc::AfterWord
+                } else {
+                    Assoc::Before
+                };
+                Some((&mut diagnostic.range.end, assoc))
+            }));
+            let mut removed_diagnostic_start = usize::MAX;
+            self.diagnostics.retain_mut(|diagnostic| {
+                if diagnostic.zero_width {
+                    diagnostic.range.end = diagnostic.range.start
+                } else if diagnostic.range.start >= diagnostic.range.end {
+                    removed_diagnostic_start = removed_diagnostic_start.min(diagnostic.range.start);
+                    return false;
+                }
+                diagnostic.line = self.text.char_to_line(diagnostic.range.start);
+                true
+            });
 
-        for pair in self.diagnostics.windows(2) {
-            let (a, b) = (&pair[0], &pair[1]);
-            if (a.range, a.severity, &a.provider) > (b.range, b.severity, &b.provider) {
-                removed_diagnostic_start =
-                    removed_diagnostic_start.min(a.range.start.min(b.range.start));
+            let mut reordered = false;
+            for pair in self.diagnostics.windows(2) {
+                let (a, b) = (&pair[0], &pair[1]);
+                if (a.range, a.severity, &a.provider) > (b.range, b.severity, &b.provider) {
+                    reordered = true;
+                    removed_diagnostic_start =
+                        removed_diagnostic_start.min(a.range.start.min(b.range.start));
+                }
             }
+            if reordered {
+                self.diagnostics.sort_by(|a, b| {
+                    (a.range, a.severity, &a.provider).cmp(&(b.range, b.severity, &b.provider))
+                });
+            }
+
+            if removed_diagnostic_start != usize::MAX {
+                self.formatter_cache
+                    .invalidate_annotations_from(self.text.slice(..), removed_diagnostic_start);
+            }
+
+            self.refresh_diagnostic_snapshot();
         }
-        self.diagnostics.sort_by(|a, b| {
-            (a.range, a.severity, &a.provider).cmp(&(b.range, b.severity, &b.provider))
-        });
-
-        if removed_diagnostic_start != usize::MAX {
-            self.formatter_cache
-                .invalidate_annotations_from(self.text.slice(..), removed_diagnostic_start);
-        }
-
-        self.refresh_diagnostic_snapshot();
 
         // Update the inlay hint annotations' positions, helping ensure they are displayed in the proper place
         let apply_inlay_hint_changes = |annotations: &mut Vec<InlineAnnotation>| {
@@ -2055,7 +2229,9 @@ impl Document {
             );
         };
 
-        self.inlay_hints_oudated = true;
+        for request in self.inlay_hint_requests.values_mut() {
+            request.controller.cancel();
+        }
         for text_annotation in self.inlay_hints.values_mut() {
             let DocumentInlayHints {
                 id: _,
@@ -2079,13 +2255,14 @@ impl Document {
             let text_len = self.text.len_chars();
             // Server ranges are sorted and merged. Map their endpoints together
             // so multicursor edits traverse the changeset once per view.
-            changes.update_positions(highlights.ranges.iter_mut().flat_map(|range| {
+            let ranges = Arc::make_mut(&mut highlights.ranges);
+            changes.update_positions(ranges.iter_mut().flat_map(|range| {
                 [
                     (&mut range.start, Assoc::After),
                     (&mut range.end, Assoc::After),
                 ]
             }));
-            highlights.ranges.retain_mut(|range| {
+            ranges.retain_mut(|range| {
                 if range.start >= text_len {
                     return false;
                 }
@@ -2858,6 +3035,12 @@ impl Document {
         self.diagnostic_snapshot = DiagnosticSnapshot {
             counts,
             ranges: ranges.map(Arc::new),
+            max_end: self
+                .diagnostics
+                .iter()
+                .map(|d| d.range.end)
+                .max()
+                .unwrap_or(0),
         };
     }
 
@@ -3016,6 +3199,38 @@ impl Document {
         }
     }
 
+    /// Starts a request unless cached or pending hints already cover the viewport.
+    pub fn request_inlay_hints(
+        &mut self,
+        view: ViewId,
+        id: DocumentInlayHintsId,
+        visible: DocumentInlayHintsId,
+    ) -> Option<TaskHandle> {
+        if self
+            .inlay_hints(view)
+            .is_some_and(|hints| hints.id.covers(&visible))
+        {
+            if let Some(pending) = self.inlay_hint_requests.get_mut(&view) {
+                if !pending.id.covers(&visible) {
+                    pending.controller.cancel();
+                }
+            }
+            return None;
+        }
+        let pending = self
+            .inlay_hint_requests
+            .entry(view)
+            .or_insert_with(|| InlayHintRequest {
+                id,
+                controller: TaskController::new(),
+            });
+        if pending.controller.is_running() && pending.id.covers(&visible) {
+            return None;
+        }
+        pending.id = id;
+        Some(pending.controller.restart())
+    }
+
     /// Set the inlay hints for this document and `view_id`.
     pub fn set_inlay_hints(&mut self, view_id: ViewId, mut inlay_hints: DocumentInlayHints) {
         inlay_hints.refresh_layout_keys();
@@ -3033,13 +3248,36 @@ impl Document {
     pub fn set_document_highlights(
         &mut self,
         view_id: ViewId,
-        ranges: Vec<std::ops::Range<usize>>,
+        mut ranges: Vec<std::ops::Range<usize>>,
     ) {
+        // Shared overlays use binary search, so normalize at the publication
+        // boundary even for callers other than the LSP handler.
+        if !ranges.is_sorted_by_key(|range| (range.start, range.end)) {
+            ranges.sort_unstable_by_key(|range| (range.start, range.end));
+        }
+        let mut written = 0;
+        for read in 0..ranges.len() {
+            let range = ranges[read].clone();
+            if range.start >= range.end {
+                continue;
+            }
+            if written != 0 && range.start <= ranges[written - 1].end {
+                ranges[written - 1].end = ranges[written - 1].end.max(range.end);
+            } else {
+                ranges[written] = range;
+                written += 1;
+            }
+        }
+        ranges.truncate(written);
         if ranges.is_empty() {
             self.document_highlights.remove(&view_id);
         } else {
-            self.document_highlights
-                .insert(view_id, DocumentHighlights { ranges });
+            self.document_highlights.insert(
+                view_id,
+                DocumentHighlights {
+                    ranges: Arc::new(ranges),
+                },
+            );
         }
     }
 
@@ -3056,6 +3294,58 @@ impl Document {
         self.document_highlights
             .get(&view_id)
             .map(|highlights| highlights.ranges.as_slice())
+    }
+
+    pub fn document_highlight_ranges(
+        &self,
+        view_id: ViewId,
+    ) -> Option<&Arc<Vec<std::ops::Range<usize>>>> {
+        self.document_highlights
+            .get(&view_id)
+            .map(|highlights| &highlights.ranges)
+    }
+
+    pub fn document_links(&self) -> &[DocumentLink] {
+        &self.document_links
+    }
+
+    pub fn document_link_ranges(&self) -> &Arc<Vec<std::ops::Range<usize>>> {
+        &self.document_link_ranges
+    }
+
+    pub fn set_document_links(&mut self, mut links: Vec<DocumentLink>) {
+        links.sort_by_key(|link| (link.start, link.end));
+        self.document_links = links;
+        self.refresh_document_link_ranges();
+    }
+
+    pub fn map_document_links(&mut self, changes: &ChangeSet) {
+        if self.document_links.is_empty() {
+            return;
+        }
+        changes.update_positions(self.document_links.iter_mut().flat_map(|link| {
+            [
+                (&mut link.start, Assoc::After),
+                (&mut link.end, Assoc::After),
+            ]
+        }));
+        self.refresh_document_link_ranges();
+    }
+
+    fn refresh_document_link_ranges(&mut self) {
+        let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+        for link in &self.document_links {
+            if link.start >= link.end {
+                continue;
+            }
+            match ranges.last_mut() {
+                Some(previous) if link.start <= previous.end => {
+                    previous.end = previous.end.max(link.end)
+                }
+                _ => ranges.push(link.start..link.end),
+            }
+        }
+        self.document_link_ranges = Arc::new(ranges);
     }
 
     pub fn document_highlight_controller(&mut self, view_id: ViewId) -> &mut TaskController {
@@ -3094,6 +3384,7 @@ impl Document {
     /// (since it often means inlay hints have been fully deactivated).
     pub fn reset_all_inlay_hints(&mut self) {
         self.inlay_hints = Default::default();
+        self.inlay_hint_requests.clear();
     }
 
     pub fn has_language_server_with_feature(&self, feature: LanguageServerFeature) -> bool {
@@ -3104,6 +3395,7 @@ impl Document {
 #[derive(Debug, Default)]
 pub struct ViewData {
     view_position: ViewPosition,
+    selection_generation: u64,
 }
 
 #[derive(Clone, Debug)]

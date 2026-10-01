@@ -33,6 +33,13 @@ pub struct CellSize {
     pub height: u16,
 }
 
+/// Cell and pixel geometry measured together for one terminal frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowMetrics {
+    pub area: Rect,
+    pub cell_size: Option<CellSize>,
+}
+
 /// A tightly packed, straight-alpha RGBA image anchored to a terminal cell.
 #[derive(Debug, Clone, Copy)]
 pub struct CursorImage<'a> {
@@ -106,9 +113,25 @@ pub trait Backend {
         None
     }
 
+    fn window_metrics(&self) -> io::Result<WindowMetrics> {
+        Ok(WindowMetrics {
+            area: self.size()?,
+            cell_size: self.cursor_graphics_cell_size(),
+        })
+    }
+
     /// Replaces the backend's cursor image, or deletes only that image for `None`.
     /// Implementations preserve the terminal cursor position and text cells.
     fn draw_cursor_graphics(&mut self, _image: Option<&CursorImage<'_>>) -> io::Result<()> {
         Ok(())
+    }
+
+    /// Draw with the geometry already measured for this frame.
+    fn draw_cursor_graphics_with_metrics(
+        &mut self,
+        image: Option<&CursorImage<'_>>,
+        _metrics: WindowMetrics,
+    ) -> io::Result<()> {
+        self.draw_cursor_graphics(image)
     }
 }

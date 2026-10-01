@@ -97,6 +97,10 @@ impl Compositor {
         self.area
     }
 
+    pub(crate) fn is_single_layer<T: Component>(&self) -> bool {
+        self.layers.len() == 1 && self.layers[0].type_name() == std::any::type_name::<T>()
+    }
+
     pub fn resize(&mut self, area: Rect) {
         self.area = area;
     }

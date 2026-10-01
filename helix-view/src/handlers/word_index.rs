@@ -7,10 +7,8 @@ use std::{borrow::Cow, collections::VecDeque, iter, sync::Arc, time::Duration};
 
 use foldhash::HashMap;
 use helix_core::{
-    chars::char_is_word,
-    diff::compare_ropes,
-    fuzzy::{fuzzy_match, fuzzy_match_cancelable},
-    ChangeSet, Rope, RopeSlice,
+    chars::char_is_word, diff::compare_ropes, fuzzy::fuzzy_match_cancelable, ChangeSet, Rope,
+    RopeSlice,
 };
 use helix_event::{register_hook, AsyncHook, TaskController, TaskHandle};
 use helix_stdx::rope::RopeSliceExt as _;
@@ -235,52 +233,122 @@ struct WordIndexInner {
     /// reference count of times a word is used. When the reference count drops to zero the word
     /// is removed from the index.
     words: HashMap<Word, u32>,
+    generation: u64,
+    snapshot: std::sync::OnceLock<Arc<Vec<Word>>>,
 }
 
 impl WordIndexInner {
-    fn words(&self) -> impl Iterator<Item = &Word> {
-        self.words.keys()
-    }
-
     fn clear(&mut self) {
         std::mem::take(&mut self.words);
+        self.generation = self.generation.wrapping_add(1);
+        self.snapshot.take();
     }
 }
 
 #[derive(Debug, Default, Clone)]
 pub struct WordIndex {
     inner: Arc<RwLock<WordIndexInner>>,
+    candidates: Arc<Mutex<Option<CandidateCache>>>,
+}
+
+#[derive(Debug)]
+struct CandidateCache {
+    generation: u64,
+    pattern: String,
+    words: Arc<Vec<Word>>,
+}
+
+impl CandidateCache {
+    fn can_refine(&self, pattern: &str) -> bool {
+        pattern == self.pattern
+            || (pattern.starts_with(&self.pattern)
+                && pattern
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'))
+    }
 }
 
 type WordDelta = HashMap<Word, i64>;
 
 impl WordIndex {
     pub fn matches(&self, pattern: &str) -> Vec<String> {
-        let inner = self.inner.read();
-        let mut matches = fuzzy_match(pattern, inner.words(), false);
-        matches.sort_unstable_by_key(|(_, score)| *score);
-        matches
-            .into_iter()
-            .map(|(word, _)| word.to_string())
-            .collect()
+        self.matches_with_cancel(pattern, || false)
     }
 
     pub fn matches_cancelable(&self, pattern: &str, cancel: &TaskHandle) -> Vec<String> {
-        let inner = self.inner.read();
-        let Some(mut matches) =
-            fuzzy_match_cancelable(pattern, inner.words(), || cancel.is_canceled())
-        else {
+        self.matches_with_cancel(pattern, || cancel.is_canceled())
+    }
+
+    fn matches_with_cancel(
+        &self,
+        pattern: &str,
+        mut canceled: impl FnMut() -> bool,
+    ) -> Vec<String> {
+        if canceled() {
+            return Vec::new();
+        }
+        // Only copying cheap, shared word handles happens under the index lock.
+        // Matching and sorting must not stall the background index writer.
+        let (generation, words) = {
+            let inner = self.inner.read();
+            let cached = self.candidates.lock();
+            let words = cached
+                .as_ref()
+                .filter(|cache| cache.generation == inner.generation && cache.can_refine(pattern))
+                .map(|cache| cache.words.clone())
+                .unwrap_or_else(|| {
+                    inner
+                        .snapshot
+                        .get_or_init(|| Arc::new(inner.words.keys().cloned().collect()))
+                        .clone()
+                });
+            (inner.generation, words)
+        };
+        let Some(mut matches) = fuzzy_match_cancelable(pattern, words.iter(), &mut canceled) else {
             return Vec::new();
         };
-        matches.sort_unstable_by_key(|(_, score)| *score);
-        let mut words = Vec::with_capacity(matches.len());
-        for (i, (word, _)) in matches.into_iter().enumerate() {
-            if i % 64 == 0 && cancel.is_canceled() {
+        if matches.len() <= 32_768
+            && matches
+                .iter()
+                .map(|(word, _)| word.len() + std::mem::size_of::<Word>())
+                .sum::<usize>()
+                <= 2 * 1024 * 1024
+        {
+            // Publishing an obsolete snapshot is harmless: its generation will
+            // never match the current index. Canceled scans publish nothing.
+            *self.candidates.lock() = Some(CandidateCache {
+                generation,
+                pattern: pattern.into(),
+                words: Arc::new(matches.iter().map(|(word, _)| (*word).clone()).collect()),
+            });
+        }
+        // Sort in bounded chunks so cancellation also interrupts ordering a
+        // large result set. Merge them in score order while building labels.
+        const CHUNK: usize = 256;
+        for chunk in matches.chunks_mut(CHUNK) {
+            if canceled() {
                 return Vec::new();
             }
-            words.push(word.to_string());
+            chunk.sort_unstable_by_key(|(_, score)| *score);
         }
-        words
+        let mut heap = std::collections::BinaryHeap::new();
+        for (chunk, items) in matches.chunks(CHUNK).enumerate() {
+            if let Some((_, score)) = items.first() {
+                heap.push(std::cmp::Reverse((*score, chunk * CHUNK)));
+            }
+        }
+        let mut result = Vec::with_capacity(matches.len());
+        while let Some(std::cmp::Reverse((_, index))) = heap.pop() {
+            if result.len() % 64 == 0 && canceled() {
+                return Vec::new();
+            }
+            result.push(matches[index].0.to_string());
+            let next = index + 1;
+            if next < matches.len() && next % CHUNK != 0 {
+                heap.push(std::cmp::Reverse((matches[next].1, next)));
+            }
+        }
+        result
     }
 
     fn stage_words(
@@ -346,6 +414,7 @@ impl WordIndex {
 
     fn apply_delta(&self, delta: WordDelta) {
         let mut inner = self.inner.write();
+        let mut changed = false;
         for (word, difference) in delta {
             if difference == 0 {
                 continue;
@@ -353,10 +422,14 @@ impl WordIndex {
             let count = (i64::from(*inner.words.get(&word).unwrap_or(&0)) + difference)
                 .clamp(0, u32::MAX as i64) as u32;
             if count == 0 {
-                inner.words.remove(&word);
+                changed |= inner.words.remove(&word).is_some();
             } else {
-                inner.words.insert(word, count);
+                changed |= inner.words.insert(word, count).is_none();
             }
+        }
+        if changed {
+            inner.generation = inner.generation.wrapping_add(1);
+            inner.snapshot.take();
         }
     }
 
@@ -383,6 +456,7 @@ impl WordIndex {
 
     fn clear(&self) {
         self.inner.write().clear();
+        self.candidates.lock().take();
     }
 
     async fn run(self, coordinator: Coordinator, cancel: TaskHandle) {
@@ -726,10 +800,37 @@ mod tests {
     use super::*;
     use quickcheck::{Arbitrary, Gen};
 
+    #[test]
+    fn refined_matches_preserve_unicode_case_rules_and_follow_index_updates() {
+        let index = WordIndex::default();
+        let text = Rope::from_str("alpha alphabet Alpine álphabet beta almanac ALPHA omega");
+        let mut controller = TaskController::new();
+        index.add_document(&text, &controller.restart());
+        for pattern in [
+            "a", "al", "alp", "alpha", "Al", "AlP", "ál", "b", "be", "", "omega",
+        ] {
+            let actual: HashSet<_> = index.matches(pattern).into_iter().collect();
+            let expected: HashSet<_> =
+                helix_core::fuzzy::fuzzy_match(pattern, index.words(), false)
+                    .into_iter()
+                    .map(|(word, _)| word)
+                    .collect();
+            assert_eq!(actual, expected);
+        }
+        index.add_document(&Rope::from_str("alphonse"), &controller.restart());
+        assert!(index.matches("alph").contains(&"alphonse".into()));
+        index.clear();
+        assert!(index.matches("alph").is_empty());
+        assert!(index.candidates.lock().as_ref().unwrap().words.is_empty());
+        let cancel = controller.restart();
+        controller.cancel();
+        assert!(index.matches_cancelable("", &cancel).is_empty());
+    }
+
     impl WordIndex {
         fn words(&self) -> HashSet<String> {
             let inner = self.inner.read();
-            inner.words().map(|w| w.to_string()).collect()
+            inner.words.keys().map(|w| w.to_string()).collect()
         }
 
         /// The full reference-counted word multiset. Unlike [`WordIndex::words`] this keeps the

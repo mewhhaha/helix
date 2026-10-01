@@ -1,5 +1,6 @@
 mod handlers;
 mod query;
+mod row_cache;
 
 use crate::{
     alt,
@@ -365,6 +366,7 @@ pub struct Column<T, D> {
     /// global search) is not used for filtering twice.
     filter: bool,
     hidden: bool,
+    cache_format: bool,
 }
 
 impl<T, D> Column<T, D> {
@@ -374,6 +376,7 @@ impl<T, D> Column<T, D> {
             format,
             filter: true,
             hidden: false,
+            cache_format: false,
         }
     }
 
@@ -386,7 +389,15 @@ impl<T, D> Column<T, D> {
             format,
             filter: false,
             hidden: true,
+            cache_format: true,
         }
+    }
+
+    /// Cache formatting for immutable item/data snapshots. Dynamic formatters
+    /// keep the default and are evaluated before reusing match highlights.
+    pub fn cached(mut self) -> Self {
+        self.cache_format = true;
+        self
     }
 
     pub fn without_filtering(mut self) -> Self {
@@ -427,6 +438,7 @@ pub struct Picker<T: 'static + Send + Sync, D: 'static> {
     show_preview: bool,
     /// Constraints for tabular formatting
     widths: Vec<Constraint>,
+    row_cache: row_cache::RowCache,
 
     callback_fn: PickerCallback<T>,
     default_action: Action,
@@ -564,6 +576,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             default_action: Action::Replace,
             completion_height: 0,
             widths,
+            row_cache: Default::default(),
             preview_cache: PreviewCache::default(),
             preview_path: None,
             preview_version: Arc::new(AtomicUsize::new(0)),
@@ -890,6 +903,12 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
     fn render_picker(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
         let status = self.matcher.tick(10);
         let snapshot = self.matcher.snapshot();
+        self.row_cache.prepare(
+            self.version.load(atomic::Ordering::Relaxed),
+            cx.editor.theme.cache_key(),
+            self.file_fn.is_some(),
+            status.changed,
+        );
         if status.changed {
             self.cursor = self
                 .cursor
@@ -968,77 +987,115 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             let mut widths = self.widths.iter_mut();
             let mut matcher_index = 0;
 
-            Row::new(self.columns.iter().map(|column| {
-                if column.hidden {
-                    return Cell::default();
-                }
-
-                let Some(Constraint::Length(max_width)) = widths.next() else {
-                    unreachable!();
-                };
-                let mut cell = column.format(item.data, &self.editor_data);
-                let width = if column.filter {
-                    snapshot.pattern().column_pattern(matcher_index).indices(
-                        item.matcher_columns[matcher_index].slice(..),
-                        &mut matcher,
-                        &mut indices,
-                    );
-                    indices.sort_unstable();
-                    indices.dedup();
-                    let mut indices = indices.drain(..);
-                    let mut next_highlight_idx = indices.next().unwrap_or(u32::MAX);
-                    let mut span_list = Vec::new();
-                    let mut current_span = String::new();
-                    let mut current_style = Style::default();
-                    let mut grapheme_idx = 0u32;
-                    let mut width = 0;
-
-                    let spans: &[Span] =
-                        cell.content.lines.first().map_or(&[], |it| it.0.as_slice());
-                    for span in spans {
-                        // this looks like a bug on first glance, we are iterating
-                        // graphemes but treating them as char indices. The reason that
-                        // this is correct is that nucleo will only ever consider the first char
-                        // of a grapheme (and discard the rest of the grapheme) so the indices
-                        // returned by nucleo are essentially grapheme indecies
-                        for grapheme in span.content.graphemes(true) {
-                            let style = if grapheme_idx == next_highlight_idx {
-                                next_highlight_idx = indices.next().unwrap_or(u32::MAX);
-                                span.style.patch(highlight_style)
-                            } else {
-                                span.style
-                            };
-                            if style != current_style {
-                                if !current_span.is_empty() {
-                                    span_list.push(Span::styled(current_span, current_style))
-                                }
-                                current_span = String::new();
-                                current_style = style;
-                            }
-                            current_span.push_str(grapheme);
-                            grapheme_idx += 1;
+            let item_id = item.matcher_columns.as_ptr() as usize;
+            Row::new(
+                self.columns
+                    .iter()
+                    .enumerate()
+                    .map(|(column_index, column)| {
+                        if column.hidden {
+                            return Cell::default();
                         }
-                        width += span.width();
-                    }
 
-                    span_list.push(Span::styled(current_span, current_style));
-                    cell = Cell::from(Spans::from(span_list));
-                    matcher_index += 1;
-                    width
-                } else {
-                    cell.content
-                        .lines
-                        .first()
-                        .map(|line| line.width())
-                        .unwrap_or_default()
-                };
+                        let Some(Constraint::Length(max_width)) = widths.next() else {
+                            unreachable!();
+                        };
+                        let cached = column
+                            .cache_format
+                            .then(|| self.row_cache.get(item_id, column_index, None))
+                            .flatten();
+                        if let Some((cell, width)) = cached {
+                            *max_width = (*max_width).max(width.min(u16::MAX as usize) as u16);
+                            if column.filter {
+                                matcher_index += 1;
+                            }
+                            return cell;
+                        }
+                        let source = if column.cache_format {
+                            self.row_cache
+                                .formatted(item_id, column_index)
+                                .unwrap_or_else(|| {
+                                    column.format(item.data, &self.editor_data).into_owned()
+                                })
+                        } else {
+                            column.format(item.data, &self.editor_data).into_owned()
+                        };
+                        if let Some((cell, width)) =
+                            self.row_cache.get(item_id, column_index, Some(&source))
+                        {
+                            *max_width = (*max_width).max(width.min(u16::MAX as usize) as u16);
+                            if column.filter {
+                                matcher_index += 1;
+                            }
+                            return cell;
+                        }
+                        let mut cell = source.clone();
+                        let width = if column.filter {
+                            snapshot.pattern().column_pattern(matcher_index).indices(
+                                item.matcher_columns[matcher_index].slice(..),
+                                &mut matcher,
+                                &mut indices,
+                            );
+                            indices.sort_unstable();
+                            indices.dedup();
+                            let mut indices = indices.drain(..);
+                            let mut next_highlight_idx = indices.next().unwrap_or(u32::MAX);
+                            let mut span_list = Vec::new();
+                            let mut current_span = String::new();
+                            let mut current_style = Style::default();
+                            let mut grapheme_idx = 0u32;
+                            let mut width = 0;
 
-                if width as u16 > *max_width {
-                    *max_width = width as u16;
-                }
+                            let spans: &[Span] =
+                                cell.content.lines.first().map_or(&[], |it| it.0.as_slice());
+                            for span in spans {
+                                // this looks like a bug on first glance, we are iterating
+                                // graphemes but treating them as char indices. The reason that
+                                // this is correct is that nucleo will only ever consider the first char
+                                // of a grapheme (and discard the rest of the grapheme) so the indices
+                                // returned by nucleo are essentially grapheme indecies
+                                for grapheme in span.content.graphemes(true) {
+                                    let style = if grapheme_idx == next_highlight_idx {
+                                        next_highlight_idx = indices.next().unwrap_or(u32::MAX);
+                                        span.style.patch(highlight_style)
+                                    } else {
+                                        span.style
+                                    };
+                                    if style != current_style {
+                                        if !current_span.is_empty() {
+                                            span_list
+                                                .push(Span::styled(current_span, current_style))
+                                        }
+                                        current_span = String::new();
+                                        current_style = style;
+                                    }
+                                    current_span.push_str(grapheme);
+                                    grapheme_idx += 1;
+                                }
+                                width += span.width();
+                            }
 
-                cell
-            }))
+                            span_list.push(Span::styled(current_span, current_style));
+                            cell = Cell::from(Spans::from(span_list));
+                            matcher_index += 1;
+                            width
+                        } else {
+                            cell.content
+                                .lines
+                                .first()
+                                .map(|line| line.width())
+                                .unwrap_or_default()
+                        };
+
+                        if width as u16 > *max_width {
+                            *max_width = width as u16;
+                        }
+
+                        self.row_cache
+                            .insert(item_id, column_index, source, cell.clone(), width);
+                        cell
+                    }),
+            )
         });
 
         let mut table = Table::new(options)
@@ -1449,6 +1506,67 @@ mod preview_cache_tests {
             handlers,
             helix_loader::workspace_trust::WorkspaceTrust::fully_trusted(),
         )
+    }
+
+    #[tokio::test]
+    async fn cached_picker_rows_reuse_formatting_and_refresh_query_highlights() {
+        let mut editor = editor();
+        let formats = Arc::new(AtomicUsize::new(0));
+        let options = || ["alpha", "alphabet", "beta"].map(String::from);
+        let column = || {
+            Column::new("name", |item: &String, formats: &Arc<AtomicUsize>| {
+                formats.fetch_add(1, atomic::Ordering::Relaxed);
+                item.as_str().into()
+            })
+            .cached()
+        };
+        let mut picker = Picker::new([column()], 0, options(), formats.clone(), |_, _, _| {});
+        let mut jobs = crate::job::Jobs::new();
+        let area = Rect::new(0, 0, 80, 24);
+        let mut surface = Surface::empty(area);
+        let mut cx = Context {
+            editor: &mut editor,
+            jobs: &mut jobs,
+            scroll: None,
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while picker.matcher.snapshot().matched_item_count() != 3 {
+            assert!(Instant::now() < deadline);
+            picker.render_picker(area, &mut surface, &mut cx);
+            tokio::task::yield_now().await;
+        }
+        picker.render_picker(area, &mut surface, &mut cx);
+        let before = formats.load(atomic::Ordering::Relaxed);
+        picker.move_by(1, Direction::Forward);
+        picker.render_picker(area, &mut surface, &mut cx);
+        assert_eq!(formats.load(atomic::Ordering::Relaxed), before);
+        picker.prompt.set_line("alp".into(), cx.editor);
+        picker.handle_prompt_change(false);
+        while picker.matcher.snapshot().matched_item_count() != 2 {
+            assert!(Instant::now() < deadline);
+            picker.render_picker(area, &mut surface, &mut cx);
+            tokio::task::yield_now().await;
+        }
+        picker.render_picker(area, &mut surface, &mut cx);
+        assert_eq!(formats.load(atomic::Ordering::Relaxed), before);
+
+        let mut fresh = Picker::new(
+            [column()],
+            0,
+            options(),
+            Arc::new(AtomicUsize::new(0)),
+            |_, _, _| {},
+        );
+        fresh.prompt.set_line("alp".into(), cx.editor);
+        fresh.handle_prompt_change(false);
+        let mut expected = Surface::empty(area);
+        while fresh.matcher.snapshot().matched_item_count() != 2 {
+            assert!(Instant::now() < deadline);
+            fresh.render_picker(area, &mut expected, &mut cx);
+            tokio::task::yield_now().await;
+        }
+        fresh.render_picker(area, &mut expected, &mut cx);
+        assert_eq!(surface, expected);
     }
 
     fn picker(path: &Path) -> (Picker<std::path::PathBuf, ()>, Receiver<PreviewRequest>) {

@@ -1335,7 +1335,7 @@ pub fn compute_inlay_hints_for_all_views(editor: &mut Editor, jobs: &mut crate::
     }
 
     for (view, _) in editor.tree.views() {
-        let doc = match editor.documents.get(&view.doc) {
+        let doc = match editor.documents.get_mut(&view.doc) {
             Some(doc) => doc,
             None => continue,
         };
@@ -1347,7 +1347,7 @@ pub fn compute_inlay_hints_for_all_views(editor: &mut Editor, jobs: &mut crate::
 
 fn compute_inlay_hints_for_view(
     view: &View,
-    doc: &Document,
+    doc: &mut Document,
 ) -> Option<std::pin::Pin<Box<impl Future<Output = Result<crate::job::Callback, anyhow::Error>>>>> {
     let view_id = view.id;
     let doc_id = view.doc;
@@ -1374,15 +1374,10 @@ fn compute_inlay_hints_for_view(
     let new_doc_inlay_hints_id = DocumentInlayHintsId {
         first_line,
         last_line,
+        version: doc.version(),
+        server_id: language_server.id(),
+        length_limit: doc.config.load().lsp.inlay_hints_length_limit,
     };
-    // Don't recompute the annotations in case nothing has changed about the view
-    if !doc.inlay_hints_oudated
-        && doc
-            .inlay_hints(view_id)
-            .is_some_and(|dih| dih.id == new_doc_inlay_hints_id)
-    {
-        return None;
-    }
 
     let doc_slice = doc_text.slice(..);
     let first_char_in_range = doc_slice.line_to_char(first_line);
@@ -1396,11 +1391,32 @@ fn compute_inlay_hints_for_view(
 
     let offset_encoding = language_server.offset_encoding();
 
+    let visible = DocumentInlayHintsId {
+        first_line: first_visible_line,
+        last_line: first_visible_line
+            .saturating_add(view_height)
+            .min(len_lines),
+        ..new_doc_inlay_hints_id
+    };
+    let cancel = doc.request_inlay_hints(view_id, new_doc_inlay_hints_id, visible)?;
+    // Constructing an LSP future enqueues the request immediately. Only do so
+    // after the coverage/pending check, then reborrow the chosen server.
+    let language_server = doc
+        .language_servers_with_feature(LanguageServerFeature::InlayHints)
+        .find(|server| server.id() == new_doc_inlay_hints_id.server_id)?;
+    let request = language_server.text_document_range_inlay_hints(doc.identifier(), range, None)?;
+    let callback_cancel = cancel.clone();
     let callback = super::make_job_callback(
-        language_server.text_document_range_inlay_hints(doc.identifier(), range, None)?,
+        request,
         move |editor, _compositor, response: Option<Vec<lsp::InlayHint>>| {
             // The config was modified or the window was closed while the request was in flight
-            if !editor.config().lsp.display_inlay_hints || editor.tree.try_get(view_id).is_none() {
+            if callback_cancel.is_canceled()
+                || !editor.config().lsp.display_inlay_hints
+                || editor
+                    .tree
+                    .try_get(view_id)
+                    .is_none_or(|view| view.doc != doc_id)
+            {
                 return;
             }
 
@@ -1410,6 +1426,29 @@ fn compute_inlay_hints_for_view(
                 None => return,
             };
 
+            if doc.version() != new_doc_inlay_hints_id.version
+                || doc.config.load().lsp.inlay_hints_length_limit
+                    != new_doc_inlay_hints_id.length_limit
+                || !doc.supports_language_server(new_doc_inlay_hints_id.server_id)
+            {
+                return;
+            }
+
+            let view = editor.tree.get(view_id);
+            let first_line = doc
+                .text()
+                .char_to_line(doc.view_offset(view_id).anchor.min(doc.text().len_chars()));
+            let visible = DocumentInlayHintsId {
+                first_line,
+                last_line: first_line
+                    .saturating_add(view.inner_height())
+                    .min(doc.text().len_lines()),
+                ..new_doc_inlay_hints_id
+            };
+            if !new_doc_inlay_hints_id.covers(&visible) {
+                return;
+            }
+
             // If we have neither hints nor an LSP, empty the inlay hints since they're now oudated
             let mut hints = match response {
                 Some(hints) if !hints.is_empty() => hints,
@@ -1418,7 +1457,6 @@ fn compute_inlay_hints_for_view(
                         view_id,
                         DocumentInlayHints::empty_with_id(new_doc_inlay_hints_id),
                     );
-                    doc.inlay_hints_oudated = false;
                     return;
                 }
             };
@@ -1510,9 +1548,12 @@ fn compute_inlay_hints_for_view(
                     layout_keys: None,
                 },
             );
-            doc.inlay_hints_oudated = false;
         },
     );
 
-    Some(callback)
+    Some(Box::pin(async move {
+        helix_event::cancelable_future(callback, &cancel)
+            .await
+            .unwrap_or_else(|| Ok(Callback::EditorCompositor(Box::new(|_, _| {}))))
+    }))
 }

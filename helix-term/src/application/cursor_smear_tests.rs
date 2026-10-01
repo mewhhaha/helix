@@ -95,7 +95,10 @@ async fn pixel_frames_preserve_text_redraw_requests_and_settle_without_a_timer(
 
     helix_event::request_redraw();
     app.editor.needs_redraw = true;
-    app.paint_cursor_smear(tokio::time::Instant::now() + Duration::from_millis(30));
+    app.paint_cursor_smear(
+        tokio::time::Instant::now() + Duration::from_millis(30),
+        app.terminal.backend().window_metrics().unwrap(),
+    );
     assert!(app.editor.needs_redraw);
     tokio::time::timeout(Duration::from_millis(50), helix_event::redraw_requested()).await?;
     assert_eq!(app.terminal.backend().buffer().content, baseline.content);
@@ -109,7 +112,10 @@ async fn pixel_frames_preserve_text_redraw_requests_and_settle_without_a_timer(
     assert_eq!(doc.text(), &document);
     assert_eq!(doc.selection(view.id), &selection);
 
-    app.paint_cursor_smear(tokio::time::Instant::now() + Duration::from_secs(2));
+    app.paint_cursor_smear(
+        tokio::time::Instant::now() + Duration::from_secs(2),
+        app.terminal.backend().window_metrics().unwrap(),
+    );
     assert_eq!(app.terminal.backend().buffer().content, baseline.content);
     assert!(app.cursor_smear_frame.is_none(), "idle cursor has no timer");
     let image = app.terminal.backend().cursor_image().unwrap();
@@ -265,7 +271,10 @@ async fn graphics_cursor_follows_mode_shapes_wide_graphemes_and_eof() -> anyhow:
     let mut app = application(120, true).await?;
     replace_text(&mut app, "a界e\u{301}\n", Selection::point(1));
     app.render().await;
-    app.paint_cursor_smear(tokio::time::Instant::now() + Duration::from_secs(2));
+    app.paint_cursor_smear(
+        tokio::time::Instant::now() + Duration::from_secs(2),
+        app.terminal.backend().window_metrics().unwrap(),
+    );
     for mode in [Mode::Normal, Mode::Insert, Mode::Select] {
         app.editor.mode = mode;
         app.render().await;
@@ -295,7 +304,10 @@ async fn graphics_cursor_follows_mode_shapes_wide_graphemes_and_eof() -> anyhow:
     let eof = current_ref!(app.editor).1.text().len_chars();
     set_selection(&mut app, Selection::point(eof));
     app.render().await;
-    app.paint_cursor_smear(tokio::time::Instant::now() + Duration::from_secs(2));
+    app.paint_cursor_smear(
+        tokio::time::Instant::now() + Duration::from_secs(2),
+        app.terminal.backend().window_metrics().unwrap(),
+    );
     let image = app.terminal.backend().cursor_image().unwrap();
     assert_eq!((image.width, image.height), (8, 16));
     assert_eq!(
@@ -432,6 +444,75 @@ async fn press_keys(app: &mut Application, keys: &str) -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn queued_keys_preserve_commands_and_reduce_redraws() -> anyhow::Result<()> {
+    use futures_util::StreamExt;
+    for keys in ["iabc<esc>hhx", "gwao", &"l".repeat(160)] {
+        let text = "origin word word word word word word word word word word word word word word word word\n";
+        let mut single = application(0, false).await?;
+        replace_text(&mut single, text, Selection::point(0));
+        let before = single.terminal.backend().draw_calls();
+        for key in helix_view::input::parse_macro(keys)? {
+            single
+                .handle_terminal_events(Ok(TerminalEvent::Key(key.into())))
+                .await;
+            tokio::task::yield_now().await;
+        }
+        let draws = single.terminal.backend().draw_calls() - before;
+        let (view, doc) = current_ref!(single.editor);
+        let expected_text = doc.text().clone();
+        let expected_selection = doc.selection(view.id).clone();
+        assert!(single.close().await.is_empty());
+        drop(single);
+
+        let mut batched = application(0, false).await?;
+        replace_text(&mut batched, text, Selection::point(0));
+        let events = helix_view::input::parse_macro(keys)?
+            .into_iter()
+            .map(|key| Ok(TerminalEvent::Key(key.into())))
+            .collect::<Vec<_>>();
+        let mut input = futures_util::stream::iter(events);
+        let before = batched.terminal.backend().draw_calls();
+        while let Some(first) = input.next().await {
+            batched.handle_terminal_event_batch(first, &mut input).await;
+        }
+        let (view, doc) = current_ref!(batched.editor);
+        assert_eq!(&expected_text, doc.text(), "{keys}");
+        assert_eq!(&expected_selection, doc.selection(view.id), "{keys}");
+        assert!(
+            batched.terminal.backend().draw_calls() - before < draws,
+            "{keys}"
+        );
+        assert!(batched.close().await.is_empty());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn cursor_frames_measure_geometry_once_and_observe_font_changes() -> anyhow::Result<()> {
+    let mut app = moving_cursor(1000).await?;
+    let before = app.terminal.backend().metrics_queries();
+    app.render().await;
+    assert_eq!(app.terminal.backend().metrics_queries() - before, 1);
+    let before = app.terminal.backend().metrics_queries();
+    app.render_cursor_smear().await;
+    assert_eq!(app.terminal.backend().metrics_queries() - before, 1);
+    app.terminal
+        .backend_mut()
+        .set_cursor_graphics_cell_size(Some(CellSize {
+            width: 10,
+            height: 20,
+        }));
+    app.render_cursor_smear().await;
+    assert_eq!(
+        app.cursor_smear_frame.as_ref().map(|frame| frame.cell_size),
+        None
+    );
+    assert!(app.terminal.backend().cursor_image().is_some());
+    assert!(app.close().await.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
 async fn word_label_jumps_animate_near_and_far_with_automatic_help_enabled() -> anyhow::Result<()> {
     for (label, word_index) in [("aa", 0), ("ao", 14)] {
         let mut app = application(120, true).await?;
@@ -474,7 +555,10 @@ async fn word_label_jumps_animate_near_and_far_with_automatic_help_enabled() -> 
         assert!(app.cursor_smear_frame.is_some(), "gw{label} must animate");
         assert!(app.terminal.backend().cursor_image().is_some());
         assert!(!app.terminal.backend().cursor_visible());
-        app.paint_cursor_smear(tokio::time::Instant::now() + Duration::from_secs(2));
+        app.paint_cursor_smear(
+            tokio::time::Instant::now() + Duration::from_secs(2),
+            app.terminal.backend().window_metrics().unwrap(),
+        );
         assert!(app.cursor_smear_frame.is_none());
         let image = app.terminal.backend().cursor_image().unwrap();
         assert_eq!(
@@ -489,7 +573,10 @@ async fn word_label_jumps_animate_near_and_far_with_automatic_help_enabled() -> 
 #[tokio::test]
 async fn direct_goto_keeps_its_origin_across_automatic_help() -> anyhow::Result<()> {
     let mut app = moving_cursor(120).await?;
-    app.paint_cursor_smear(tokio::time::Instant::now() + Duration::from_secs(2));
+    app.paint_cursor_smear(
+        tokio::time::Instant::now() + Duration::from_secs(2),
+        app.terminal.backend().window_metrics().unwrap(),
+    );
     let origin = app.terminal.backend().cursor_position();
     press_keys(&mut app, "g").await?;
     assert!(app.editor.autoinfo.is_some());
@@ -540,7 +627,10 @@ async fn word_label_jump_that_scrolls_still_animates_to_the_new_cursor() -> anyh
     );
     assert!(app.terminal.backend().cursor_image().is_some());
     let destination = app.terminal.backend().cursor_position();
-    app.paint_cursor_smear(tokio::time::Instant::now() + Duration::from_secs(2));
+    app.paint_cursor_smear(
+        tokio::time::Instant::now() + Duration::from_secs(2),
+        app.terminal.backend().window_metrics().unwrap(),
+    );
     assert!(app.cursor_smear_frame.is_none());
     let image = app.terminal.backend().cursor_image().unwrap();
     assert_eq!(

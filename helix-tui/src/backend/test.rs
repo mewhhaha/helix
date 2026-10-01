@@ -1,5 +1,5 @@
 use crate::{
-    backend::{Backend, CellSize, CursorImage},
+    backend::{Backend, CellSize, CursorImage, WindowMetrics},
     buffer::{Buffer, Cell},
     terminal::Config,
 };
@@ -23,6 +23,7 @@ pub struct TestBackend {
     synchronized: bool,
     graphics_frames_synchronized: bool,
     draw_calls: usize,
+    metrics_queries: std::cell::Cell<usize>,
 }
 
 /// The last pixel cursor placement, kept separately from the text-cell buffer.
@@ -80,11 +81,16 @@ impl TestBackend {
             synchronized: false,
             graphics_frames_synchronized: true,
             draw_calls: 0,
+            metrics_queries: std::cell::Cell::new(0),
         }
     }
 
     pub fn buffer(&self) -> &Buffer {
         &self.buffer
+    }
+
+    pub fn metrics_queries(&self) -> usize {
+        self.metrics_queries.get()
     }
 
     pub fn set_cursor_graphics_cell_size(&mut self, size: Option<CellSize>) {
@@ -227,6 +233,14 @@ impl Backend for TestBackend {
 
     fn size(&self) -> Result<Rect, io::Error> {
         Ok(Rect::new(0, 0, self.width, self.height))
+    }
+
+    fn window_metrics(&self) -> io::Result<WindowMetrics> {
+        self.metrics_queries.set(self.metrics_queries.get() + 1);
+        Ok(WindowMetrics {
+            area: Rect::new(0, 0, self.width, self.height),
+            cell_size: self.cursor_graphics_cell_size,
+        })
     }
 
     fn flush(&mut self) -> Result<(), io::Error> {

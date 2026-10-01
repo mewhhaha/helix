@@ -2,7 +2,7 @@
 //! Frontend for [Backend]
 
 use crate::{
-    backend::{Backend, CursorImage},
+    backend::{Backend, CursorImage, WindowMetrics},
     buffer::Buffer,
 };
 use helix_view::editor::{Config as EditorConfig, KittyKeyboardProtocolConfig};
@@ -180,11 +180,18 @@ where
 
     /// Queries the backend for size and resizes if it doesn't match the previous size.
     pub fn autoresize(&mut self) -> io::Result<Rect> {
-        let size = self.size();
-        if size != self.viewport.area {
-            self.resize(size)?;
-        };
-        Ok(size)
+        Ok(self.autoresize_with_metrics()?.area)
+    }
+
+    pub fn autoresize_with_metrics(&mut self) -> io::Result<WindowMetrics> {
+        let metrics = self.backend.window_metrics().unwrap_or(WindowMetrics {
+            area: DEFAULT_TERMINAL_SIZE,
+            cell_size: None,
+        });
+        if metrics.area != self.viewport.area {
+            self.resize(metrics.area)?;
+        }
+        Ok(metrics)
     }
 
     /// Synchronizes terminal size, calls the rendering closure, flushes the current internal state
@@ -204,21 +211,30 @@ where
         cursor_kind: CursorKind,
         image: Option<&CursorImage<'_>>,
     ) -> io::Result<()> {
-        // // Autoresize - otherwise we get glitches if shrinking or potential desync between widgets
-        // // and the terminal (if growing), which may OOB.
-        // self.autoresize()?;
+        let metrics = if image.is_some() {
+            self.backend.window_metrics()?
+        } else {
+            WindowMetrics {
+                area: self.viewport.area,
+                cell_size: None,
+            }
+        };
+        self.draw_with_cursor_graphics_and_metrics(cursor_position, cursor_kind, image, metrics)
+    }
 
-        // let mut frame = self.get_frame();
-        // f(&mut frame);
-        // // We can't change the cursor position right away because we have to flush the frame to
-        // // stdout first. But we also can't keep the frame around, since it holds a &mut to
-        // // Terminal. Thus, we're taking the important data out of the Frame and dropping it.
-        // let cursor_position = frame.cursor_position;
-
+    pub fn draw_with_cursor_graphics_and_metrics(
+        &mut self,
+        cursor_position: Option<(u16, u16)>,
+        cursor_kind: CursorKind,
+        image: Option<&CursorImage<'_>>,
+        metrics: WindowMetrics,
+    ) -> io::Result<()> {
         // One synchronized frame for the whole draw
         self.synchronized(|terminal| {
             terminal.flush()?;
-            terminal.backend.draw_cursor_graphics(image)?;
+            terminal
+                .backend
+                .draw_cursor_graphics_with_metrics(image, metrics)?;
             if let Some((x, y)) = cursor_position {
                 terminal.set_cursor(x, y)?;
             }
@@ -237,7 +253,27 @@ where
 
     /// Presents an animation frame without diffing or swapping the text buffers.
     pub fn draw_cursor_graphics(&mut self, image: Option<&CursorImage<'_>>) -> io::Result<()> {
-        self.synchronized(|terminal| terminal.backend.draw_cursor_graphics(image))
+        let metrics = if image.is_some() {
+            self.backend.window_metrics()?
+        } else {
+            WindowMetrics {
+                area: self.viewport.area,
+                cell_size: None,
+            }
+        };
+        self.draw_cursor_graphics_with_metrics(image, metrics)
+    }
+
+    pub fn draw_cursor_graphics_with_metrics(
+        &mut self,
+        image: Option<&CursorImage<'_>>,
+        metrics: WindowMetrics,
+    ) -> io::Result<()> {
+        self.synchronized(|terminal| {
+            terminal
+                .backend
+                .draw_cursor_graphics_with_metrics(image, metrics)
+        })
     }
 
     fn synchronized(&mut self, draw: impl FnOnce(&mut Self) -> io::Result<()>) -> io::Result<()> {

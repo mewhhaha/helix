@@ -1,3 +1,5 @@
+mod render_cache;
+
 use crate::{
     commands::{self, OnKeyCallback, OnKeyCallbackKind},
     compositor::{Component, Context, Event, EventResult},
@@ -46,6 +48,7 @@ pub struct EditorView {
     terminal_focused: bool,
     /// The primary cursor is drawn by the terminal graphics layer.
     graphics_cursor: bool,
+    render_cache: std::cell::RefCell<render_cache::ViewRenderCache>,
 }
 
 #[derive(Debug, Clone)]
@@ -70,6 +73,7 @@ impl EditorView {
             spinners: ProgressSpinners::default(),
             terminal_focused: true,
             graphics_cursor: false,
+            render_cache: Default::default(),
         }
     }
 
@@ -103,6 +107,35 @@ impl EditorView {
         let view_offset = doc.view_offset(view.id);
 
         let text_annotations = view.text_annotations(doc, Some(theme));
+        let key = render_cache::RenderKey::new(
+            self,
+            editor,
+            doc,
+            view,
+            viewport,
+            is_focused,
+            &text_annotations,
+        );
+        let body_area = view
+            .area
+            .with_width(
+                view.area
+                    .width
+                    .saturating_add(u16::from(viewport.right() != view.area.right())),
+            )
+            .intersection(surface.area);
+        if let Some(key) = &key {
+            if self.render_cache.borrow_mut().restore(
+                view.id,
+                key,
+                surface,
+                &editor.cursor_cache,
+                is_focused,
+            ) {
+                self.render_statusline(editor, doc, view, surface, is_focused);
+                return;
+            }
+        }
         let mut decorations = DecorationManager::default();
 
         if is_focused && config.cursorline {
@@ -150,7 +183,9 @@ impl EditorView {
             }
         }
 
-        if let Some(overlay) = Self::doc_document_link_highlights(doc, theme) {
+        if let Some(overlay) =
+            Self::doc_document_link_highlights(doc, view_offset.anchor, inner.height, theme)
+        {
             overlays.push(overlay);
         }
 
@@ -258,6 +293,25 @@ impl EditorView {
             Self::render_diagnostics(doc, view, inner, surface, theme);
         }
 
+        if let Some(key) = key {
+            let cursor = is_focused
+                .then(|| editor.cursor_cache.get(view, doc))
+                .flatten();
+            self.render_cache
+                .borrow_mut()
+                .store(view.id, key, surface, body_area, cursor);
+        }
+        self.render_statusline(editor, doc, view, surface, is_focused);
+    }
+
+    fn render_statusline(
+        &self,
+        editor: &Editor,
+        doc: &Document,
+        view: &View,
+        surface: &mut Surface,
+        is_focused: bool,
+    ) {
         let statusline_area = view
             .area
             .clip_top(view.area.height.saturating_sub(1))
@@ -379,13 +433,9 @@ impl EditorView {
         let text = doc.text().slice(..);
         let row = text.char_to_line(anchor.min(text.len_chars()));
         let visible_range = Self::viewport_byte_range(text, row, height);
-        let start = syntax::child_for_byte_range(
-            &syntax.tree().root_node(),
-            visible_range.start as u32..visible_range.end as u32,
-        )
-        .map_or(visible_range.start as u32, |node| node.start_byte());
-        let range = start..visible_range.end as u32;
-
+        // Tree-sitter emits enclosing scope captures even when their start is
+        // outside this range, so nesting colors need no scan of the prefix.
+        let range = visible_range.start as u32..visible_range.end as u32;
         Some(syntax.rainbow_highlights(text, theme.rainbow_length(), loader, range))
     }
 
@@ -442,53 +492,42 @@ impl EditorView {
         view: &View,
         theme: &Theme,
     ) -> Option<OverlayHighlights> {
-        let ranges = doc.document_highlights(view.id)?;
-        if ranges.is_empty() {
-            return None;
-        }
-
+        let ranges = doc.document_highlight_ranges(view.id)?.clone();
         let highlight = theme
             .find_highlight_exact("ui.highlight")
             .or_else(|| theme.find_highlight_exact("ui.selection"))
             .or_else(|| theme.find_highlight_exact("ui.cursor"))?;
-
-        Some(OverlayHighlights::Homogeneous {
-            highlight,
-            ranges: ranges.to_vec(),
-        })
+        let visible = Self::viewport_char_range(
+            doc,
+            doc.view_offset(view.id).anchor,
+            view.inner_area(doc).height,
+        );
+        let overlay = OverlayHighlights::shared_homogeneous(highlight, ranges, visible);
+        (!overlay.is_empty()).then_some(overlay)
     }
 
     pub fn doc_document_link_highlights(
         doc: &Document,
+        anchor: usize,
+        height: u16,
         theme: &Theme,
     ) -> Option<OverlayHighlights> {
         let highlight = theme
             .find_highlight_exact("markup.link.url")
             .or_else(|| theme.find_highlight_exact("markup.link"))?;
+        let overlay = OverlayHighlights::shared_homogeneous(
+            highlight,
+            doc.document_link_ranges().clone(),
+            Self::viewport_char_range(doc, anchor, height),
+        );
+        (!overlay.is_empty()).then_some(overlay)
+    }
 
-        if doc.document_links.is_empty() {
-            return None;
-        }
-
-        let mut ranges: Vec<ops::Range<usize>> = Vec::new();
-        for link in &doc.document_links {
-            if link.start >= link.end {
-                continue;
-            }
-
-            match ranges.last_mut() {
-                Some(existing_range) if link.start <= existing_range.end => {
-                    existing_range.end = existing_range.end.max(link.end);
-                }
-                _ => ranges.push(link.start..link.end),
-            }
-        }
-
-        if ranges.is_empty() {
-            return None;
-        }
-
-        Some(OverlayHighlights::Homogeneous { highlight, ranges })
+    fn viewport_char_range(doc: &Document, anchor: usize, height: u16) -> ops::Range<usize> {
+        let text = doc.text().slice(..);
+        let row = text.char_to_line(anchor.min(text.len_chars()));
+        let bytes = Self::viewport_byte_range(text, row, height);
+        text.byte_to_char(bytes.start)..text.byte_to_char(bytes.end)
     }
 
     fn visible_selection_indices(doc: &Document, view: &View) -> std::ops::Range<usize> {
@@ -1623,6 +1662,9 @@ impl Component for EditorView {
             Self::render_bufferline(cx.editor, area.with_height(1), surface);
         }
 
+        self.render_cache
+            .borrow_mut()
+            .retain(|id| cx.editor.tree.try_get(id).is_some());
         for (view, is_focused) in cx.editor.tree.views() {
             let doc = cx.editor.document(view.doc).unwrap();
             self.render_view(cx.editor, doc, view, area, surface, is_focused);

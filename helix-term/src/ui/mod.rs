@@ -228,9 +228,8 @@ pub fn file_picker(editor: &Editor, root: PathBuf) -> FilePicker {
         directory_style: editor.theme.get("ui.text.directory"),
     };
 
-    let columns = [PickerColumn::new(
-        "path",
-        |item: &PathBuf, data: &FilePickerData| {
+    let columns = [
+        PickerColumn::new("path", |item: &PathBuf, data: &FilePickerData| {
             let path = item.strip_prefix(&data.root).unwrap_or(item);
             let mut spans = Vec::with_capacity(3);
             if let Some(dirs) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -245,8 +244,9 @@ pub fn file_picker(editor: &Editor, root: PathBuf) -> FilePicker {
                 .to_string_lossy();
             spans.push(Span::raw(filename));
             Spans::from(spans).into()
-        },
-    )];
+        })
+        .cached(),
+    ];
     let picker = Picker::new(columns, 0, [], data, move |cx, path: &PathBuf, action| {
         if let Err(e) = cx.editor.open(path, action) {
             let err = if let Some(err) = e.source() {
@@ -315,7 +315,8 @@ pub fn file_explorer(root: PathBuf, editor: &Editor) -> Result<FileExplorer, std
                 name.into()
             }
         },
-    )];
+    )
+    .cached()];
     let picker = Picker::new(
         columns,
         0,

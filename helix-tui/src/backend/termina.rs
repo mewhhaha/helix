@@ -24,7 +24,7 @@ use termina::{
 
 use crate::{buffer::Cell, terminal::Config};
 
-use super::{kitty, Backend, CellSize, CursorImage};
+use super::{kitty, Backend, CellSize, CursorImage, WindowMetrics};
 
 fn supports_cursor_graphics(term: Option<&str>, program: Option<&str>, multiplexed: bool) -> bool {
     !multiplexed
@@ -662,14 +662,36 @@ impl Backend for TerminaBackend {
     }
 
     fn cursor_graphics_cell_size(&self) -> Option<CellSize> {
-        if !self.config.cursor_graphics || !self.capabilities.cursor_graphics {
-            return None;
-        }
-        let size = self.terminal.get_dimensions().ok()?;
-        cell_size(size)
+        self.window_metrics().ok()?.cell_size
+    }
+
+    fn window_metrics(&self) -> io::Result<WindowMetrics> {
+        let size = self.terminal.get_dimensions()?;
+        Ok(WindowMetrics {
+            area: Rect::new(0, 0, size.cols, size.rows),
+            cell_size: (self.config.cursor_graphics && self.capabilities.cursor_graphics)
+                .then(|| cell_size(size))
+                .flatten(),
+        })
     }
 
     fn draw_cursor_graphics(&mut self, image: Option<&CursorImage<'_>>) -> io::Result<()> {
+        let metrics = if image.is_some() {
+            self.window_metrics()?
+        } else {
+            WindowMetrics {
+                area: Rect::default(),
+                cell_size: None,
+            }
+        };
+        self.draw_cursor_graphics_with_metrics(image, metrics)
+    }
+
+    fn draw_cursor_graphics_with_metrics(
+        &mut self,
+        image: Option<&CursorImage<'_>>,
+        metrics: WindowMetrics,
+    ) -> io::Result<()> {
         let Some(image) = image else {
             if self.cursor_image_active.load(Ordering::Relaxed) {
                 kitty::delete_image(&mut self.terminal, self.cursor_image_id)?;
@@ -677,10 +699,10 @@ impl Backend for TerminaBackend {
             }
             return Ok(());
         };
-        let Some(size) = self.cursor_graphics_cell_size() else {
+        let Some(size) = metrics.cell_size else {
             return self.draw_cursor_graphics(None);
         };
-        let area = self.size()?;
+        let area = metrics.area;
         if image.position.row >= usize::from(area.height)
             || image.position.col >= usize::from(area.width)
             || image.offset_x >= size.width

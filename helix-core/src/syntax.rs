@@ -1,5 +1,6 @@
 pub mod config;
 mod display;
+mod rainbow;
 mod textobject_cache;
 pub use display::DisplayHighlighter;
 
@@ -518,6 +519,7 @@ pub struct Syntax {
     inner: tree_house::Syntax,
     display_cache: parking_lot::Mutex<display::DisplayCache>,
     textobject_cache: parking_lot::Mutex<textobject_cache::TextObjectCache>,
+    rainbow_cache: parking_lot::Mutex<rainbow::RainbowCache>,
 }
 
 const PARSE_TIMEOUT: Duration = Duration::from_millis(500); // half a second is pretty generous
@@ -529,6 +531,7 @@ impl Syntax {
             inner,
             display_cache: Default::default(),
             textobject_cache: Default::default(),
+            rainbow_cache: Default::default(),
         })
     }
 
@@ -545,6 +548,7 @@ impl Syntax {
         } else {
             self.display_cache.get_mut().clear();
             self.textobject_cache.get_mut().clear();
+            self.rainbow_cache.get_mut().clear();
             self.inner.update(source, PARSE_TIMEOUT, &edits, loader)
         }
     }
@@ -694,13 +698,13 @@ impl Syntax {
         )
     }
 
-    pub fn rainbow_highlights(
+    fn rainbow_highlights_uncached(
         &self,
         source: RopeSlice,
         rainbow_length: usize,
         loader: &Loader,
-        range: impl RangeBounds<u32>,
-    ) -> OverlayHighlights {
+        range: ops::Range<u32>,
+    ) -> Vec<(Highlight, ops::Range<usize>)> {
         struct RainbowScope<'tree> {
             end: u32,
             node: Option<Node<'tree>>,
@@ -764,7 +768,7 @@ impl Syntax {
             }
         }
 
-        OverlayHighlights::Heterogenous { highlights }
+        highlights
     }
 }
 

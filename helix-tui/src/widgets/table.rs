@@ -35,6 +35,28 @@ pub struct Cell<'a> {
 }
 
 impl Cell<'_> {
+    pub fn into_owned(self) -> Cell<'static> {
+        let lines = self
+            .content
+            .lines
+            .into_iter()
+            .map(|line| {
+                crate::text::Spans(
+                    line.0
+                        .into_iter()
+                        .map(|span| {
+                            crate::text::Span::styled(span.content.into_owned(), span.style)
+                        })
+                        .collect(),
+                )
+            })
+            .collect::<Vec<_>>();
+        Cell {
+            content: Text::from(lines),
+            style: self.style,
+        }
+    }
+
     /// Set the `Style` of this cell.
     pub fn style(mut self, style: Style) -> Self {
         self.set_style(style);
