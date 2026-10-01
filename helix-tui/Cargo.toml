@@ -26,6 +26,9 @@ termina = { workspace = true, optional = true }
 termini = "1.0"
 once_cell = "1.21"
 log = "~0.4"
+zlib-rs = "0.6.3"
+
+[dev-dependencies]
 miniz_oxide = "0.8"
 
 [target.'cfg(windows)'.dependencies]

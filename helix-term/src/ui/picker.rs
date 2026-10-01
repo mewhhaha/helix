@@ -469,7 +469,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         let matcher = Nucleo::new(
             Config::DEFAULT,
             Arc::new(helix_event::redraw_callback()),
-            None,
+            Some(helix_stdx::cpu::auxiliary_worker_count()),
             matcher_columns,
         );
         let streamer = Injector {
@@ -504,7 +504,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         let matcher = Nucleo::new(
             Config::DEFAULT,
             Arc::new(helix_event::redraw_callback()),
-            None,
+            Some(helix_stdx::cpu::auxiliary_worker_count()),
             matcher_columns,
         );
         let injector = matcher.injector();

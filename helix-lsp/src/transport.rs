@@ -8,6 +8,7 @@ use helix_core::Rope;
 use log::{error, info};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -45,7 +46,7 @@ pub enum Payload {
 
 #[derive(Debug)]
 pub struct PendingRequest {
-    response: Sender<Result<Value>>,
+    response: Sender<Result<jsonrpc::ResponseValue>>,
     canceled: Arc<AtomicBool>,
 }
 
@@ -55,7 +56,7 @@ pub struct FullDocumentChange {
     text: Rope,
 }
 
-type PendingRequests = Arc<Mutex<HashMap<jsonrpc::Id, Sender<Result<Value>>>>>;
+type PendingRequests = Arc<Mutex<HashMap<jsonrpc::Id, Sender<Result<jsonrpc::ResponseValue>>>>>;
 type QueuedRequest = Arc<Mutex<Option<jsonrpc::MethodCall>>>;
 type CoalescedChanges = HashMap<lsp::Url, std::sync::Weak<Mutex<Option<FullDocumentChange>>>>;
 
@@ -133,7 +134,7 @@ impl OutboundSender {
     pub fn request(
         &self,
         value: jsonrpc::MethodCall,
-    ) -> Result<(Receiver<Result<Value>>, RequestGuard)> {
+    ) -> Result<(Receiver<Result<jsonrpc::ResponseValue>>, RequestGuard)> {
         let id = value.id.clone();
         let queued = Arc::new(Mutex::new(Some(value)));
         let (response, receiver) = channel(1);
@@ -264,6 +265,84 @@ enum ServerMessage {
     Call(jsonrpc::Call),
 }
 
+/// Inspect the envelope once; untagged deserialization otherwise builds a DOM
+/// and retries its payload for every response/request variant.
+#[derive(Deserialize)]
+struct Envelope<'a> {
+    jsonrpc: Option<jsonrpc::Version>,
+    method: Option<String>,
+    #[serde(default, deserialize_with = "present")]
+    id: Option<jsonrpc::Id>,
+    #[serde(default, borrow, deserialize_with = "present")]
+    params: Option<sonic_rs::LazyValue<'a>>,
+    #[serde(default, borrow, deserialize_with = "present")]
+    result: Option<sonic_rs::LazyValue<'a>>,
+    error: Option<jsonrpc::Error>,
+}
+
+// JSON null is a present ID/result, unlike an omitted field.
+fn present<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
+fn decode_server_message(content: &[u8]) -> Result<ServerMessage> {
+    let envelope: Envelope<'_> = match sonic_rs::from_slice(content) {
+        Ok(envelope) => envelope,
+        // Preserve the permissive invalid-request/id salvage behavior for
+        // malformed envelopes and nonconforming servers.
+        Err(_) => return sonic_rs::from_slice(content).map_err(Into::into),
+    };
+    if let Some(id) = envelope.id.clone() {
+        if let Some(error) = envelope.error {
+            return Ok(ServerMessage::Output(jsonrpc::Output::Failure(
+                jsonrpc::Failure {
+                    jsonrpc: envelope.jsonrpc,
+                    id,
+                    error,
+                },
+            )));
+        }
+        if let Some(result) = envelope.result {
+            return Ok(ServerMessage::Output(jsonrpc::Output::Success(
+                jsonrpc::Success {
+                    jsonrpc: envelope.jsonrpc,
+                    id,
+                    result: jsonrpc::ResponseValue::Raw(jsonrpc::RawJson::new(
+                        result.as_raw_str(),
+                    )?),
+                },
+            )));
+        }
+    }
+    let Some(method) = envelope.method else {
+        return sonic_rs::from_slice(content).map_err(Into::into);
+    };
+    let params = match envelope.params.as_ref().map(|params| params.as_raw_str()) {
+        None | Some("null") => jsonrpc::Params::None,
+        Some(raw) if matches!(raw.as_bytes().first(), Some(b'{' | b'[')) => {
+            jsonrpc::Params::Raw(jsonrpc::RawJson::new(raw)?)
+        }
+        _ => return sonic_rs::from_slice(content).map_err(Into::into),
+    };
+    Ok(ServerMessage::Call(match envelope.id {
+        Some(id) => jsonrpc::Call::MethodCall(jsonrpc::MethodCall {
+            jsonrpc: envelope.jsonrpc,
+            id,
+            method,
+            params,
+        }),
+        None => jsonrpc::Call::Notification(jsonrpc::Notification {
+            jsonrpc: envelope.jsonrpc,
+            method,
+            params,
+        }),
+    }))
+}
+
 #[derive(Debug)]
 pub struct Transport {
     id: LanguageServerId,
@@ -383,7 +462,7 @@ impl Transport {
         // NOTE: We avoid using `?` here, since it would return early on error
         // and skip clearing `content`. By returning the result directly instead,
         // we ensure `content.clear()` is always called.
-        let output = sonic_rs::from_slice(content).map_err(Into::into);
+        let output = decode_server_message(content);
 
         content.clear();
 
@@ -526,7 +605,7 @@ impl Transport {
                         jsonrpc::Success {
                             jsonrpc: Some(jsonrpc::Version::V2),
                             id: method_call.id.clone(),
-                            result: serde_json::Value::Null,
+                            result: serde_json::Value::Null.into(),
                         },
                     )));
             }
@@ -909,7 +988,7 @@ mod tests {
             let response = serde_json::to_vec(&jsonrpc::Output::Success(jsonrpc::Success {
                 jsonrpc: Some(jsonrpc::Version::V2),
                 id: jsonrpc::Id::Num(id),
-                result,
+                result: result.into(),
             }))
             .unwrap();
             let header = format!("Content-Length: {}\r\n\r\n", response.len());
@@ -956,7 +1035,7 @@ mod tests {
                 jsonrpc::Success {
                     jsonrpc: Some(jsonrpc::Version::V2),
                     id: jsonrpc::Id::Num(id),
-                    result: Value::Null,
+                    result: Value::Null.into(),
                 },
             )))
             .unwrap();
@@ -979,6 +1058,58 @@ mod tests {
         assert!(
             matches!(message, ServerMessage::Output(jsonrpc::Output::Success(response))
             if response.id == jsonrpc::Id::Num(expected))
+        );
+    }
+
+    #[test]
+    fn raw_envelopes_preserve_jsonrpc_compatibility_and_error_precedence() {
+        for input in [
+            r#"{"jsonrpc":"2.0","id":1,"result":null,"extra":true}"#,
+            r#"{"id":4.0,"result":[{"label":"résumé","data":[1,2]}]}"#,
+            r#"{"id":null,"method":"request","params":{"value":3}}"#,
+            r#"{"method":"notify","params":[1,2],"traceparent":"ignored"}"#,
+            r#"{"method":"notify","params":null}"#,
+            r#"{"id":3,"result":42,"error":{"code":-32603,"message":"failure"}}"#,
+            r#"{"id":3,"result":42,"error":null}"#,
+            r#"{"id":"salvage","method":4}"#,
+            r#"{"id":3,"method":"invalid","params":42}"#,
+            r#"{"jsonrpc":"bad","id":3,"method":"invalid"}"#,
+            r#"{}"#,
+        ] {
+            match sonic_rs::from_str::<ServerMessage>(input) {
+                Ok(expected) => {
+                    let actual = decode_server_message(input.as_bytes()).unwrap();
+                    assert_eq!(
+                        serde_json::to_value(actual).unwrap(),
+                        serde_json::to_value(expected).unwrap(),
+                        "{input}"
+                    );
+                }
+                Err(_) => assert!(decode_server_message(input.as_bytes()).is_err(), "{input}"),
+            }
+        }
+        for input in [r#"{"result": [1,]}"#, r#"{"method": "broken}"#] {
+            assert!(decode_server_message(input.as_bytes()).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn large_raw_responses_decode_directly_into_typed_results() {
+        let values: Vec<_> = (0..10_000)
+            .map(|i| format!("completion_{i}_résumé"))
+            .collect();
+        let wire = serde_json::json!({"id": 7, "result": values}).to_string();
+        let ServerMessage::Output(jsonrpc::Output::Success(response)) =
+            decode_server_message(wire.as_bytes()).unwrap()
+        else {
+            panic!()
+        };
+        assert!(
+            matches!(response.result, jsonrpc::ResponseValue::Raw(ref raw) if raw.len() > 64 * 1024)
+        );
+        assert_eq!(
+            response.result.parse::<Vec<String>>().await.unwrap(),
+            values
         );
     }
 
@@ -1431,7 +1562,7 @@ mod tests {
         let response = jsonrpc::Output::Success(jsonrpc::Success {
             jsonrpc: Some(jsonrpc::Version::V2),
             id: jsonrpc::Id::Num(42),
-            result: serde_json::json!({ "title": "Continue" }),
+            result: serde_json::json!({ "title": "Continue" }).into(),
         });
         server_tx.send(Payload::Response(response.clone())).unwrap();
 

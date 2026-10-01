@@ -16,6 +16,7 @@ unicode-lines = ["ropey/unicode_lines"]
 integration = []
 
 [dependencies]
+rayon.workspace = true
 helix-stdx = { path = "../helix-stdx" }
 helix-loader = { path = "../helix-loader" }
 helix-parsec = { path = "../helix-parsec" }

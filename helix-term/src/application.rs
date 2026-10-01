@@ -109,6 +109,7 @@ pub struct Application {
     cursor_smear_last_position: Option<(CursorSmearIdentity, usize)>,
     cursor_smear_frame: Option<CursorSmearFrame>,
     pending_lsp_messages: std::collections::VecDeque<diagnostic_batch::PreparedMessage>,
+    lsp_preparation: Option<tokio::task::JoinHandle<Vec<diagnostic_batch::PreparedMessage>>>,
 }
 
 #[cfg(feature = "integration")]
@@ -287,6 +288,7 @@ impl Application {
             cursor_smear_last_position: None,
             cursor_smear_frame: None,
             pending_lsp_messages: Default::default(),
+            lsp_preparation: None,
         };
 
         Ok(app)
@@ -607,6 +609,7 @@ impl Application {
                 .cursor_smear_frame
                 .as_ref()
                 .map(|frame| frame.next_frame);
+            let poll_lsp = self.lsp_preparation.is_none() && self.pending_lsp_messages.is_empty();
 
             tokio::select! {
                 biased;
@@ -642,7 +645,14 @@ impl Application {
                     self.handle_prepared_language_server_message(message).await;
                     helix_event::request_redraw();
                 }
-                event = self.editor.wait_event() => {
+                prepared = async { self.lsp_preparation.as_mut().unwrap().await }, if self.lsp_preparation.is_some() => {
+                    self.lsp_preparation = None;
+                    match prepared {
+                        Ok(messages) => self.pending_lsp_messages.extend(messages),
+                        Err(error) => log::error!("LSP batch preparation failed: {error}"),
+                    }
+                }
+                event = self.editor.wait_event_with_lsp(poll_lsp) => {
                     let _idle_handled = self.handle_editor_event(event).await;
 
                     #[cfg(feature = "integration")]
@@ -651,7 +661,7 @@ impl Application {
                         // set in `handle_document_write`) can run before the `DocumentSavedEvent` is processed. Slow file I/O on Windows
                         // (atomic_save's rename/fsync dance over the still-open temp file) makes this race observable.
                         // Errors produce an event too, so it cannot hang.
-                        if _idle_handled && self.editor.write_count == 0 {
+                        if _idle_handled && self.editor.write_count == 0 && self.lsp_preparation.is_none() && self.pending_lsp_messages.is_empty() {
                             return true;
                         }
                     }
@@ -1159,6 +1169,20 @@ impl Application {
                 break;
             };
             messages.push(message);
+        }
+        let bytes: usize = messages
+            .iter()
+            .map(|(_, call)| match call {
+                helix_lsp::Call::Notification(call) => call.params.raw_len(),
+                helix_lsp::Call::MethodCall(call) => call.params.raw_len(),
+                helix_lsp::Call::Invalid { .. } => 0,
+            })
+            .sum();
+        if bytes >= 64 * 1024 {
+            self.lsp_preparation = Some(tokio::spawn(helix_event::spawn_cpu(move || {
+                diagnostic_batch::coalesce(messages)
+            })));
+            return;
         }
         self.pending_lsp_messages
             .extend(diagnostic_batch::coalesce(messages));

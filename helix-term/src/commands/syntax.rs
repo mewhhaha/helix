@@ -251,6 +251,7 @@ pub fn syntax_workspace_symbol_picker(cx: &mut Context) {
 
     let mut walk_builder = WalkBuilder::new(&search_root);
     walk_builder
+        .threads(helix_stdx::cpu::auxiliary_worker_count())
         .hidden(config.file_picker.hidden)
         .parents(config.file_picker.parents)
         .ignore(config.file_picker.ignore)

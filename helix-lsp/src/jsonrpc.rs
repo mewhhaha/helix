@@ -9,7 +9,83 @@
 
 use serde::de::{self, DeserializeOwned, Visitor};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{value::RawValue, Value};
+
+/// Retain a validated payload without allocating maps and arrays for its DOM.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RawJson(Box<RawValue>);
+
+impl RawJson {
+    pub(crate) fn new(json: &str) -> Result<Self, serde_json::Error> {
+        RawValue::from_string(json.to_owned()).map(Self)
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.get().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.get().is_empty()
+    }
+
+    fn parse<T: DeserializeOwned>(&self) -> Result<T, sonic_rs::Error> {
+        sonic_rs::from_str(self.0.get())
+    }
+}
+
+impl PartialEq for RawJson {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.get() == other.0.get()
+    }
+}
+
+impl Eq for RawJson {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ResponseValue {
+    Value(Value),
+    #[serde(skip_deserializing)]
+    Raw(RawJson),
+}
+
+impl ResponseValue {
+    pub async fn parse<T: DeserializeOwned + Send + 'static>(self) -> crate::Result<T> {
+        const BACKGROUND_THRESHOLD: usize = 64 * 1024;
+        match self {
+            Self::Raw(raw) if raw.len() >= BACKGROUND_THRESHOLD => {
+                helix_event::spawn_cpu(move || raw.parse().map_err(Into::into)).await
+            }
+            Self::Raw(raw) => raw.parse().map_err(Into::into),
+            Self::Value(value) => serde_json::from_value(value).map_err(Into::into),
+        }
+    }
+}
+
+impl From<Value> for ResponseValue {
+    fn from(value: Value) -> Self {
+        Self::Value(value)
+    }
+}
+
+impl From<ResponseValue> for Value {
+    fn from(value: ResponseValue) -> Self {
+        match value {
+            ResponseValue::Value(value) => value,
+            ResponseValue::Raw(raw) => raw.parse().expect("validated JSON payload"),
+        }
+    }
+}
+
+impl PartialEq for ResponseValue {
+    fn eq(&self, other: &Self) -> bool {
+        // Preserve JSON equality for retained and constructed payloads.
+        Value::from(self.clone()) == Value::from(other.clone())
+    }
+}
+
+impl Eq for ResponseValue {}
 
 // https://www.jsonrpc.org/specification#error_object
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -195,6 +271,8 @@ pub enum Params {
     None,
     Array(Vec<Value>),
     Map(serde_json::Map<String, Value>),
+    #[serde(skip_deserializing)]
+    Raw(RawJson),
 }
 
 impl Params {
@@ -202,13 +280,24 @@ impl Params {
     where
         D: DeserializeOwned,
     {
-        let value: Value = self.into();
-        serde_json::from_value(value)
-            .map_err(|err| Error::invalid_params(format!("Invalid params: {}.", err)))
+        match self {
+            Self::Raw(raw) => raw
+                .parse()
+                .map_err(|err| Error::invalid_params(format!("Invalid params: {err}."))),
+            params => serde_json::from_value(Value::from(params))
+                .map_err(|err| Error::invalid_params(format!("Invalid params: {err}."))),
+        }
     }
 
     pub fn is_none(&self) -> bool {
-        self == &Params::None
+        matches!(self, Params::None)
+    }
+
+    pub fn raw_len(&self) -> usize {
+        match self {
+            Self::Raw(raw) => raw.len(),
+            _ => 0,
+        }
     }
 }
 
@@ -218,6 +307,7 @@ impl From<Params> for Value {
             Params::Array(vec) => Value::Array(vec),
             Params::Map(map) => Value::Object(map),
             Params::None => Value::Null,
+            Params::Raw(raw) => raw.parse().expect("validated JSON parameters"),
         }
     }
 }
@@ -287,7 +377,7 @@ pub enum Request {
 pub struct Success {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub jsonrpc: Option<Version>,
-    pub result: Value,
+    pub result: ResponseValue,
     pub id: Id,
 }
 
@@ -312,7 +402,7 @@ pub enum Output {
 impl From<Output> for Result<Value, Error> {
     fn from(output: Output) -> Self {
         match output {
-            Output::Success(success) => Ok(success.result),
+            Output::Success(success) => Ok(success.result.into()),
             Output::Failure(failure) => Err(failure.error),
         }
     }
@@ -426,7 +516,7 @@ fn success_output_deserialize() {
         deserialized,
         Output::Success(Success {
             jsonrpc: Some(Version::V2),
-            result: Value::from(1),
+            result: Value::from(1).into(),
             id: Id::Num(1)
         })
     );
@@ -444,7 +534,7 @@ fn success_output_deserialize_with_extra_fields() {
         deserialized,
         Output::Success(Success {
             jsonrpc: Some(Version::V2),
-            result: Value::from(1),
+            result: Value::from(1).into(),
             id: Id::Num(1)
         })
     );

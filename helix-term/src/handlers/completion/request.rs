@@ -251,7 +251,7 @@ fn request_completions(
     if let Some(word_completion_request) =
         word::completion(editor, trigger, handle.clone(), savepoint)
     {
-        requests.spawn_blocking(word_completion_request);
+        requests.spawn(helix_event::spawn_cpu(word_completion_request));
     }
 
     let ui = compositor.find::<ui::EditorView>().unwrap();

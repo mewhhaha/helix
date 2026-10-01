@@ -12,6 +12,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
+rayon.workspace = true
 dunce = "1.0"
 etcetera.workspace = true
 ropey.workspace = true

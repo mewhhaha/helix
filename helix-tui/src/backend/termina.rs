@@ -107,6 +107,7 @@ pub struct TerminaBackend {
     original_background_color: Option<RgbColor>,
     cursor_image_id: u32,
     cursor_image_active: Arc<AtomicBool>,
+    cursor_encoder: kitty::Encoder,
 }
 
 impl TerminaBackend {
@@ -298,6 +299,7 @@ impl TerminaBackend {
             original_background_color,
             cursor_image_id,
             cursor_image_active,
+            cursor_encoder: kitty::Encoder::default(),
         })
     }
 
@@ -715,7 +717,8 @@ impl Backend for TerminaBackend {
         }
         // Mark before writing so a partial transfer is also deleted during cleanup.
         self.cursor_image_active.store(true, Ordering::Relaxed);
-        kitty::draw_image(&mut self.terminal, self.cursor_image_id, image)
+        self.cursor_encoder
+            .draw_image(&mut self.terminal, self.cursor_image_id, image)
     }
 
     fn get_theme_mode(&self) -> Option<theme::Mode> {

@@ -11,46 +11,83 @@ pub(super) fn delete_image(writer: &mut impl Write, image_id: u32) -> io::Result
     write!(writer, "\x1b_Ga=d,d=I,i={image_id},q=2;\x1b\\")
 }
 
-pub(super) fn draw_image(
-    writer: &mut impl Write,
-    image_id: u32,
-    image: &CursorImage<'_>,
-) -> io::Result<()> {
-    image.validate()?;
+#[derive(Default)]
+pub(super) struct Encoder {
+    compressor: Option<zlib_rs::Deflate>,
+    compressed: Vec<u8>,
+}
 
-    // Positioning the placement must not move the real cursor (including on timer-only frames).
-    let compressed = miniz_oxide::deflate::compress_to_vec_zlib(image.rgba, 1);
-    writer.write_all(b"\x1b7")?;
-    let result = (|| {
-        write!(
-            writer,
-            "\x1b[{};{}H",
-            image.position.row + 1,
-            image.position.col + 1
-        )?;
-        let mut encoded = [0; 4096];
-        let mut chunks = compressed.chunks(RAW_CHUNK_SIZE).peekable();
-        let mut first = true;
-        while let Some(chunk) = chunks.next() {
-            let more = u8::from(chunks.peek().is_some());
-            if first {
-                write!(
+impl std::fmt::Debug for Encoder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Encoder")
+            .field("capacity", &self.compressed.capacity())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Encoder {
+    pub(super) fn draw_image(
+        &mut self,
+        writer: &mut impl Write,
+        image_id: u32,
+        image: &CursorImage<'_>,
+    ) -> io::Result<()> {
+        image.validate()?;
+
+        // Positioning the placement must not move the real cursor (including on timer-only frames).
+        let capacity = zlib_rs::compress_bound(image.rgba.len());
+        if self.compressed.len() < capacity {
+            self.compressed.resize(capacity, 0);
+        }
+        let compressor = self
+            .compressor
+            .get_or_insert_with(|| zlib_rs::Deflate::new(1, true, 15));
+        compressor.reset();
+        let status = compressor
+            .compress(
+                image.rgba,
+                &mut self.compressed,
+                zlib_rs::DeflateFlush::Finish,
+            )
+            .map_err(|error| io::Error::other(format!("cursor compression failed: {error:?}")))?;
+        if status != zlib_rs::Status::StreamEnd
+            || compressor.total_in() as usize != image.rgba.len()
+        {
+            return Err(io::Error::other("incomplete cursor image compression"));
+        }
+        let compressed = &self.compressed[..compressor.total_out() as usize];
+        writer.write_all(b"\x1b7")?;
+        let result = (|| {
+            write!(
+                writer,
+                "\x1b[{};{}H",
+                image.position.row + 1,
+                image.position.col + 1
+            )?;
+            let mut encoded = [0; 4096];
+            let mut chunks = compressed.chunks(RAW_CHUNK_SIZE).peekable();
+            let mut first = true;
+            while let Some(chunk) = chunks.next() {
+                let more = u8::from(chunks.peek().is_some());
+                if first {
+                    write!(
                     writer,
                     "\x1b_Ga=T,t=d,f=32,o=z,i={image_id},p=1,s={},v={},X={},Y={},z=-1,C=1,q=2,m={more};",
                     image.width, image.height, image.offset_x, image.offset_y,
                 )?;
-                first = false;
-            } else {
-                write!(writer, "\x1b_Gm={more};")?;
+                    first = false;
+                } else {
+                    write!(writer, "\x1b_Gm={more};")?;
+                }
+                let len = encode_base64(chunk, &mut encoded);
+                writer.write_all(&encoded[..len])?;
+                writer.write_all(b"\x1b\\")?;
             }
-            let len = encode_base64(chunk, &mut encoded);
-            writer.write_all(&encoded[..len])?;
-            writer.write_all(b"\x1b\\")?;
-        }
-        Ok(())
-    })();
-    let restore = writer.write_all(b"\x1b8");
-    result.and(restore)
+            Ok(())
+        })();
+        let restore = writer.write_all(b"\x1b8");
+        result.and(restore)
+    }
 }
 
 fn encode_base64(input: &[u8], output: &mut [u8; 4096]) -> usize {
@@ -101,7 +138,9 @@ mod tests {
             rgba: &rgba,
         };
         let mut output = Vec::new();
-        draw_image(&mut output, 123, &image).unwrap();
+        Encoder::default()
+            .draw_image(&mut output, 123, &image)
+            .unwrap();
         let output = String::from_utf8(output).unwrap();
         assert!(output.starts_with(
             "\x1b7\x1b[3;6H\x1b_Ga=T,t=d,f=32,o=z,i=123,p=1,s=64,v=32,X=3,Y=4,z=-1,C=1,q=2,m=1;"
@@ -176,9 +215,34 @@ mod tests {
         };
         let mut output = Vec::new();
         assert_eq!(
-            draw_image(&mut output, 123, &image).unwrap_err().kind(),
+            Encoder::default()
+                .draw_image(&mut output, 123, &image)
+                .unwrap_err()
+                .kind(),
             io::ErrorKind::InvalidInput
         );
         assert!(output.is_empty());
+    }
+
+    #[test]
+    fn reused_compressor_produces_independent_zlib_streams() {
+        let mut encoder = Encoder::default();
+        for width in [512, 3, 1024, 1, 512] {
+            let rgba: Vec<_> = (0..width * 4).map(|index| (index % 251) as u8).collect();
+            let image = CursorImage {
+                position: Position::new(0, 0),
+                offset_x: 0,
+                offset_y: 0,
+                width,
+                height: 1,
+                rgba: &rgba,
+            };
+            encoder.draw_image(&mut Vec::new(), 123, &image).unwrap();
+            let len = encoder.compressor.as_ref().unwrap().total_out() as usize;
+            assert_eq!(
+                miniz_oxide::inflate::decompress_to_vec_zlib(&encoder.compressed[..len]).unwrap(),
+                rgba
+            );
+        }
     }
 }

@@ -2792,6 +2792,12 @@ impl Editor {
     }
 
     pub async fn wait_event(&mut self) -> EditorEvent {
+        self.wait_event_with_lsp(true).await
+    }
+
+    /// Temporarily leave incoming LSP calls queued while an earlier batch is
+    /// being decoded, without delaying saves, debugger events or redraws.
+    pub async fn wait_event_with_lsp(&mut self, poll_lsp: bool) -> EditorEvent {
         // the loop only runs once or twice and would be better implemented with a recursion + const generic
         // however due to limitations with async functions that can not be implemented right now
         loop {
@@ -2816,7 +2822,7 @@ impl Editor {
                         Err(err) => log::error!("VCS preparation failed: {err}"),
                     }
                 }
-                Some(message) = self.language_servers.incoming.next() => {
+                Some(message) = self.language_servers.incoming.next(), if poll_lsp => {
                     return EditorEvent::LanguageServerMessage(message)
                 }
                 Some(event) = self.debug_adapters.incoming.next() => {

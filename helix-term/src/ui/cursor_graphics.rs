@@ -268,41 +268,14 @@ impl<I: Eq> CursorGraphics<I> {
                 polygon.horizontal_span(raster.y as f64 + y as f64 + 0.25),
                 polygon.horizontal_span(raster.y as f64 + y as f64 + 0.75),
             ];
-            let start = spans
-                .iter()
-                .flatten()
-                .map(|span| span.0)
-                .fold(f64::INFINITY, f64::min);
-            let end = spans
-                .iter()
-                .flatten()
-                .map(|span| span.1)
-                .fold(f64::NEG_INFINITY, f64::max);
-            if !start.is_finite() || !end.is_finite() {
-                continue;
-            }
-            let first_x = (start.floor().max(raster.x as f64) as u32) - raster.x;
-            let last_x = (end.ceil().min((raster.x + raster.width) as f64) as u32) - raster.x;
-            for x in first_x..last_x {
-                let mut coverage = 0u16;
-                for span in spans.into_iter().flatten() {
-                    for offset in [0.25, 0.75] {
-                        let pixel_x = raster.x as f64 + x as f64 + offset;
-                        coverage += u16::from(pixel_x >= span.0 && pixel_x < span.1);
-                    }
-                }
-                if coverage == 0 {
-                    continue;
-                }
-                painted = true;
-                let index = ((y as usize * raster.width as usize) + x as usize) * 4;
-                self.rgba[index..index + 4].copy_from_slice(&[
-                    color.0,
-                    color.1,
-                    color.2,
-                    ((opacity * coverage + 2) / 4) as u8,
-                ]);
-            }
+            let first = y as usize * raster.width as usize * 4;
+            painted |= paint_row(
+                &mut self.rgba[first..first + raster.width as usize * 4],
+                spans,
+                raster.x,
+                [color.0, color.1, color.2],
+                opacity,
+            );
         }
         if !painted && self.animation.is_some() {
             // A very thin deformed polygon can fit between sample points.
@@ -322,6 +295,75 @@ impl<I: Eq> CursorGraphics<I> {
             rgba: &self.rgba,
         })
     }
+}
+
+fn paint_row(
+    pixels: &mut [u8],
+    spans: [Option<(f64, f64)>; 2],
+    origin: u32,
+    color: [u8; 3],
+    opacity: u16,
+) -> bool {
+    let start = spans
+        .iter()
+        .flatten()
+        .map(|span| span.0)
+        .fold(f64::INFINITY, f64::min);
+    let end = spans
+        .iter()
+        .flatten()
+        .map(|span| span.1)
+        .fold(f64::NEG_INFINITY, f64::max);
+    if !start.is_finite() || !end.is_finite() {
+        return false;
+    }
+    let left = origin as f64;
+    let right = left + (pixels.len() / 4) as f64;
+    let first = (start.floor().clamp(left, right) - left) as usize;
+    let last = (end.ceil().clamp(left, right) - left) as usize;
+    if first >= last {
+        return false;
+    }
+    let (interior_start, interior_end) = match spans {
+        [Some(a), Some(b)] => {
+            // All four samples must be inside both spans. The right edge is
+            // exclusive, including when it falls exactly on a sample point.
+            let begin = (a.0.max(b.0) - 0.25)
+                .ceil()
+                .clamp(left + first as f64, left + last as f64);
+            let end = (a.1.min(b.1) - 0.75)
+                .ceil()
+                .clamp(begin, left + last as f64);
+            ((begin - left) as usize, (end - left) as usize)
+        }
+        _ => (first, first),
+    };
+    let mut painted = interior_start < interior_end;
+    let rgba = [color[0], color[1], color[2], opacity as u8];
+    // A constant interior fill lets the native optimizer use vector stores;
+    // only the two antialiased edges need per-sample classification.
+    for pixel in pixels[interior_start * 4..interior_end * 4].chunks_exact_mut(4) {
+        pixel.copy_from_slice(&rgba);
+    }
+    for x in (first..interior_start).chain(interior_end..last) {
+        let mut coverage = 0u16;
+        for span in spans.into_iter().flatten() {
+            for offset in [0.25, 0.75] {
+                let position = left + x as f64 + offset;
+                coverage += u16::from(position >= span.0 && position < span.1);
+            }
+        }
+        if coverage != 0 {
+            painted = true;
+            pixels[x * 4..x * 4 + 4].copy_from_slice(&[
+                color[0],
+                color[1],
+                color[2],
+                ((opacity * coverage + 2) / 4) as u8,
+            ]);
+        }
+    }
+    painted
 }
 
 fn bounded_source(from: Quad, target: Quad, maximum: f64, bounds: Rect, size: CellSize) -> Quad {
@@ -567,6 +609,52 @@ pub(crate) fn color_rgb(color: Color) -> Option<(u8, u8, u8)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bulk_fills_preserve_every_antialias_sample_and_clipped_edge() {
+        let edges = [-3.0, -0.01, 0.0, 0.25, 0.75, 1.25, 7.75, 9.0, 15.0];
+        for origin in [0, 17, 1000] {
+            for &a in &edges {
+                for &b in &edges {
+                    for spans in [
+                        [Some((a, b)), Some((a + 0.5, b - 0.5))],
+                        [None, Some((a, b))],
+                    ] {
+                        let spans = spans
+                            .map(|span| span.map(|(a, b)| (a + origin as f64, b + origin as f64)));
+                        for opacity in [230, 255] {
+                            let mut expected = vec![0u8; 40];
+                            for (x, pixel) in expected.chunks_exact_mut(4).enumerate() {
+                                let samples = spans
+                                    .into_iter()
+                                    .flatten()
+                                    .flat_map(|(a, b)| {
+                                        [0.25, 0.75].map(move |offset| {
+                                            let position = origin as f64 + x as f64 + offset;
+                                            u16::from(position >= a && position < b)
+                                        })
+                                    })
+                                    .sum::<u16>();
+                                if samples > 0 {
+                                    pixel.copy_from_slice(&[
+                                        12,
+                                        34,
+                                        56,
+                                        ((opacity * samples + 2) / 4) as u8,
+                                    ]);
+                                }
+                            }
+                            let mut actual = vec![0; 40];
+                            let painted =
+                                paint_row(&mut actual, spans, origin, [12, 34, 56], opacity);
+                            assert_eq!(actual, expected, "spans={spans:?}");
+                            assert_eq!(painted, expected.iter().any(|&byte| byte != 0));
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     const CELL: CellSize = CellSize {
         width: 10,

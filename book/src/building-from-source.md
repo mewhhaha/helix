@@ -52,6 +52,8 @@ RUSTFLAGS="-C target-feature=-crt-static"
    ignored when target flags are configured. The native build is optimized for
    the CPU of the machine building it.
 
+   With `just` installed, `just install` runs the same native build.
+
    Either command will create the `hx` executable and construct the tree-sitter
    grammars in the local `runtime` folder.
 
@@ -64,6 +66,39 @@ RUSTFLAGS="-C target-feature=-crt-static"
 > [details below](#multiple-runtime-directories)).
 
 > 💡 If you only want to build _some_ grammars, see [`use-grammars`](./languages.md#choosing-grammars)
+
+### Profile-guided native builds
+
+For a build trained on editing workloads, install Python 3 and the profiling
+tools for the active Rust toolchain, then run from the repository root:
+
+```sh
+rustup component add llvm-tools-preview
+just install-pgo
+```
+
+This builds an instrumented binary, exercises typing, scrolling, searching,
+file and buffer pickers, word completion, split views and cursor graphics in
+isolated Linux/macOS PTYs, merges the profiles with the matching LLVM tools,
+and installs an optimized binary using that profile. It uses native CPU flags
+and preserves the repository's required flags. Builds and profiles stay in
+`target/pgo`; training uses generated documents and disables external LSPs.
+
+The steps also run separately: `just pgo-build`, `just pgo-train`, and
+`just pgo-install`. To include your usual projects, run the instrumented binary
+between building and merging, then exit normally so it writes its profile:
+
+```sh
+LLVM_PROFILE_FILE="$PWD/target/pgo/raw/helix-%m-%p.profraw" \
+  target/pgo/instrumented/$(rustc -vV | sed -n 's/^host: //p')/opt/hx
+just pgo-merge
+just pgo-install
+```
+
+Manual training also works on Windows. The workflow checks the compiler,
+source and flags before reusing a profile; rerun `just pgo-build` after they
+change. Profile-guided builds take two compilations, and their benefit depends
+on how closely training matches your editing workload.
 
 ### Configuring Helix's runtime files
 

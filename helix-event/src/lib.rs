@@ -33,6 +33,7 @@
 
 use anyhow::Result;
 pub use cancel::{cancelable_future, TaskController, TaskHandle};
+pub use cpu::spawn_cpu;
 pub use debounce::{send_blocking, AsyncHook};
 pub use redraw::{
     lock_frame, redraw_callback, redraw_requested, request_redraw, start_frame, RenderLockGuard,
@@ -41,6 +42,7 @@ pub use redraw::{
 pub use registry::Event;
 
 mod cancel;
+mod cpu;
 mod debounce;
 mod hook;
 mod redraw;

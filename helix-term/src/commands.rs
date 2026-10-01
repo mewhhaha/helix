@@ -2653,6 +2653,7 @@ fn global_search(cx: &mut Context) {
             .multi_line(true)
             .build();
         WalkBuilder::new(root)
+            .threads(helix_stdx::cpu::auxiliary_worker_count())
             .hidden(config.hidden)
             .parents(config.parents)
             .ignore(config.ignore)

@@ -116,6 +116,7 @@ pub(crate) fn request_with_timeout<R: lsp::request::Request>(
 ) -> impl Future<Output = Result<R::Result>>
 where
     R::Params: serde::Serialize,
+    R::Result: Send + 'static,
 {
     // Enqueue before constructing the future so requests remain ordered with
     // document changes even if the future is not polled immediately.
@@ -136,9 +137,7 @@ where
                 // Server errors and disconnects also finish the request. Only
                 // timeout or dropping this future should send cancellation.
                 guard.complete();
-                response
-                    .ok_or(Error::StreamClosed)?
-                    .and_then(|value| serde_json::from_value(value).map_err(Into::into))
+                response.ok_or(Error::StreamClosed)??.parse().await
             }
             Err(_) => Err(Error::Timeout(id)),
         }
@@ -536,6 +535,7 @@ impl Client {
     ) -> impl Future<Output = Result<R::Result>>
     where
         R::Params: serde::Serialize,
+        R::Result: Send + 'static,
     {
         self.call_with_ref::<R>(&params)
     }
@@ -546,6 +546,7 @@ impl Client {
     ) -> impl Future<Output = Result<R::Result>>
     where
         R::Params: serde::Serialize,
+        R::Result: Send + 'static,
     {
         self.call_with_timeout::<R>(params, self.req_timeout)
     }
@@ -557,6 +558,7 @@ impl Client {
     ) -> impl Future<Output = Result<R::Result>>
     where
         R::Params: serde::Serialize,
+        R::Result: Send + 'static,
     {
         request_with_timeout::<R>(
             &self.server_tx,
@@ -614,7 +616,7 @@ impl Client {
             Ok(result) => Output::Success(Success {
                 jsonrpc: Some(Version::V2),
                 id,
-                result,
+                result: result.into(),
             }),
             Err(error) => Output::Failure(Failure {
                 jsonrpc: Some(Version::V2),

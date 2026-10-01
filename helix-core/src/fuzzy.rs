@@ -78,3 +78,62 @@ pub fn fuzzy_match_cancelable<T: AsRef<str>>(
     }
     (!is_canceled()).then_some(matches)
 }
+
+/// Score large immutable candidate sets in parallel. Each chunk owns its
+/// matcher, and collection preserves input order, including equal scores.
+pub fn fuzzy_match_parallel<'a, T: AsRef<str> + Sync>(
+    pattern: &str,
+    items: &'a [T],
+    is_canceled: impl Fn() -> bool + Sync,
+) -> Option<Vec<(&'a T, u16)>> {
+    use rayon::prelude::*;
+
+    const PARALLEL_THRESHOLD: usize = 32_768;
+    const CHUNK: usize = 4096;
+    if items.len() < PARALLEL_THRESHOLD || helix_stdx::cpu::worker_count() == 1 {
+        return fuzzy_match_cancelable(pattern, items, is_canceled);
+    }
+    let chunks: Option<Vec<_>> = helix_stdx::cpu::pool().install(|| {
+        items
+            .par_chunks(CHUNK)
+            .map(|chunk| fuzzy_match_cancelable(pattern, chunk, &is_canceled))
+            .collect()
+    });
+    if is_canceled() {
+        return None;
+    }
+    Some(chunks?.into_iter().flatten().collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn parallel_scores_and_order_match_the_serial_scan() {
+        let words: Vec<_> = (0..40_000)
+            .map(|i| {
+                format!(
+                    "parse_{}_buffer_{i}",
+                    if i % 2 == 0 { "é" } else { "ascii" }
+                )
+            })
+            .collect();
+        for pattern in ["", "pbf", "Pb", "é", "xyz"] {
+            assert_eq!(
+                super::fuzzy_match_parallel(pattern, &words, || false),
+                super::fuzzy_match_cancelable(pattern, &words, || false)
+            );
+        }
+    }
+
+    #[test]
+    fn canceled_parallel_scans_discard_all_partial_results() {
+        let checks = AtomicUsize::new(0);
+        let words = vec!["word"; 100_000];
+        assert!(super::fuzzy_match_parallel("w", &words, || {
+            checks.fetch_add(1, Ordering::Relaxed) >= 10
+        })
+        .is_none());
+    }
+}

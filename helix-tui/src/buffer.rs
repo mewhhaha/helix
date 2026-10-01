@@ -746,30 +746,56 @@ impl Buffer {
     /// Updates: `0: a, 1: コ` (double width symbol at index 1 - skip index 2)
     /// ```
     pub fn diff<'a>(&self, other: &'a Buffer) -> Vec<(u16, u16, &'a Cell)> {
+        self.diff_iter(other).collect()
+    }
+
+    /// Stream changed cells, skipping identical rows before width bookkeeping.
+    /// Row equality includes every style field, so removing a popup also redraws
+    /// its exposed contents. Keep `diff` for callers which need an owned list.
+    pub fn diff_iter<'a, 'b>(
+        &'b self,
+        other: &'a Buffer,
+    ) -> impl Iterator<Item = (u16, u16, &'a Cell)> + use<'a, 'b> {
         let previous_buffer = &self.content;
         let next_buffer = &other.content;
-        let width = self.area.width;
+        let width = self.area.width as usize;
+        let len = previous_buffer.len().min(next_buffer.len());
 
-        let mut updates: Vec<(u16, u16, &Cell)> = vec![];
         // Cells invalidated by drawing/replacing preceding multi-width characters:
         let mut invalidated: usize = 0;
         // Cells from the current buffer to skip due to preceding multi-width characters taking their
         // place (the skipped cells should be blank anyway):
         let mut to_skip: usize = 0;
-        for (i, (current, previous)) in next_buffer.iter().zip(previous_buffer.iter()).enumerate() {
-            if (current != previous || invalidated > 0) && to_skip == 0 {
-                let x = (i % width as usize) as u16;
-                let y = (i / width as usize) as u16;
-                updates.push((x, y, &next_buffer[i]));
+        let mut i = 0;
+        std::iter::from_fn(move || {
+            while i < len && width != 0 {
+                if i.is_multiple_of(width) && invalidated == 0 && to_skip == 0 {
+                    let end = (i + width).min(len);
+                    if next_buffer[i..end] == previous_buffer[i..end] {
+                        i = end;
+                        continue;
+                    }
+                }
+                let current = &next_buffer[i];
+                let previous = &previous_buffer[i];
+                let changed = (current != previous || invalidated > 0) && to_skip == 0;
+                let current_width = current.width();
+                to_skip = current_width.saturating_sub(1);
+
+                let affected_width = std::cmp::max(current_width, previous.width());
+                invalidated = std::cmp::max(affected_width, invalidated).saturating_sub(1);
+                let position = i;
+                i += 1;
+                if changed {
+                    return Some((
+                        (position % width) as u16,
+                        (position / width) as u16,
+                        current,
+                    ));
+                }
             }
-
-            let current_width = current.width();
-            to_skip = current_width.saturating_sub(1);
-
-            let affected_width = std::cmp::max(current_width, previous.width());
-            invalidated = std::cmp::max(affected_width, invalidated).saturating_sub(1);
-        }
-        updates
+            None
+        })
     }
 }
 
@@ -797,6 +823,21 @@ mod tests {
         let mut cell = Cell::default();
         cell.set_symbol(s);
         cell
+    }
+
+    #[test]
+    fn streaming_diff_clears_popups_wide_glyphs_and_style_changes_between_equal_rows() {
+        let mut previous = Buffer::with_lines(vec!["same", "漢xy", "same", "last"]);
+        let mut next = Buffer::with_lines(vec!["same", "    ", "same", "last"]);
+        previous[(2, 3)].underline_color = Color::Red;
+        next[(2, 3)].underline_color = Color::Blue;
+        let positions: Vec<_> = previous.diff_iter(&next).map(|(x, y, _)| (x, y)).collect();
+        assert_eq!(positions, [(0, 1), (1, 1), (2, 1), (3, 1), (2, 3)]);
+        assert!(next.diff_iter(&next).next().is_none());
+        assert!(Buffer::empty(Rect::new(0, 0, 0, 3))
+            .diff_iter(&Buffer::empty(Rect::new(0, 0, 0, 3)))
+            .next()
+            .is_none());
     }
 
     #[test]

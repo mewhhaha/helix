@@ -6,8 +6,9 @@
 use std::{borrow::Cow, collections::VecDeque, iter, sync::Arc, time::Duration};
 
 use foldhash::HashMap;
+use futures_util::{stream::FuturesUnordered, StreamExt};
 use helix_core::{
-    chars::char_is_word, diff::compare_ropes, fuzzy::fuzzy_match_cancelable, ChangeSet, Rope,
+    chars::char_is_word, diff::compare_ropes, fuzzy::fuzzy_match_parallel, ChangeSet, Rope,
     RopeSlice,
 };
 use helix_event::{register_hook, AsyncHook, TaskController, TaskHandle};
@@ -62,7 +63,7 @@ struct Pending {
     events: HashMap<DocumentId, Event>,
     order: VecDeque<DocumentId>,
     clear: bool,
-    active: Option<(DocumentId, TaskController)>,
+    active: HashMap<DocumentId, TaskController>,
     generation: u64,
 }
 
@@ -78,17 +79,15 @@ fn send(coordinator: &Coordinator, event: Event) {
             pending.clear = true;
             pending.events.clear();
             pending.order.clear();
-            if let Some((_, controller)) = &mut pending.active {
+            for controller in pending.active.values_mut() {
                 controller.cancel();
             }
             coordinator.notify.notify_one();
             return;
         }
     };
-    if let Some((active_doc, controller)) = &mut pending.active {
-        if *active_doc == doc {
-            controller.cancel();
-        }
+    if let Some(controller) = pending.active.get_mut(&doc) {
+        controller.cancel();
     }
     if !pending.events.contains_key(&doc) {
         pending.order.push_back(doc);
@@ -282,7 +281,7 @@ impl WordIndex {
     fn matches_with_cancel(
         &self,
         pattern: &str,
-        mut canceled: impl FnMut() -> bool,
+        canceled: impl Fn() -> bool + Sync,
     ) -> Vec<String> {
         if canceled() {
             return Vec::new();
@@ -304,7 +303,7 @@ impl WordIndex {
                 });
             (inner.generation, words)
         };
-        let Some(mut matches) = fuzzy_match_cancelable(pattern, words.iter(), &mut canceled) else {
+        let Some(mut matches) = fuzzy_match_parallel(pattern, &words, &canceled) else {
             return Vec::new();
         };
         if matches.len() <= 32_768
@@ -463,97 +462,102 @@ impl WordIndex {
         // These are the revisions actually committed to the index, rather than
         // the event's old text (which can contain skipped completion previews).
         let mut indexed = HashMap::<DocumentId, Rope>::default();
+        let mut preparing = FuturesUnordered::new();
         loop {
             if cancel.is_canceled() {
+                coordinator.pending.lock().active.clear();
                 return;
             }
-            let (clear, next) = {
+            let clear = {
                 let mut pending = coordinator.pending.lock();
-                if pending.clear {
-                    pending.clear = false;
-                    (true, None)
-                } else {
-                    (
-                        false,
-                        pending.order.pop_front().map(|doc| {
-                            let event = pending.events.remove(&doc).unwrap();
-                            let mut controller = TaskController::new();
-                            let handle = controller.restart();
-                            pending.active = Some((doc, controller));
-                            (doc, event, handle)
-                        }),
-                    )
-                }
+                std::mem::take(&mut pending.clear)
             };
             if clear {
                 let previous = std::mem::take(&mut indexed);
                 let this = self.clone();
-                if let Err(error) = tokio::task::spawn_blocking(move || {
+                helix_event::spawn_cpu(move || {
                     this.clear();
                     drop(previous);
                 })
-                .await
-                {
-                    log::error!("clearing word index failed: {error}");
-                    return;
-                }
+                .await;
                 continue;
             }
-            let Some((doc, event, handle)) = next else {
-                tokio::select! { _ = cancel.canceled() => return, _ = coordinator.notify.notified() => {} }
-                continue;
-            };
-            let old = indexed.get(&doc).cloned();
-            let (text, changes) = match event {
-                Event::Insert(_, text) => (Some(text), None),
-                Event::Update(_, change) => {
-                    let changes = (!change.dirty
-                        && old
-                            .as_ref()
-                            .is_some_and(|old| old.is_instance(&change.old_text)))
-                    .then_some(change.changes);
-                    (Some(change.text), changes)
-                }
-                Event::Delete(_, _) => (None, None),
-                Event::Clear => unreachable!(),
-            };
-            let work_text = text.clone();
-            let work_handle = handle.clone();
-            let shutdown = cancel.clone();
-            let task = tokio::task::spawn_blocking(move || {
-                if shutdown.is_canceled() {
-                    return None;
-                }
-                Self::prepare_delta(
-                    old.as_ref(),
-                    work_text.as_ref(),
-                    changes.as_ref(),
-                    &work_handle,
-                )
-            });
-            let result = tokio::select! {
+            while preparing.len() < helix_stdx::cpu::worker_count() {
+                let next = {
+                    let mut pending = coordinator.pending.lock();
+                    // One preparation per document. Other documents may bypass
+                    // a queued revision which is waiting for its canceled work.
+                    let position = (!pending.clear)
+                        .then(|| {
+                            pending
+                                .order
+                                .iter()
+                                .position(|doc| !pending.active.contains_key(doc))
+                        })
+                        .flatten();
+                    position.map(|position| {
+                        let doc = pending.order.remove(position).unwrap();
+                        let event = pending.events.remove(&doc).unwrap();
+                        let mut controller = TaskController::new();
+                        let handle = controller.restart();
+                        pending.active.insert(doc, controller);
+                        (doc, event, handle)
+                    })
+                };
+                let Some((doc, event, handle)) = next else {
+                    break;
+                };
+                let old = indexed.get(&doc).cloned();
+                let (text, changes) = match event {
+                    Event::Insert(_, text) => (Some(text), None),
+                    Event::Update(_, change) => {
+                        let changes = (!change.dirty
+                            && old
+                                .as_ref()
+                                .is_some_and(|old| old.is_instance(&change.old_text)))
+                        .then_some(change.changes);
+                        (Some(change.text), changes)
+                    }
+                    Event::Delete(_, _) => (None, None),
+                    Event::Clear => unreachable!(),
+                };
+                let work_text = text.clone();
+                let work_handle = handle.clone();
+                let shutdown = cancel.clone();
+                let task = helix_event::spawn_cpu(move || {
+                    if shutdown.is_canceled() || work_handle.is_canceled() {
+                        return None;
+                    }
+                    Self::prepare_delta(
+                        old.as_ref(),
+                        work_text.as_ref(),
+                        changes.as_ref(),
+                        &work_handle,
+                    )
+                });
+                preparing.push(async move {
+                    // Retain the document identity even if preparation panics.
+                    let result = tokio::spawn(task).await;
+                    (doc, text, handle, result)
+                });
+            }
+            let (doc, text, handle, result) = tokio::select! {
+                biased;
                 _ = cancel.canceled() => {
-                    if let Some((_, controller)) = &mut coordinator.pending.lock().active { controller.cancel(); }
+                    coordinator.pending.lock().active.clear();
                     return;
                 }
-                result = task => result,
+                Some(prepared) = preparing.next(), if !preparing.is_empty() => prepared,
+                _ = coordinator.notify.notified() => continue,
             };
             // Accept the complete delta atomically with cancellation. Commit it
-            // in full before starting another revision, without holding the
-            // scheduler mutex or doing index maintenance on a Tokio worker.
+            // in full before scheduling this document's next revision. Prepared
+            // deltas for other documents can finish in any order.
             let accepted = {
                 let mut pending = coordinator.pending.lock();
                 let accepted = if !handle.is_canceled() && !cancel.is_canceled() {
                     match result {
-                        Ok(Some(delta)) => {
-                            if let Some(text) = text {
-                                indexed.insert(doc, text);
-                            } else {
-                                indexed.remove(&doc);
-                            }
-                            Some(delta)
-                        }
-                        Ok(None) => None,
+                        Ok(delta) => delta,
                         Err(error) => {
                             log::error!("word indexing task failed: {error}");
                             None
@@ -562,16 +566,16 @@ impl WordIndex {
                 } else {
                     None
                 };
-                pending.active = None;
+                pending.active.remove(&doc);
                 accepted
             };
             if let Some(delta) = accepted {
                 let this = self.clone();
-                if let Err(error) =
-                    tokio::task::spawn_blocking(move || this.apply_delta(delta)).await
-                {
-                    log::error!("committing word index failed: {error}");
-                    return;
+                helix_event::spawn_cpu(move || this.apply_delta(delta)).await;
+                if let Some(text) = text {
+                    indexed.insert(doc, text);
+                } else {
+                    indexed.remove(&doc);
                 }
             }
         }
@@ -584,15 +588,127 @@ impl WordIndex {
 /// w[word character][char_is_word], spanning at least [`MIN_WORD_GRAPHEMES`] clusters and at
 /// most [`MAX_WORD_LEN`] chars. All other text is skipped.
 ///
-/// This is a single forward pass over the text's grapheme clusters: each cluster is visited once.
-/// and the only rope position ever sought is the start of an emitted word, which keeps
-/// extraction roughly linear in the length of the text.
+/// ASCII slices use byte runs; Unicode slices retain a forward grapheme scan.
+/// Only emitted words seek into the rope, keeping extraction roughly linear.
 #[cfg(any(test, feature = "bench"))]
 fn words(text: RopeSlice) -> impl Iterator<Item = RopeSlice> {
     words_with_cancel(text, || false)
 }
 
 fn words_with_cancel(
+    text: RopeSlice<'_>,
+    mut is_canceled: impl FnMut() -> bool,
+) -> impl Iterator<Item = RopeSlice<'_>> {
+    // Validate the entire slice before using byte boundaries: an ASCII run can
+    // belong to a Unicode grapheme whose combining marks are in the next chunk.
+    let mut ascii = Some(true);
+    let mut checked = CANCEL_CHECK_INTERVAL;
+    for chunk in text.chunks() {
+        if checked >= CANCEL_CHECK_INTERVAL {
+            if is_canceled() {
+                ascii = None;
+                break;
+            }
+            checked = 0;
+        }
+        if !chunk.is_ascii() {
+            ascii = Some(false);
+            break;
+        }
+        checked += chunk.len();
+    }
+    match ascii {
+        Some(true) => Words::Ascii(ascii_words_with_cancel(text, is_canceled)),
+        Some(false) => Words::Unicode(unicode_words_with_cancel(text, is_canceled)),
+        None => Words::Canceled,
+    }
+}
+
+enum Words<A, U> {
+    Ascii(A),
+    Unicode(U),
+    Canceled,
+}
+
+impl<'a, A, U> Iterator for Words<A, U>
+where
+    A: Iterator<Item = RopeSlice<'a>>,
+    U: Iterator<Item = RopeSlice<'a>>,
+{
+    type Item = RopeSlice<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Ascii(words) => words.next(),
+            Self::Unicode(words) => words.next(),
+            Self::Canceled => None,
+        }
+    }
+}
+
+fn ascii_words_with_cancel(
+    text: RopeSlice<'_>,
+    mut is_canceled: impl FnMut() -> bool,
+) -> impl Iterator<Item = RopeSlice<'_>> {
+    let mut blocks = text.chunks().flat_map(|chunk| chunk.as_bytes().chunks(32));
+    let mut start = None;
+    let mut base = 0;
+    let mut offset = 0;
+    let mut len = 0;
+    let mut mask = 0u32;
+    let mut visited = 0;
+    let mut done = false;
+    iter::from_fn(move || {
+        while !done {
+            if offset == len {
+                base += len;
+                if visited >= CANCEL_CHECK_INTERVAL {
+                    visited = 0;
+                    if is_canceled() {
+                        done = true;
+                        return None;
+                    }
+                }
+                let Some(bytes) = blocks.next() else {
+                    done = true;
+                    return start.take().and_then(|begin| {
+                        (MIN_WORD_GRAPHEMES..=MAX_WORD_LEN)
+                            .contains(&(base - begin))
+                            .then(|| text.byte_slice(begin..base))
+                    });
+                };
+                len = bytes.len();
+                offset = 0;
+                visited += len;
+                // Independent byte classifications let LLVM vectorize this
+                // loop, without requiring an architecture-specific instruction.
+                mask = bytes.iter().enumerate().fold(0u32, |mask, (i, &byte)| {
+                    mask | (u32::from(byte.is_ascii_alphanumeric() || byte == b'_') << i)
+                });
+            }
+            let word = mask & 1 != 0;
+            let run = if word {
+                mask.trailing_ones()
+            } else {
+                mask.trailing_zeros()
+            };
+            let run = (run as usize).min(len - offset);
+            let end = base + offset;
+            offset += run;
+            mask = mask.checked_shr(run as u32).unwrap_or(0);
+            if word {
+                start.get_or_insert(end);
+            } else if let Some(begin) = start.take() {
+                if (MIN_WORD_GRAPHEMES..=MAX_WORD_LEN).contains(&(end - begin)) {
+                    return Some(text.byte_slice(begin..end));
+                }
+            }
+        }
+        None
+    })
+}
+
+fn unicode_words_with_cancel(
     text: RopeSlice<'_>,
     mut is_canceled: impl FnMut() -> bool,
 ) -> impl Iterator<Item = RopeSlice<'_>> {
@@ -861,6 +977,78 @@ mod tests {
     fn parse() {
         assert_words("one two three", ["one", "two", "three"]);
         assert_words("a foo c", ["foo"]);
+    }
+
+    #[test]
+    fn ascii_runs_and_unicode_fallback_preserve_grapheme_boundaries() {
+        for input in [
+            "abc_123\r\nnext\0last".into(),
+            format!("{} {}", "a".repeat(50), "b".repeat(51)),
+            format!(
+                "{}boundary_word\r\n{}",
+                " ".repeat(997),
+                "alpha beta\r\n".repeat(1000)
+            ),
+            "abc e\u{301}fg résumé 中文词 emoji😀 next".into(),
+            "a".repeat(1023) + "e\u{301}fg last",
+        ] {
+            let rope = Rope::from_str(&input);
+            for text in [rope.slice(..), rope.slice(1..rope.len_chars())] {
+                let expected: Vec<_> = unicode_words_with_cancel(text, || false).collect();
+                assert_eq!(words(text).collect::<Vec<_>>(), expected);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_preparations_cancel_before_clear_and_new_revisions() {
+        if helix_stdx::cpu::worker_count() < 2 {
+            return;
+        }
+        let coordinator = Coordinator::default();
+        let index = WordIndex::default();
+        let mut controller = TaskController::new();
+        let task = tokio::spawn(index.clone().run(coordinator.clone(), controller.restart()));
+        let first = DocumentId::new(1);
+        let second = DocumentId::new(2);
+        let large = Rope::from_str(&"shared résumés repeated\n".repeat(100_000));
+        send(&coordinator, Event::Insert(first, large.clone()));
+        send(&coordinator, Event::Insert(second, large));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while coordinator.pending.lock().active.len() != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        send(
+            &coordinator,
+            Event::Update(first, build_change("ghost", "shared newest")),
+        );
+        send(&coordinator, Event::Delete(second, Rope::new()));
+        send(&coordinator, Event::Clear);
+        send(
+            &coordinator,
+            Event::Insert(first, Rope::from_str("shared final")),
+        );
+        send(
+            &coordinator,
+            Event::Insert(second, Rope::from_str("shared second")),
+        );
+        let expected = std::collections::HashMap::from([
+            ("shared".into(), 2),
+            ("final".into(), 1),
+            ("second".into(), 1),
+        ]);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while index.counts() != expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        controller.cancel();
+        task.await.unwrap();
     }
 
     #[test]
