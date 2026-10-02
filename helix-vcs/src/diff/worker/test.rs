@@ -8,6 +8,22 @@ use std::{sync::Arc, time::Duration};
 use tokio::sync::Notify;
 
 #[tokio::test]
+async fn new_diff_requests_redraw_on_initial_publication() {
+    helix_event::start_frame();
+    let (differ, handle) = DiffHandle::new_test("base\n", "current\n");
+    assert_eq!(
+        differ.into_diff(handle).await,
+        vec![Hunk {
+            before: 0..1,
+            after: 0..1,
+        }]
+    );
+    tokio::time::timeout(Duration::from_secs(1), helix_event::redraw_requested())
+        .await
+        .expect("the first published diff must repaint without another input event");
+}
+
+#[tokio::test]
 async fn async_redraw_observes_completion_before_task_starts() {
     let notify = Arc::new(Notify::new());
     let task = spawn_diff_notification(None, notify.clone());

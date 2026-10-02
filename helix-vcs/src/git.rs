@@ -17,7 +17,7 @@ use gix::status::{
 };
 use gix::{Commit, ObjectId, Repository, ThreadSafeRepository};
 
-use crate::{FileChange, PreparedVcs};
+use crate::{FileChange, PreparedVcs, RevisionDiffBase};
 
 #[cfg(test)]
 mod test;
@@ -39,7 +39,39 @@ pub fn get_diff_base(file: &Path, trust_full: bool) -> Result<Vec<u8>> {
         .context("failed to open git repo")?
         .to_thread_local();
     let head = repo.head_commit()?;
-    get_diff_base_from_repo(&repo, &head, &file, None)
+    get_diff_base_from_repo(&repo, &head, &file, None, false)
+}
+
+pub fn get_review_base(
+    file: &Path,
+    reference: &str,
+    trust_full: bool,
+    cancel: &helix_event::TaskHandle,
+) -> Result<RevisionDiffBase> {
+    if cancel.is_canceled() {
+        bail!("Git review canceled");
+    }
+    let file = gix::path::realpath(file).context("resolve symlinks")?;
+    let repo = open_repo(get_repo_dir(&file)?, trust_full)?.to_thread_local();
+    let head = repo.head_commit()?;
+    let target = repo
+        .rev_parse_single(reference.as_bytes().as_bstr())
+        .with_context(|| format!("Cannot resolve Git revision '{reference}'"))?
+        .object()?
+        .peel_to_commit()
+        .with_context(|| format!("Git revision '{reference}' is not a commit"))?;
+    if cancel.is_canceled() {
+        bail!("Git review canceled");
+    }
+    let base = repo
+        .merge_base(head.id, target.id)
+        .with_context(|| format!("No common ancestor between HEAD and '{reference}'"))?
+        .object()?
+        .peel_to_commit()?;
+    Ok(RevisionDiffBase {
+        bytes: get_diff_base_from_repo(&repo, &base, &file, Some(cancel), true)?,
+        commit: base.id.to_string(),
+    })
 }
 
 fn get_diff_base_from_repo(
@@ -47,11 +79,17 @@ fn get_diff_base_from_repo(
     head: &Commit,
     file: &Path,
     cancel: Option<&helix_event::TaskHandle>,
+    allow_missing: bool,
 ) -> Result<Vec<u8>> {
     if cancel.is_some_and(helix_event::TaskHandle::is_canceled) {
         bail!("VCS preparation canceled");
     }
-    let file_oid = find_file_in_commit(repo, head, file)?;
+    let Some(file_oid) = find_file_in_commit(repo, head, file)? else {
+        if allow_missing {
+            return Ok(Vec::new());
+        }
+        bail!("file is untracked");
+    };
 
     let file_object = repo.find_object(file_oid)?;
     let data = file_object.detach().data;
@@ -133,7 +171,7 @@ pub fn prepare_vcs(
     }
     let head = repo.head_commit()?;
     let head_name = current_head_name(&repo, &head)?;
-    let diff_base = get_diff_base_from_repo(&repo, &head, &file, Some(cancel))
+    let diff_base = get_diff_base_from_repo(&repo, &head, &file, Some(cancel), false)
         .map_err(|err| log::debug!("Loading VCS baseline for {}: {err:#}", file.display()))
         .ok();
     Ok(PreparedVcs {
@@ -297,19 +335,23 @@ fn status(
 }
 
 /// Finds the object that contains the contents of a file at a specific commit.
-fn find_file_in_commit(repo: &Repository, commit: &Commit, file: &Path) -> Result<ObjectId> {
+fn find_file_in_commit(
+    repo: &Repository,
+    commit: &Commit,
+    file: &Path,
+) -> Result<Option<ObjectId>> {
     let repo_dir = repo.workdir().context("repo has no worktree")?;
     let rel_path = file.strip_prefix(repo_dir)?;
     let tree = commit.tree()?;
-    let tree_entry = tree
-        .lookup_entry_by_path(rel_path)?
-        .context("file is untracked")?;
+    let Some(tree_entry) = tree.lookup_entry_by_path(rel_path)? else {
+        return Ok(None);
+    };
     match tree_entry.mode().kind() {
         // not a file, everything is new, do not show diff
         mode @ (EntryKind::Tree | EntryKind::Commit | EntryKind::Link) => {
             bail!("entry at {} is not a file but a {mode:?}", file.display())
         }
         // found a file
-        EntryKind::Blob | EntryKind::BlobExecutable => Ok(tree_entry.object_id()),
+        EntryKind::Blob | EntryKind::BlobExecutable => Ok(Some(tree_entry.object_id())),
     }
 }

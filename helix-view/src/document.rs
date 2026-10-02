@@ -670,6 +670,9 @@ pub struct Document {
     pub(crate) language_servers: HashMap<LanguageServerName, Arc<Client>>,
 
     diff_handle: Option<DiffHandle>,
+    review_diff: Option<(String, String, DiffHandle)>,
+    review_diff_generation: u64,
+    pub(crate) review_diff_controller: TaskController,
     version_control_head: Option<Arc<ArcSwap<Box<str>>>>,
     pub(crate) vcs_controller: TaskController,
 
@@ -1321,6 +1324,9 @@ impl Document {
             modified_since_accessed: false,
             language_servers: HashMap::new(),
             diff_handle: None,
+            review_diff: None,
+            review_diff_generation: 0,
+            review_diff_controller: TaskController::new(),
             config,
             version_control_head: None,
             vcs_controller: TaskController::new(),
@@ -1875,6 +1881,7 @@ impl Document {
     /// the editor schedules VCS metadata separately in its bounded worker.
     pub fn reload_text(&mut self, view: &mut View) -> Result<(), Error> {
         self.vcs_controller.cancel();
+        self.review_diff_controller.cancel();
         let encoding = self.encoding;
         let path = match self.path() {
             None => return Ok(()),
@@ -1937,6 +1944,7 @@ impl Document {
             self.color_swatches = None;
             self.vcs_controller.cancel();
             self.diff_handle = None;
+            self.clear_review_diff_base();
             self.version_control_head = None;
         }
 
@@ -2158,6 +2166,9 @@ impl Document {
         // TODO: all of that should likely just be hooks
         // start computing the diff in parallel
         if let Some(diff_handle) = &self.diff_handle {
+            diff_handle.update_document(self.text.clone(), false);
+        }
+        if let Some((_, _, diff_handle)) = &self.review_diff {
             diff_handle.update_document(self.text.clone(), false);
         }
 
@@ -2640,6 +2651,41 @@ impl Document {
 
     pub fn diff_handle(&self) -> Option<&DiffHandle> {
         self.diff_handle.as_ref()
+    }
+
+    pub fn review_diff_handle(&self) -> Option<&DiffHandle> {
+        self.review_diff
+            .as_ref()
+            .map(|(_, _, handle)| handle)
+            .or_else(|| self.diff_handle())
+    }
+
+    pub fn review_diff_reference(&self) -> Option<&str> {
+        self.review_diff
+            .as_ref()
+            .map(|(reference, _, _)| reference.as_str())
+    }
+
+    pub fn review_diff_key(&self) -> Option<(u64, bool, u64)> {
+        self.review_diff_handle().map(|handle| {
+            let (revision, inverted) = handle.render_key();
+            (revision, inverted, self.review_diff_generation)
+        })
+    }
+
+    pub(crate) fn review_diff_generation(&self) -> u64 {
+        self.review_diff_generation
+    }
+
+    pub(crate) fn set_review_diff_base(&mut self, reference: String, commit: String, base: Rope) {
+        self.review_diff_generation = self.review_diff_generation.wrapping_add(1);
+        self.review_diff = Some((reference, commit, DiffHandle::new(base, self.text.clone())));
+    }
+
+    pub(crate) fn clear_review_diff_base(&mut self) {
+        self.review_diff_controller.cancel();
+        self.review_diff_generation = self.review_diff_generation.wrapping_add(1);
+        self.review_diff = None;
     }
 
     /// Intialize/updates the differ for this document with a new base.

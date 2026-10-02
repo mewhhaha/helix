@@ -86,6 +86,70 @@ fn modified_file() {
 }
 
 #[test]
+fn review_base_uses_merge_base_for_diverged_branches_and_supports_git_revisions() {
+    let repo = empty_git_repo();
+    let file = repo.path().join("file.txt");
+    std::fs::write(&file, b"shared baseline\n").unwrap();
+    create_commit(repo.path(), true);
+    exec_git_cmd("tag fork-point", repo.path());
+    exec_git_cmd("checkout -b feature", repo.path());
+    std::fs::write(&file, b"branch change\n").unwrap();
+    create_commit(repo.path(), true);
+    let added = repo.path().join("added.txt");
+    std::fs::write(&added, b"new on feature\n").unwrap();
+    create_commit(repo.path(), true);
+    exec_git_cmd("checkout main", repo.path());
+    std::fs::write(&file, b"changed only on main\n").unwrap();
+    create_commit(repo.path(), true);
+    exec_git_cmd("update-ref refs/remotes/origin/main main", repo.path());
+    exec_git_cmd("checkout feature", repo.path());
+    std::fs::write(&file, b"unsaved working change\n").unwrap();
+    let mut controller = helix_event::TaskController::new();
+    let cancel = controller.restart();
+    let base = git::get_review_base(&file, "main", true, &cancel).unwrap();
+    assert_eq!(base.bytes, b"shared baseline\n");
+    assert_eq!(
+        git::get_review_base(&file, "origin/main", true, &cancel)
+            .unwrap()
+            .commit,
+        base.commit
+    );
+    assert_eq!(
+        git::get_review_base(&file, "fork-point", true, &cancel)
+            .unwrap()
+            .commit,
+        base.commit
+    );
+    for reference in ["HEAD", "HEAD~1"] {
+        assert_eq!(
+            git::get_review_base(&file, reference, true, &cancel)
+                .unwrap()
+                .bytes,
+            b"branch change\n"
+        );
+    }
+    assert!(git::get_review_base(&added, "main", true, &cancel)
+        .unwrap()
+        .bytes
+        .is_empty());
+    let error = git::get_review_base(&file, "missing-branch", true, &cancel)
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("Cannot resolve Git revision"));
+    exec_git_cmd("checkout --orphan unrelated", repo.path());
+    create_commit(repo.path(), true);
+    exec_git_cmd("checkout feature", repo.path());
+    let error = git::get_review_base(&file, "unrelated", true, &cancel)
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("No common ancestor"));
+    controller.cancel();
+    assert!(
+        git::get_review_base(&repo.path().join("missing/file.txt"), "main", true, &cancel).is_err()
+    );
+}
+
+#[test]
 fn combined_vcs_preparation_keeps_committed_baseline_and_head_for_untracked_files() {
     let repo = empty_git_repo();
     let tracked = repo.path().join("tracked.txt");

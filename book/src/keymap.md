@@ -31,6 +31,12 @@
 
 Normal mode is the default mode when you launch helix. You can return to it from other modes by pressing the `Escape` key.
 
+`:diff-mode` toggles a diff against HEAD by default. Use `:diff-mode main` or
+`:diff-mode origin/main` to compare the current buffer, including unsaved edits,
+with the common ancestor of HEAD and that revision. `:diff-mode HEAD` returns to
+local changes. `:diff-mode off` and `:diff-mode on` retain the selected base for the
+buffer; repeat the revision command to refresh it. References are resolved locally.
+
 In `:diff-mode`, all deleted rows stay visible before the added rows, with syntax
 highlighting from the original file. `j`/`k` and the arrow keys also visit deleted
 rows. Use `v` and character, word, or line movements to select deleted text,

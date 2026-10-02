@@ -29,6 +29,11 @@ pub struct PreparedVcs {
     pub head: Option<Arc<ArcSwap<Box<str>>>>,
 }
 
+pub struct RevisionDiffBase {
+    pub bytes: Vec<u8>,
+    pub commit: String,
+}
+
 /// Contains all active diff providers. Diff providers are compiled in via features. Currently
 /// only `git` is supported.
 #[derive(Clone)]
@@ -38,6 +43,48 @@ pub struct DiffProviderRegistry {
 }
 
 impl DiffProviderRegistry {
+    /// Resolve a pull-request baseline and decode it on the bounded Git worker.
+    pub async fn prepare_review_with<T: Send + 'static>(
+        &self,
+        file: PathBuf,
+        reference: String,
+        trust: impl FnOnce() -> bool + Send + 'static,
+        cancel: helix_event::TaskHandle,
+        finish: impl FnOnce(RevisionDiffBase, &helix_event::TaskHandle, bool) -> T + Send + 'static,
+    ) -> Result<Option<T>> {
+        let Some(permit) =
+            helix_event::cancelable_future(self.workers.clone().acquire_owned(), &cancel)
+                .await
+                .transpose()?
+        else {
+            return Ok(None);
+        };
+        let provider = self
+            .providers
+            .first()
+            .copied()
+            .unwrap_or(DiffProvider::None);
+        let worker_cancel = cancel.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            if worker_cancel.is_canceled() {
+                return Ok(None);
+            }
+            let trust_full = trust();
+            let prepared =
+                provider.get_review_base(&file, &reference, trust_full, &worker_cancel)?;
+            if worker_cancel.is_canceled() {
+                return Ok(None);
+            }
+            Ok(Some(finish(prepared, &worker_cancel, trust_full)))
+        })
+        .await;
+        if cancel.is_canceled() {
+            return Ok(None);
+        }
+        result.map_err(|err| anyhow!("Git review worker failed: {err}"))?
+    }
+
     /// Prepare both gutter inputs together without blocking the editor. The
     /// permit belongs to the blocking closure, so canceling an async caller
     /// cannot start more workers while its filesystem operation is still busy.
@@ -417,6 +464,41 @@ mod preparation_tests {
     }
 
     #[tokio::test]
+    async fn queued_review_cancellation_skips_git_and_preserves_worker_slots() {
+        let registry = DiffProviderRegistry::default();
+        let busy = registry
+            .workers
+            .clone()
+            .acquire_many_owned(2)
+            .await
+            .unwrap();
+        let worker = registry.clone();
+        let mut controller = helix_event::TaskController::new();
+        let cancel = controller.restart();
+        let task = tokio::spawn(async move {
+            worker
+                .prepare_review_with::<()>(
+                    PathBuf::from("missing/file.txt"),
+                    "main".into(),
+                    || panic!("canceled review queried trust"),
+                    cancel,
+                    |_, _, _| panic!("canceled review started decoding"),
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        controller.cancel();
+        assert!(tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .is_none());
+        drop(busy);
+        assert_eq!(registry.workers.available_permits(), 2);
+    }
+
+    #[tokio::test]
     async fn canceled_vcs_request_never_runs_its_preparation_callback() {
         let registry = DiffProviderRegistry::default();
         let mut controller = helix_event::TaskController::new();
@@ -446,6 +528,23 @@ enum DiffProvider {
 }
 
 impl DiffProvider {
+    fn get_review_base(
+        &self,
+        file: &Path,
+        reference: &str,
+        trust_full: bool,
+        cancel: &helix_event::TaskHandle,
+    ) -> Result<RevisionDiffBase> {
+        match self {
+            #[cfg(feature = "git")]
+            Self::Git => git::get_review_base(file, reference, trust_full, cancel),
+            Self::None => {
+                let _ = (file, reference, trust_full, cancel);
+                bail!("Git diff support is not available")
+            }
+        }
+    }
+
     fn prepare_vcs(
         &self,
         file: &Path,

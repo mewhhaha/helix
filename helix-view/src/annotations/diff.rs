@@ -47,7 +47,7 @@ pub struct DiffCursor {
     document: DocumentId,
     version: i32,
     selection: u64,
-    diff_key: (u64, bool),
+    diff_key: (u64, bool, u64),
 }
 
 pub struct Deletion {
@@ -66,7 +66,7 @@ impl Deletion {
 pub struct DiffDisplay {
     document: DocumentId,
     version: i32,
-    diff_key: (u64, bool),
+    diff_key: (u64, bool, u64),
     pub layout_key: u64,
     pub base: Rope,
     pub hunks: Vec<Hunk>,
@@ -96,7 +96,7 @@ impl DiffMode {
                 && cursor.document == doc.id()
                 && cursor.version == doc.version()
                 && cursor.selection == doc.selection_generation(view)
-                && doc.diff_handle().map(|diff| diff.render_key()) == Some(cursor.diff_key)
+                && doc.review_diff_key() == Some(cursor.diff_key)
         })
     }
 
@@ -269,13 +269,14 @@ impl DiffMode {
         if !self.enabled {
             return None;
         }
-        let diff = doc.diff_handle()?.load();
+        let diff = doc.review_diff_handle()?.load();
         // A worker can briefly lag behind edits. Its old line numbers must not
         // be used to insert virtual rows into the newer text.
         if !diff.doc().is_instance(doc.text()) {
             return None;
         }
-        let diff_key = diff.render_key();
+        let (revision, inverted) = diff.render_key();
+        let diff_key = (revision, inverted, doc.review_diff_generation());
         let mut cache = self.cache.borrow_mut();
         if let Some(display) = cache.as_ref().filter(|display| {
             display.document == doc.id()
@@ -456,6 +457,66 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn named_review_base_invalidates_caches_and_tracks_edits() {
+        let (mut doc, mut view) = fixture("keep\nold\nsame\n", "keep\nnew\nsame\n").await;
+        let old = view.diff_mode.display(&doc).unwrap();
+        let before = old.deletions[0].before.clone();
+        view.diff_mode
+            .set_cursor(&doc, view.id, before.clone(), 0, 0);
+        doc.set_review_diff_base(
+            "main".into(),
+            "base-commit".into(),
+            Rope::from_str("keep\nmain\nsame\n"),
+        );
+        async fn wait_review(doc: &Document) {
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    let ready = {
+                        let diff = doc.review_diff_handle().unwrap().load();
+                        diff.render_key().0 != 0 && diff.doc().is_instance(doc.text())
+                    };
+                    if ready {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        wait_review(&doc).await;
+        let review = view.diff_mode.display(&doc).unwrap();
+        assert_eq!(review.deleted_text(&before).to_string(), "main\n");
+        assert!(!Arc::ptr_eq(&old, &review));
+        assert!(view.diff_mode.cursor(&doc, view.id).is_none());
+        assert_eq!(
+            doc.diff_handle().unwrap().load().diff_base().to_string(),
+            "keep\nold\nsame\n"
+        );
+        let change = Transaction::change(doc.text(), [(5, 8, Some("unsaved".into()))].into_iter());
+        assert!(doc.apply(&change, view.id));
+        wait_review(&doc).await;
+        assert_eq!(
+            doc.review_diff_handle().unwrap().load().doc().to_string(),
+            "keep\nunsaved\nsame\n"
+        );
+        assert_eq!(
+            view.diff_mode.display(&doc).unwrap().base.to_string(),
+            "keep\nmain\nsame\n"
+        );
+        view.diff_mode.enabled = false;
+        assert!(view.diff_mode.display(&doc).is_none());
+        assert_eq!(doc.review_diff_reference(), Some("main"));
+        view.diff_mode.enabled = true;
+        assert_eq!(
+            view.diff_mode.display(&doc).unwrap().base.to_string(),
+            "keep\nmain\nsame\n"
+        );
+        doc.set_path(Some(std::path::Path::new("renamed.txt")));
+        assert!(doc.review_diff_reference().is_none());
     }
 
     #[tokio::test(flavor = "multi_thread")]

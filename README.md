@@ -57,8 +57,16 @@ See the [cursor configuration](./book/src/configuration.md) and
 
 ## Diff mode
 
-Use `:diff-mode` to toggle a Git diff against HEAD in the current view
-(`:diff-mode on` and `:diff-mode off` also work). Added and changed rows have a
+Use `:diff-mode` to toggle a Git diff in the current view
+(`:diff-mode on` and `:diff-mode off` also work). The default base is HEAD.
+Use `:diff-mode main` or `:diff-mode origin/main` to review the current buffer
+against the common ancestor of HEAD and that revision, like a pull request.
+This includes committed branch changes and unsaved edits while excluding changes
+made only on the target branch. `:diff-mode HEAD` returns to local changes.
+The selected base is remembered for the buffer; repeat the revision command to
+refresh its pinned commit. These commands use local Git references.
+
+Added and changed rows have a
 green background and a `+` gutter before the line numbers. Diff backgrounds cover
 the full row, including its gutters. Deleted rows use a red background and a
 `-` gutter. All deleted lines remain visible before the added lines.

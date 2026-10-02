@@ -2680,16 +2680,23 @@ fn diff_mode(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> an
     if event != PromptEvent::Validate {
         return Ok(());
     }
+    if let Some(reference) = args.first().filter(|arg| !matches!(*arg, "on" | "off")) {
+        return cx
+            .editor
+            .request_review_diff(cx.editor.tree.focus, reference.to_owned());
+    }
     let scrolloff = cx.editor.config().scrolloff;
+    cx.editor
+        .cancel_review_diff(cx.editor.tree.get(cx.editor.tree.focus).doc);
     let (view, doc) = current!(cx.editor);
     let enabled = match args.first() {
         None => !view.diff_mode.enabled,
         Some("on") => true,
         Some("off") => false,
-        Some(_) => bail!("Usage: diff-mode [on|off]"),
+        Some(_) => unreachable!("Git revisions are handled above"),
     };
     ensure!(
-        !enabled || doc.diff_handle().is_some(),
+        !enabled || doc.review_diff_handle().is_some(),
         "Diff is not available in the current buffer"
     );
     view.diff_mode.enabled = enabled;
@@ -2703,11 +2710,15 @@ fn diff_mode(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> an
         view.diff_mode.release_scroll();
     }
     view.ensure_cursor_in_view(doc, scrolloff);
-    cx.editor.set_status(if enabled {
-        "Diff mode enabled"
+    let status = if enabled {
+        doc.review_diff_reference().map_or_else(
+            || "Diff mode enabled".to_owned(),
+            |reference| format!("Diff mode enabled against {reference}"),
+        )
     } else {
-        "Diff mode disabled"
-    });
+        "Diff mode disabled".to_owned()
+    };
+    cx.editor.set_status(status);
     Ok(())
 }
 
@@ -2724,7 +2735,12 @@ fn reset_diff_change(
     let scrolloff = editor.config().scrolloff;
 
     let (view, doc) = current!(editor);
-    let Some(handle) = doc.diff_handle() else {
+    let handle = if view.diff_mode.enabled {
+        doc.review_diff_handle()
+    } else {
+        doc.diff_handle()
+    };
+    let Some(handle) = handle else {
         bail!("Diff is not available in the current buffer")
     };
 
@@ -4014,7 +4030,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     TypableCommand {
         name: "diff-mode",
         aliases: &[],
-        doc: "Toggle the current view's Git diff display, or set it with on/off.",
+        doc: "Toggle Git diff display, set on/off, or compare with the merge base of HEAD and a Git revision (e.g. main, origin/main, HEAD).",
         fun: diff_mode,
         completer: CommandCompleter::none(),
         signature: Signature { positionals: (0, Some(1)), ..Signature::DEFAULT },

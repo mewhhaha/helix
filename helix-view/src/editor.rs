@@ -40,7 +40,7 @@ use tokio::{
     time::{sleep, Duration, Instant, Sleep},
 };
 
-use anyhow::{anyhow, bail, Error};
+use anyhow::{anyhow, bail, Context, Error};
 
 pub use helix_core::diagnostic::Severity;
 use helix_core::{
@@ -1485,6 +1485,7 @@ pub struct Editor {
     pub save_queue: SelectAll<Flatten<UnboundedReceiverStream<Once<DocumentSavedEventFuture>>>>,
     pub write_count: usize,
     vcs_tasks: FuturesUnordered<tokio::task::JoinHandle<Option<PreparedDocumentVcs>>>,
+    review_diff_tasks: FuturesUnordered<tokio::task::JoinHandle<PreparedReviewDiff>>,
 
     pub count: Option<std::num::NonZeroUsize>,
     pub selected_register: Option<char>,
@@ -1560,6 +1561,16 @@ struct PreparedDocumentVcs {
     cancel: helix_event::TaskHandle,
     diff_base: Option<helix_core::Rope>,
     head: Option<Arc<ArcSwap<Box<str>>>>,
+}
+
+struct PreparedReviewDiff {
+    view: ViewId,
+    document: DocumentId,
+    path: PathBuf,
+    reference: String,
+    encoding: &'static helix_core::encoding::Encoding,
+    cancel: helix_event::TaskHandle,
+    result: anyhow::Result<Option<(helix_core::Rope, String, bool)>>,
 }
 
 #[derive(Debug)]
@@ -1649,6 +1660,7 @@ impl Editor {
             save_queue: SelectAll::new(),
             write_count: 0,
             vcs_tasks: FuturesUnordered::new(),
+            review_diff_tasks: FuturesUnordered::new(),
             count: None,
             selected_register: None,
             macro_recording: None,
@@ -2449,6 +2461,113 @@ impl Editor {
         }));
     }
 
+    pub fn request_review_diff(
+        &mut self,
+        view_id: ViewId,
+        reference: String,
+    ) -> anyhow::Result<()> {
+        let view = self.tree.get(view_id);
+        let document = view.doc;
+        let doc = self.documents.get_mut(&document).unwrap();
+        let path = doc
+            .path()
+            .context("Git review requires a file-backed buffer")?
+            .to_owned();
+        let encoding = doc.encoding();
+        let workspace = doc.workspace_root().to_owned();
+        let workspace_trust = self.workspace_trust.clone();
+        let cancel = doc.review_diff_controller.restart();
+        let providers = self.diff_providers.clone();
+        self.set_status(format!("Loading diff against {reference}…"));
+        self.review_diff_tasks.push(tokio::spawn(async move {
+            let result = providers
+                .prepare_review_with(
+                    path.clone(),
+                    reference.clone(),
+                    move || {
+                        workspace_trust
+                            .query(&workspace, TrustQuery::Git)
+                            .is_trusted()
+                    },
+                    cancel.clone(),
+                    move |prepared, cancel, trust_full| {
+                        let base = Document::decode_diff_base(prepared.bytes, encoding, cancel)
+                            .context("Cannot decode Git review baseline")?;
+                        Ok((base, prepared.commit, trust_full))
+                    },
+                )
+                .await
+                .and_then(Option::transpose);
+            PreparedReviewDiff {
+                view: view_id,
+                document,
+                path,
+                reference,
+                encoding,
+                cancel,
+                result,
+            }
+        }));
+        Ok(())
+    }
+
+    fn apply_prepared_review_diff(&mut self, prepared: PreparedReviewDiff) -> bool {
+        let Some(view) = self.tree.try_get(prepared.view) else {
+            return false;
+        };
+        let Some(doc) = self.documents.get_mut(&prepared.document) else {
+            return false;
+        };
+        if prepared.cancel.is_canceled()
+            || view.doc != prepared.document
+            || doc.path() != Some(prepared.path.as_path())
+        {
+            return false;
+        }
+        let (base, commit, trust_full) = match prepared.result {
+            Ok(Some(result)) => result,
+            Ok(None) => return false,
+            Err(err) => {
+                self.set_error(format!(
+                    "Cannot review against {}: {err:#}",
+                    prepared.reference
+                ));
+                return true;
+            }
+        };
+        let current_trust = self
+            .workspace_trust
+            .query(doc.workspace_root(), TrustQuery::Git)
+            .is_trusted();
+        if trust_full != current_trust || !std::ptr::eq(prepared.encoding, doc.encoding()) {
+            if let Err(err) = self.request_review_diff(prepared.view, prepared.reference) {
+                self.set_error(err.to_string());
+            }
+            return true;
+        }
+        let status = format!(
+            "Diff mode enabled against {} ({})",
+            prepared.reference,
+            &commit[..commit.len().min(8)]
+        );
+        doc.set_review_diff_base(prepared.reference, commit, base);
+        let view = self.tree.get_mut(prepared.view);
+        view.diff_mode.enabled = true;
+        view.diff_mode.clear_cursor();
+        let mut offset = doc.view_offset(view.id);
+        offset.vertical_offset = 0;
+        doc.set_view_offset(view.id, offset);
+        view.diff_mode.hold_scroll(doc, view.id);
+        self.set_status(status);
+        true
+    }
+
+    pub fn cancel_review_diff(&mut self, document: DocumentId) {
+        if let Some(doc) = self.documents.get_mut(&document) {
+            doc.review_diff_controller.cancel();
+        }
+    }
+
     fn apply_prepared_vcs(&mut self, prepared: PreparedDocumentVcs) -> bool {
         let Some(doc) = self.documents.get_mut(&prepared.document) else {
             return false;
@@ -2823,6 +2942,16 @@ impl Editor {
                         Err(err) => log::error!("VCS preparation failed: {err}"),
                     }
                 }
+                Some(result) = self.review_diff_tasks.next() => {
+                    match result {
+                        Ok(prepared) => {
+                            if self.apply_prepared_review_diff(prepared) {
+                                return EditorEvent::Redraw;
+                            }
+                        }
+                        Err(err) => log::error!("Git review preparation failed: {err}"),
+                    }
+                }
                 Some(message) = self.language_servers.incoming.next(), if poll_lsp => {
                     return EditorEvent::LanguageServerMessage(message)
                 }
@@ -3110,6 +3239,146 @@ mod vcs_loading_tests {
             diff_base: Some(Rope::from_str("committed\n")),
             head: Some(Arc::new(ArcSwap::from_pointee("main".into()))),
         }
+    }
+
+    fn prepared_review(editor: &mut Editor, document: DocumentId) -> PreparedReviewDiff {
+        let doc = editor.documents.get_mut(&document).unwrap();
+        PreparedReviewDiff {
+            view: editor.tree.focus,
+            document,
+            path: doc.path().unwrap().to_owned(),
+            reference: "main".into(),
+            encoding: UTF_8,
+            cancel: doc.review_diff_controller.restart(),
+            result: Ok(Some((
+                Rope::from_str("shared baseline\n"),
+                "0123456789abcdef".into(),
+                true,
+            ))),
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_review_rejects_superseded_canceled_renamed_and_closed_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut editor = editor();
+        let id = document(&mut editor, &dir.path().join("file.txt"));
+        editor.switch(id, Action::VerticalSplit);
+        let older = prepared_review(&mut editor, id);
+        let current = prepared_review(&mut editor, id);
+        assert!(!editor.apply_prepared_review_diff(older));
+        assert!(editor.documents[&id].review_diff_reference().is_none());
+        assert!(editor.apply_prepared_review_diff(current));
+        assert!(editor.tree.get(editor.tree.focus).diff_mode.enabled);
+        assert_eq!(editor.documents[&id].review_diff_reference(), Some("main"));
+
+        let canceled = prepared_review(&mut editor, id);
+        editor.cancel_review_diff(id);
+        editor.tree.get_mut(editor.tree.focus).diff_mode.enabled = false;
+        assert!(!editor.apply_prepared_review_diff(canceled));
+        assert!(!editor.tree.get(editor.tree.focus).diff_mode.enabled);
+        assert_eq!(editor.documents[&id].review_diff_reference(), Some("main"));
+
+        let old_path = prepared_review(&mut editor, id);
+        editor
+            .documents
+            .get_mut(&id)
+            .unwrap()
+            .set_path(Some(&dir.path().join("renamed.txt")));
+        assert!(!editor.apply_prepared_review_diff(old_path));
+        assert!(editor.documents[&id].review_diff_reference().is_none());
+
+        let switched = prepared_review(&mut editor, id);
+        let other = document(&mut editor, &dir.path().join("other.txt"));
+        editor.switch(other, Action::Replace);
+        assert!(!editor.apply_prepared_review_diff(switched));
+        assert!(editor.documents[&other].review_diff_reference().is_none());
+        editor.switch(id, Action::Replace);
+        let closed = prepared_review(&mut editor, id);
+        editor.documents.remove(&id);
+        assert!(!editor.apply_prepared_review_diff(closed));
+    }
+
+    #[tokio::test]
+    async fn prepared_review_compares_latest_edits_and_errors_preserve_the_previous_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut editor = editor();
+        let id = document(&mut editor, &dir.path().join("file.txt"));
+        editor.switch(id, Action::VerticalSplit);
+        let vcs = prepared(&mut editor, id);
+        assert!(editor.apply_prepared_vcs(vcs));
+        let result = prepared_review(&mut editor, id);
+        let view = editor.tree.focus;
+        let doc = editor.documents.get_mut(&id).unwrap();
+        let transaction = Transaction::change(
+            doc.text(),
+            [(0, 9, Some("unsaved edit".into()))].into_iter(),
+        );
+        assert!(doc.apply(&transaction, view));
+        assert!(editor.apply_prepared_review_diff(result));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let ready = {
+                    let diff = editor.documents[&id].review_diff_handle().unwrap().load();
+                    diff.diff_base() == "shared baseline\n" && diff.doc() == "unsaved edit\n"
+                };
+                if ready {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let previous = editor.documents[&id].review_diff_key();
+        let mut invalid = prepared_review(&mut editor, id);
+        invalid.reference = "unknown-branch".into();
+        invalid.result = Err(anyhow!("Cannot resolve Git revision 'unknown-branch'"));
+        assert!(editor.apply_prepared_review_diff(invalid));
+        assert!(editor.is_err());
+        assert!(editor
+            .get_status()
+            .unwrap()
+            .0
+            .contains("Cannot review against unknown-branch"));
+        assert!(editor.tree.get(view).diff_mode.enabled);
+        assert_eq!(editor.documents[&id].review_diff_key(), previous);
+        assert_eq!(editor.documents[&id].review_diff_reference(), Some("main"));
+        assert_eq!(editor.documents[&id].text().to_string(), "unsaved edit\n");
+        assert_eq!(
+            editor.documents[&id]
+                .diff_handle()
+                .unwrap()
+                .load()
+                .diff_base()
+                .to_string(),
+            "committed\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_review_rechecks_trust_and_encoding_before_applying() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut editor = editor();
+        let id = document(&mut editor, &dir.path().join("file.txt"));
+        editor.switch(id, Action::VerticalSplit);
+        let result = prepared_review(&mut editor, id);
+        editor.workspace_trust = WorkspaceTrust::new(Default::default());
+        assert!(editor.apply_prepared_review_diff(result));
+        assert!(editor.documents[&id].review_diff_reference().is_none());
+        assert!(!editor.tree.get(editor.tree.focus).diff_mode.enabled);
+
+        editor.workspace_trust = WorkspaceTrust::fully_trusted();
+        let result = prepared_review(&mut editor, id);
+        editor
+            .documents
+            .get_mut(&id)
+            .unwrap()
+            .set_encoding("windows-1252")
+            .unwrap();
+        assert!(editor.apply_prepared_review_diff(result));
+        assert!(editor.documents[&id].review_diff_reference().is_none());
+        assert!(!editor.tree.get(editor.tree.focus).diff_mode.enabled);
     }
 
     #[tokio::test]

@@ -49,6 +49,7 @@ pub(super) struct RenderKey {
     colors: Option<Identity<ColorRanges>>,
     code_actions: bool,
     diff: Option<(u64, bool)>,
+    review_diff: Option<(u64, bool, u64)>,
     diff_mode: bool,
     diff_cursor: Option<helix_view::annotations::diff::DiffCursor>,
     gutters: GutterConfig,
@@ -123,6 +124,11 @@ impl RenderKey {
             diff: doc.diff_handle().map(|diff| diff.render_key()),
             diff_mode: view.diff_mode.enabled,
             diff_cursor: view.diff_mode.cursor(doc, view.id).cloned(),
+            review_diff: view
+                .diff_mode
+                .enabled
+                .then(|| doc.review_diff_key())
+                .flatten(),
             gutters: view.gutters.clone(),
             tab_width: doc.tab_width(),
             indent_width: doc.indent_style.indent_width(doc.tab_width()),
