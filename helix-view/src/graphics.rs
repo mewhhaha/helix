@@ -638,6 +638,21 @@ impl Style {
             .remove_modifier(Modifier::DIM | Modifier::REVERSED)
     }
 
+    /// Show a color swatch on this text's displayed background. Reversed text
+    /// uses its foreground as the background; the swatch itself stays RGB.
+    pub fn color_swatch(self, color: Color) -> Self {
+        let background = if self.add_modifier.contains(Modifier::REVERSED) {
+            self.fg
+        } else {
+            self.bg
+        };
+        Self {
+            bg: background,
+            ..self.fg(color)
+        }
+        .remove_modifier(Modifier::DIM | Modifier::REVERSED)
+    }
+
     /// Returns a `Style` resetting all properties.
     pub const fn reset() -> Self {
         Self {

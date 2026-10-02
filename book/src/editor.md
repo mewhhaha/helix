@@ -174,8 +174,8 @@ The following statusline elements can be configured:
 | `auto-document-highlight` | Automatically highlight symbol references at the cursor | `false` |
 | `display-inlay-hints` | Display inlay hints[^2]                                     | `false` |
 | `inlay-hints-length-limit` | Maximum displayed length (non-zero number) of inlay hints | Unset by default  |
-| `display-color-swatches` | Show color swatches next to colors in the editor and hover popups | `false` |
-| `display-color-values` | Show color backgrounds with contrasting black or white text for colors reported by language servers in the editor and CSS color values in hover popups | `true` |
+| `display-color-swatches` | Show color swatches next to colors in the editor and hover popups, using the referenced text's background | `true` |
+| `display-color-values` | Show color backgrounds with contrasting black or white text for colors reported by language servers in the editor and CSS color values in hover popups | `false` |
 | `display-signature-help-docs` | Display docs under signature help popup             | `true`  |
 | `snippets`      | Enables snippet completions. Requires a server restart (`:lsp-restart`) to take effect after `:config-reload`/`:set`. | `true`  |
 | `goto-reference-include-declaration` | Include declaration in the goto references popup. | `true`  |

@@ -31,6 +31,18 @@
 
 Normal mode is the default mode when you launch helix. You can return to it from other modes by pressing the `Escape` key.
 
+In `:diff-mode`, all deleted rows stay visible before the added rows, with syntax
+highlighting from the original file. `j`/`k` and the arrow keys also visit deleted
+rows. Use `v` and character, word, or line movements to select deleted text,
+`x` to select lines, `%` to select the deleted block, and `y` or clipboard yank
+commands to copy it. Mouse dragging selects old text. Selections stay within one
+deleted block. Deleted rows are read-only; move to a
+current source row to edit.
+Diagnostic navigation (`]d`, `[d`, `]D`, `[D`) also includes diff hunks while
+diff mode is on, without requiring an LSP. Each hunk is one stop; deletions focus
+their old text. Counts such as `3]d` skip multiple stops. These commands include
+real LSP diagnostics in file order and stop at the first or last available target.
+
 ### Movement
 
 > NOTE: Unlike Vim, `f`, `F`, `t` and `T` are not confined to the current line.
@@ -361,10 +373,10 @@ These mappings are in the style of [vim-unimpaired](https://github.com/tpope/vim
 
 | Key      | Description                                  | Command                 |
 | -----    | -----------                                  | -------                 |
-| `]d`     | Go to next diagnostic (**LSP**)              | `goto_next_diag`        |
-| `[d`     | Go to previous diagnostic (**LSP**)          | `goto_prev_diag`        |
-| `]D`     | Go to last diagnostic in document (**LSP**)  | `goto_last_diag`        |
-| `[D`     | Go to first diagnostic in document (**LSP**) | `goto_first_diag`       |
+| `]d`     | Go to next diagnostic or diff hunk           | `goto_next_diag`        |
+| `[d`     | Go to previous diagnostic or diff hunk       | `goto_prev_diag`        |
+| `]D`     | Go to last diagnostic or diff hunk           | `goto_last_diag`        |
+| `[D`     | Go to first diagnostic or diff hunk          | `goto_first_diag`       |
 | `]f`     | Go to next function (**TS**)                 | `goto_next_function`    |
 | `[f`     | Go to previous function (**TS**)             | `goto_prev_function`    |
 | `]t`     | Go to next type definition (**TS**)          | `goto_next_class`       |

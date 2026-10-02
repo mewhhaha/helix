@@ -54,6 +54,9 @@ impl Registers {
             }
             '.' => {
                 let (view, doc) = current_ref!(editor);
+                if let Some(text) = view.diff_mode.selected_text(doc, view.id) {
+                    return Some(RegisterValues::new(iter::once(Cow::Owned(text))));
+                }
                 let text = doc.text().slice(..);
                 Some(RegisterValues::new(doc.selection(view.id).fragments(text)))
             }

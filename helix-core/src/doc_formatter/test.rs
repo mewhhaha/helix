@@ -191,10 +191,7 @@ fn annotation() {
 
 #[test]
 fn annotation_and_overlay() {
-    let annotations = [InlineAnnotation {
-        char_idx: 0,
-        text: "fooo".into(),
-    }];
+    let annotations = [InlineAnnotation::new(0, "fooo")];
     let overlay = [Overlay {
         char_idx: 0,
         grapheme: "\t".into(),

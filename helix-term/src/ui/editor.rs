@@ -106,7 +106,9 @@ impl EditorView {
 
         let view_offset = doc.view_offset(view.id);
 
-        let text_annotations = view.text_annotations(doc, Some(theme));
+        let diff_display = view.diff_mode.display(doc);
+        let text_annotations =
+            view.text_annotations_with_diff(doc, Some(theme), diff_display.clone());
         let key = render_cache::RenderKey::new(
             self,
             editor,
@@ -138,11 +140,12 @@ impl EditorView {
         }
         let mut decorations = DecorationManager::default();
 
-        if is_focused && config.cursorline {
+        let diff_cursor = view.diff_mode.cursor(doc, view.id).is_some();
+        if is_focused && config.cursorline && !diff_cursor {
             decorations.add_decoration(Self::cursorline(doc, view, theme));
         }
 
-        if is_focused && config.cursorcolumn {
+        if is_focused && config.cursorcolumn && !diff_cursor {
             Self::highlight_cursorcolumn(doc, view, surface, theme, inner, &text_annotations);
         }
 
@@ -154,7 +157,7 @@ impl EditorView {
                 if pos.doc_line != dap_line {
                     return;
                 }
-                renderer.set_style(Rect::new(inner.x, pos.visual_line, inner.width, 1), style);
+                renderer.set_row_style(inner.x, pos.visual_line, inner.width, style);
             };
 
             decorations.add_decoration(line_decoration);
@@ -162,6 +165,18 @@ impl EditorView {
 
         let syntax_highlighter =
             Self::doc_syntax_highlighter(doc, view_offset.anchor, inner.height, &loader);
+        if let Some(display) = diff_display {
+            let base_syntax = view.diff_mode.base_syntax(doc, &display, &loader);
+            decorations.add_decoration(text_decorations::diff::DiffDecoration::new(
+                display,
+                theme,
+                view.gutter_offset(doc),
+                doc.tab_width() as u16,
+                view.diff_mode.cursor(doc, view.id).cloned(),
+                base_syntax,
+                &loader,
+            ));
+        }
         let mut overlays = Vec::new();
 
         overlays.push(Self::overlay_syntax_highlights(
@@ -212,14 +227,16 @@ impl EditorView {
             if let Some(tabstops) = Self::tabstop_highlights(doc, theme) {
                 overlays.push(tabstops);
             }
-            overlays.push(Self::doc_selection_highlights(
-                editor.mode(),
-                doc,
-                view,
-                theme,
-                &config.cursor_shape,
-                self.terminal_focused && !self.graphics_cursor,
-            ));
+            if !diff_cursor {
+                overlays.push(Self::doc_selection_highlights(
+                    editor.mode(),
+                    doc,
+                    view,
+                    theme,
+                    &config.cursor_shape,
+                    self.terminal_focused && !self.graphics_cursor,
+                ));
+            }
             if let Some(overlay) = Self::highlight_focused_view_elements(view, doc, theme) {
                 overlays.push(overlay);
             }
@@ -244,7 +261,7 @@ impl EditorView {
             .selection(view.id)
             .primary()
             .cursor(doc.text().slice(..));
-        if is_focused {
+        if is_focused && !diff_cursor {
             decorations.add_decoration(text_decorations::Cursor {
                 cache: &editor.cursor_cache,
                 primary_cursor,
@@ -274,6 +291,25 @@ impl EditorView {
             theme,
             decorations,
         );
+        if is_focused && diff_cursor {
+            let position = view.diff_cursor_screen_coords(doc);
+            editor.cursor_cache.set(position);
+            if self.terminal_focused && !self.graphics_cursor {
+                if let Some(pos) = position {
+                    let style = theme.get(match editor.mode {
+                        Mode::Select => "ui.cursor.primary.select",
+                        _ => "ui.cursor.primary.normal",
+                    });
+                    let x = inner.x + pos.col as u16;
+                    let y = inner.y + pos.row as u16;
+                    let width = surface[(x, y)]
+                        .width()
+                        .max(1)
+                        .min((inner.right() - x) as usize) as u16;
+                    surface.set_style(Rect::new(x, y, width, 1), style);
+                }
+            }
+        }
 
         // if we're not at the edge of the screen, draw a right border
         if viewport.right() != view.area.right() {
@@ -758,7 +794,7 @@ impl EditorView {
     ) {
         let cursors: Rc<[_]> = Self::visible_cursor_lines(doc, view).into();
 
-        let mut offset = 0;
+        let mut offset = u16::from(view.diff_mode.enabled);
 
         let gutter_style = theme.get("ui.gutter");
         let gutter_selected_style = theme.get("ui.gutter.selected");
@@ -766,6 +802,9 @@ impl EditorView {
         let gutter_selected_style_virtual = theme.get("ui.gutter.selected.virtual");
 
         for gutter_type in view.gutters() {
+            if view.diff_mode.enabled && *gutter_type == helix_view::editor::GutterType::Diff {
+                continue;
+            }
             let mut gutter = gutter_type.style(editor, doc, view, theme, is_focused);
             let width = gutter_type.width(view, doc);
             // avoid lots of small allocations by reusing a text buffer for each line
@@ -787,16 +826,19 @@ impl EditorView {
                 if let Some(style) =
                     gutter(pos.doc_line, selected, pos.first_visual_line, &mut text)
                 {
-                    renderer.set_stringn(x, y, &text, width, gutter_style.patch(style));
+                    renderer.set_stringn(
+                        x,
+                        y,
+                        &text,
+                        width,
+                        gutter_style.patch(style).patch(renderer.line_style),
+                    );
                 } else {
-                    renderer.set_style(
-                        Rect {
-                            x,
-                            y,
-                            width: width as u16,
-                            height: 1,
-                        },
-                        gutter_style,
+                    renderer.set_row_style(
+                        x,
+                        y,
+                        width as u16,
+                        gutter_style.patch(renderer.line_style),
                     );
                 }
                 text.clear();
@@ -883,11 +925,15 @@ impl EditorView {
         let viewport = view.area;
 
         move |renderer: &mut TextRenderer, pos: LinePos| {
-            let area = Rect::new(viewport.x, pos.visual_line, viewport.width, 1);
             if primary_line == pos.doc_line {
-                renderer.set_style(area, primary_style);
+                renderer.set_row_style(viewport.x, pos.visual_line, viewport.width, primary_style);
             } else if secondary_lines.binary_search(&pos.doc_line).is_ok() {
-                renderer.set_style(area, secondary_style);
+                renderer.set_row_style(
+                    viewport.x,
+                    pos.visual_line,
+                    viewport.width,
+                    secondary_style,
+                );
             }
         }
     }
@@ -1261,8 +1307,44 @@ impl EditorView {
             MouseEventKind::Down(MouseButton::Left) => {
                 let editor = &mut cxt.editor;
 
+                let deletion = editor.tree.views().find_map(|(view, _)| {
+                    view.diff_position_at_screen_coords(&editor.documents[&view.doc], row, column)
+                        .map(|(range, old_row, old_column)| (view.id, range, old_row, old_column))
+                });
+                if let Some((view_id, range, old_row, old_column)) = deletion {
+                    editor.focus(view_id);
+                    let (view, doc) = current!(editor);
+                    if let Some(display) = view.diff_mode.display(doc) {
+                        if let Some(deletion) = display.deletions.iter().find(|d| d.before == range)
+                        {
+                            let previous = view
+                                .diff_mode
+                                .cursor(doc, view.id)
+                                .filter(|cursor| cursor.before == range)
+                                .map(|cursor| cursor.range);
+                            doc.set_selection(view.id, Selection::point(deletion.anchor));
+                            view.diff_mode
+                                .set_cursor(doc, view.id, range, old_row, old_column);
+                            if editor.mode == Mode::Select {
+                                if let Some(previous) = previous {
+                                    view.diff_mode.select(doc, view.id, |text, current| {
+                                        previous.put_cursor(text, current.cursor(text), true)
+                                    });
+                                }
+                            }
+                            editor.mouse_down_range = view
+                                .diff_mode
+                                .cursor(doc, view.id)
+                                .map(|cursor| cursor.range);
+                            editor.ensure_cursor_in_view(view_id);
+                        }
+                    }
+                    return EventResult::Consumed(None);
+                }
+
                 if let Some((pos, view_id)) = pos_and_view(editor, row, column, true) {
                     editor.focus(view_id);
+                    view_mut!(editor).diff_mode.clear_cursor();
 
                     let prev_view_id = view!(editor).id;
                     let doc = doc_mut!(editor, &view!(editor, view_id).doc);
@@ -1316,6 +1398,34 @@ impl EditorView {
             MouseEventKind::Drag(MouseButton::Left) => {
                 let (view, doc) = current!(cxt.editor);
 
+                if let Some(cursor) = view.diff_mode.cursor(doc, view.id).cloned() {
+                    if let Some((before, old_row, old_column)) =
+                        view.diff_position_at_screen_coords(doc, row, column)
+                    {
+                        if before == cursor.before {
+                            let format = helix_core::doc_formatter::TextFormat {
+                                tab_width: doc.tab_width() as u16,
+                                ..Default::default()
+                            };
+                            view.diff_mode.select(doc, view.id, |text, range| {
+                                let pos = helix_core::char_idx_at_visual_offset(
+                                    text,
+                                    text.line_to_char(old_row),
+                                    0,
+                                    old_column,
+                                    &format,
+                                    &helix_core::text_annotations::TextAnnotations::default(),
+                                )
+                                .0;
+                                range.put_cursor(text, pos, true)
+                            });
+                            let id = view.id;
+                            cxt.editor.ensure_cursor_in_view(id);
+                        }
+                    }
+                    return EventResult::Consumed(None);
+                }
+
                 let pos = match view.pos_at_screen_coords(doc, row, column, true) {
                     Some(pos) => pos,
                     None => return EventResult::Ignored(None),
@@ -1345,7 +1455,7 @@ impl EditorView {
                 }
 
                 let offset = config.scroll_lines.unsigned_abs();
-                commands::scroll(cxt, offset, direction, false);
+                commands::scroll(cxt, offset, direction, commands::ScrollCursor::Preserve);
 
                 cxt.editor.tree.focus = current_view;
                 cxt.editor.ensure_cursor_in_view(current_view);
@@ -1360,8 +1470,12 @@ impl EditorView {
 
                 let (view, doc) = current!(cxt.editor);
 
+                let review = view.diff_mode.cursor(doc, view.id);
+                let selected =
+                    review.map_or(doc.selection(view.id).primary(), |cursor| cursor.range);
                 let should_yank = match cxt.editor.mouse_down_range.take() {
-                    Some(down_range) => doc.selection(view.id).primary() != down_range,
+                    Some(down_range) => selected != down_range,
+                    None if review.is_some() => !selected.is_empty(),
                     None => {
                         // This should not happen under normal cases. We fall back to the original
                         // behavior of yanking on non-single-char selections.

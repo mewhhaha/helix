@@ -1,6 +1,9 @@
 use crate::{
     align_view,
-    annotations::diagnostics::InlineDiagnostics,
+    annotations::{
+        diagnostics::InlineDiagnostics,
+        diff::{Deletion, DiffAnnotation, DiffCursor, DiffMode},
+    },
     document::{DocumentColorSwatches, DocumentInlayHints},
     editor::{GutterConfig, GutterType},
     graphics::Rect,
@@ -163,6 +166,7 @@ pub struct View {
     pub object_selections: Vec<Selection>,
     /// all gutter-related configuration settings, used primarily for gutter rendering
     pub gutters: GutterConfig,
+    pub diff_mode: DiffMode,
     /// A mapping between documents and the last history revision the view was updated at.
     /// Changes between documents and views are synced lazily when switching windows. This
     /// mapping keeps track of the last applied history revision so that only new changes
@@ -199,6 +203,7 @@ impl View {
             last_modified_docs: [None, None],
             object_selections: Vec::new(),
             gutters,
+            diff_mode: DiffMode::default(),
             doc_revisions: HashMap::new(),
             diagnostics_handler: DiagnosticsHandler::new(),
         }
@@ -232,8 +237,10 @@ impl View {
             .gutters
             .layout
             .iter()
+            .filter(|&&gutter| !self.diff_mode.enabled || gutter != GutterType::Diff)
             .map(|gutter| gutter.width(self, doc) as u16)
-            .sum();
+            .sum::<u16>()
+            + u16::from(self.diff_mode.enabled);
         if total_width < self.area.width {
             total_width
         } else {
@@ -283,7 +290,7 @@ impl View {
 
         let cursor = doc.selection(self.id).primary().cursor(doc_text);
         let mut offset = view_offset;
-        let off = visual_offset_from_anchor(
+        let mut off = visual_offset_from_anchor(
             doc_text,
             offset.anchor,
             cursor,
@@ -291,6 +298,55 @@ impl View {
             &annotations,
             vertical_viewport_end,
         );
+
+        if text_fmt.soft_wrap {
+            offset.horizontal_offset = 0;
+        } else {
+            let col = off
+                .unwrap_or_else(|_| {
+                    visual_offset_from_block(
+                        doc_text,
+                        offset.anchor,
+                        cursor,
+                        &text_fmt,
+                        &annotations,
+                    )
+                })
+                .0
+                .col;
+            let last_col = offset.horizontal_offset + viewport.width.saturating_sub(1) as usize;
+            if col > last_col.saturating_sub(scrolloff_right) {
+                offset.horizontal_offset += col - last_col.saturating_sub(scrolloff_right);
+            } else if col < offset.horizontal_offset + scrolloff_left {
+                offset.horizontal_offset = col.saturating_sub(scrolloff_left);
+            }
+        }
+
+        // Horizontal scrolling hides or reveals inline diagnostics, changing
+        // their virtual row count. Position vertically using the final layout,
+        // including when returning from unwrapped deleted text to wrapped source.
+        let annotations = if offset.horizontal_offset != view_offset.horizontal_offset
+            && annotations.has_line_annotations()
+            && !doc.diagnostics().is_empty()
+        {
+            let annotations = self.text_annotations_for_offset(
+                doc,
+                None,
+                self.diff_mode.display(doc),
+                offset.horizontal_offset,
+            );
+            off = visual_offset_from_anchor(
+                doc_text,
+                offset.anchor,
+                cursor,
+                &text_fmt,
+                &annotations,
+                vertical_viewport_end,
+            );
+            annotations
+        } else {
+            annotations
+        };
 
         let (new_anchor, at_top) = match off {
             Ok((visual_pos, _)) if visual_pos.row < scrolloff_top + offset.vertical_offset => {
@@ -315,35 +371,17 @@ impl View {
             } else {
                 viewport.height as isize - scrolloff_bottom as isize - 1
             };
-            (offset.anchor, offset.vertical_offset) =
-                char_idx_at_visual_offset(doc_text, cursor, -v_off, 0, &text_fmt, &annotations);
-        }
-
-        if text_fmt.soft_wrap {
-            offset.horizontal_offset = 0;
-        } else {
-            // determine the current visual column of the text
-            let col = off
-                .unwrap_or_else(|_| {
-                    visual_offset_from_block(
-                        doc_text,
-                        offset.anchor,
-                        cursor,
-                        &text_fmt,
-                        &annotations,
-                    )
-                })
-                .0
-                .col;
-
-            let last_col = offset.horizontal_offset + viewport.width.saturating_sub(1) as usize;
-            if col > last_col.saturating_sub(scrolloff_right) {
-                // scroll right
-                offset.horizontal_offset += col - (last_col.saturating_sub(scrolloff_right))
-            } else if col < offset.horizontal_offset + scrolloff_left {
-                // scroll left
-                offset.horizontal_offset = col.saturating_sub(scrolloff_left)
+            let leading = if cursor == 0 {
+                annotations.leading_virtual_lines()
+            } else {
+                0
             };
+            let target = leading as isize - v_off;
+            (offset.anchor, offset.vertical_offset) =
+                char_idx_at_visual_offset(doc_text, cursor, target, 0, &text_fmt, &annotations);
+            if offset.anchor == 0 && offset.vertical_offset == 0 && target >= leading as isize {
+                offset.vertical_offset = leading;
+            }
         }
 
         // if we are not centering return None if view position is unchanged
@@ -355,6 +393,13 @@ impl View {
     }
 
     pub fn ensure_cursor_in_view(&self, doc: &mut Document, scrolloff: usize) {
+        if self.diff_mode.preserves_scroll(doc, self.id) {
+            return;
+        }
+        if let Some(cursor) = self.diff_mode.cursor(doc, self.id) {
+            self.ensure_diff_cursor_in_view(doc, cursor, scrolloff);
+            return;
+        }
         if let Some(offset) = self.offset_coords_to_in_view_center::<false>(doc, scrolloff) {
             doc.set_view_offset(self.id, offset);
         }
@@ -442,7 +487,7 @@ impl View {
             pos,
             &text_fmt,
             &annotations,
-            viewport.height as usize,
+            viewport.height as usize + view_offset.vertical_offset,
         )
         .ok()?
         .0;
@@ -458,13 +503,447 @@ impl View {
         Some(pos)
     }
 
+    /// The start of a deletion relative to the visual row containing `anchor`.
+    fn diff_deletion_row(
+        doc: &Document,
+        deletion: &Deletion,
+        anchor: usize,
+        format: &TextFormat,
+        annotations: &TextAnnotations,
+    ) -> Option<isize> {
+        let text = doc.text().slice(..);
+        if deletion.at_start {
+            if anchor == 0 {
+                Some(0)
+            } else {
+                Some(
+                    -(visual_offset_from_anchor(text, 0, anchor, format, annotations, usize::MAX)
+                        .ok()?
+                        .0
+                        .row as isize),
+                )
+            }
+        } else if deletion.anchor >= anchor {
+            Some(
+                visual_offset_from_anchor(
+                    text,
+                    anchor,
+                    deletion.anchor,
+                    format,
+                    annotations,
+                    usize::MAX,
+                )
+                .ok()?
+                .0
+                .row as isize
+                    + 1,
+            )
+        } else {
+            Some(
+                1 - visual_offset_from_anchor(
+                    text,
+                    deletion.anchor,
+                    anchor,
+                    format,
+                    annotations,
+                    usize::MAX,
+                )
+                .ok()?
+                .0
+                .row as isize,
+            )
+        }
+    }
+
+    /// Move the review cursor through source and deleted rows. Its position is
+    /// separate from the document selection, so virtual text remains read-only.
+    pub fn move_diff_cursor(&mut self, doc: &mut Document, down: bool, count: usize) -> bool {
+        if doc.selection(self.id).len() != 1 {
+            return false;
+        }
+        let Some(display) = self.diff_mode.display(doc) else {
+            return false;
+        };
+        if display.deletions.is_empty() {
+            return false;
+        }
+        let cursor = self.diff_mode.cursor(doc, self.id);
+        let text = doc.text().slice(..);
+        let format = doc.text_format(self.inner_width(doc), None);
+        let annotations = self.text_annotations_with_diff(doc, None, Some(display.clone()));
+        let range = doc.selection(self.id).primary();
+        let (anchor, row, column) = if let Some((cursor, deletion)) = cursor.and_then(|cursor| {
+            display
+                .deletions
+                .iter()
+                .find(|d| d.before == cursor.before)
+                .map(|d| (cursor, d))
+        }) {
+            (
+                deletion.anchor,
+                cursor.row + usize::from(!deletion.at_start),
+                cursor
+                    .range
+                    .old_visual_position
+                    .map_or(cursor.column, |(_, col)| col as usize),
+            )
+        } else {
+            let anchor = range.cursor(text);
+            let column = range.old_visual_position.map_or_else(
+                || {
+                    visual_offset_from_block(text, anchor, anchor, &format, &annotations)
+                        .0
+                        .col
+                },
+                |(_, col)| col as usize,
+            );
+            (
+                anchor,
+                if anchor == 0 {
+                    annotations.leading_virtual_lines()
+                } else {
+                    0
+                },
+                column,
+            )
+        };
+        let target_row = row as isize
+            + if down {
+                count as isize
+            } else {
+                -(count as isize)
+            };
+        let (pos, virtual_rows) =
+            char_idx_at_visual_offset(text, anchor, target_row, column, &format, &annotations);
+        let target_row = if pos == 0 {
+            display
+                .deletions
+                .first()
+                .filter(|d| d.at_start)
+                .and_then(|d| Self::diff_deletion_row(doc, d, anchor, &format, &annotations))
+                .map_or(target_row, |first| target_row.max(first))
+        } else {
+            target_row
+        };
+        let next = display.deletions.partition_point(|d| d.anchor < pos);
+        let deletion = display.deletions
+            [next.saturating_sub(1)..(next + 1).min(display.deletions.len())]
+            .iter()
+            .find_map(|d| {
+                let first = Self::diff_deletion_row(doc, d, anchor, &format, &annotations)?;
+                let row = target_row.checked_sub(first)?;
+                (row >= 0 && (row as usize) < d.height()).then_some((d, row as usize))
+            });
+        let target = deletion.map(|(d, row)| (d.anchor, d.before.clone(), row));
+        drop(annotations);
+        if let Some((anchor, before, row)) = target {
+            doc.set_selection(self.id, Selection::point(anchor));
+            self.diff_mode.set_cursor(doc, self.id, before, row, column);
+        } else {
+            self.diff_mode.clear_cursor();
+            let pos = if down && virtual_rows != 0 {
+                helix_core::graphemes::next_grapheme_boundary(text, pos)
+            } else {
+                pos
+            };
+            let mut range = range.put_cursor(text, pos, false);
+            range.old_visual_position = Some((0, column as u32));
+            let selection = doc.selection(self.id).clone().transform(|_| range);
+            doc.set_selection(self.id, selection);
+        }
+        true
+    }
+
+    /// Extend a selection vertically within its deleted block.
+    pub fn move_diff_selection(&mut self, doc: &Document, down: bool, count: usize) -> bool {
+        let format = TextFormat {
+            tab_width: doc.tab_width() as u16,
+            ..TextFormat::default()
+        };
+        self.diff_mode.select(doc, self.id, |text, range| {
+            let line = range.cursor_line(text);
+            let last = text.len_lines()
+                - 1
+                - usize::from(text.line(text.len_lines() - 1).len_chars() == 0);
+            let count = count.min(if down {
+                last.saturating_sub(line)
+            } else {
+                line
+            });
+            helix_core::movement::move_vertically(
+                text,
+                range,
+                if down {
+                    helix_core::movement::Direction::Forward
+                } else {
+                    helix_core::movement::Direction::Backward
+                },
+                count,
+                helix_core::movement::Movement::Extend,
+                &format,
+                &mut TextAnnotations::default(),
+            )
+        })
+    }
+
+    /// Paging keeps the review cursor inside the scrolled viewport, including
+    /// when the nearest visible row belongs to a deletion.
+    pub fn clamp_diff_cursor(
+        &mut self,
+        doc: &mut Document,
+        scrolloff: usize,
+        extend: bool,
+    ) -> bool {
+        if doc.selection(self.id).len() != 1 {
+            return false;
+        }
+        let Some(display) = self.diff_mode.display(doc) else {
+            return false;
+        };
+        if display.deletions.is_empty() {
+            return false;
+        }
+        let inner = self.inner_area(doc);
+        let offset = doc.view_offset(self.id);
+        let format = doc.text_format(inner.width, None);
+        let annotations = self.text_annotations_with_diff(doc, None, Some(display.clone()));
+        let row = if let Some((cursor, deletion)) =
+            self.diff_mode.cursor(doc, self.id).and_then(|cursor| {
+                display
+                    .deletions
+                    .iter()
+                    .find(|d| d.before == cursor.before)
+                    .map(|d| (cursor, d))
+            }) {
+            Self::diff_deletion_row(doc, deletion, offset.anchor, &format, &annotations)
+                .map(|row| row + cursor.row as isize)
+        } else {
+            let text = doc.text().slice(..);
+            let cursor = doc.selection(self.id).primary().cursor(text);
+            if cursor >= offset.anchor {
+                visual_offset_from_anchor(
+                    text,
+                    offset.anchor,
+                    cursor,
+                    &format,
+                    &annotations,
+                    usize::MAX,
+                )
+                .ok()
+                .map(|(pos, _)| pos.row as isize)
+            } else {
+                let leading = if cursor == 0 {
+                    annotations.leading_virtual_lines()
+                } else {
+                    0
+                };
+                visual_offset_from_anchor(
+                    text,
+                    cursor,
+                    offset.anchor,
+                    &format,
+                    &annotations,
+                    usize::MAX,
+                )
+                .ok()
+                .map(|(pos, _)| leading as isize - pos.row as isize)
+            }
+        };
+        let Some(row) = row else { return false };
+        let margin = scrolloff.min(inner.height.saturating_sub(1) as usize / 2);
+        let top = offset.vertical_offset + margin;
+        let bottom = offset.vertical_offset + inner.height.saturating_sub(1) as usize - margin;
+        let target = row.clamp(top as isize, bottom as isize);
+        drop(annotations);
+        if target != row {
+            if extend && self.diff_mode.cursor(doc, self.id).is_some() {
+                self.move_diff_selection(doc, target > row, target.abs_diff(row));
+            } else {
+                self.move_diff_cursor(doc, target > row, target.abs_diff(row));
+            }
+        }
+        self.diff_mode.release_scroll();
+        true
+    }
+
+    fn ensure_diff_cursor_in_view(
+        &self,
+        doc: &mut Document,
+        cursor: &DiffCursor,
+        scrolloff: usize,
+    ) {
+        let Some(display) = self.diff_mode.display(doc) else {
+            return;
+        };
+        let Some(deletion) = display.deletions.iter().find(|d| d.before == cursor.before) else {
+            return;
+        };
+        let inner = self.inner_area(doc);
+        let format = doc.text_format(inner.width, None);
+        let mut offset = doc.view_offset(self.id);
+        let old_offset = offset;
+        let column = cursor.column;
+        let width = inner.width as usize;
+        let margin = scrolloff.min(width.saturating_sub(1) / 2);
+        if column < offset.horizontal_offset + margin {
+            offset.horizontal_offset = column.saturating_sub(margin);
+        } else if column >= offset.horizontal_offset + width.saturating_sub(margin) {
+            offset.horizontal_offset = (column + margin + 1).saturating_sub(width);
+        }
+        let annotations = self.text_annotations_for_offset(
+            doc,
+            None,
+            Some(display.clone()),
+            offset.horizontal_offset,
+        );
+        let Some(first) =
+            Self::diff_deletion_row(doc, deletion, offset.anchor, &format, &annotations)
+        else {
+            return;
+        };
+        let row = first + cursor.row as isize;
+        let margin = scrolloff.min(inner.height.saturating_sub(1) as usize / 2);
+        let top = offset.vertical_offset + margin;
+        let bottom = offset.vertical_offset + inner.height.saturating_sub(1) as usize - margin;
+        if row < top as isize || row > bottom as isize {
+            let screen_row = if row < top as isize {
+                margin
+            } else {
+                inner.height.saturating_sub(1) as usize - margin
+            };
+            (offset.anchor, offset.vertical_offset) = char_idx_at_visual_offset(
+                doc.text().slice(..),
+                deletion.anchor,
+                (cursor.row + usize::from(!deletion.at_start)) as isize - screen_row as isize,
+                0,
+                &format,
+                &annotations,
+            );
+        }
+        drop(annotations);
+        if offset != old_offset {
+            doc.set_view_offset(self.id, offset);
+        }
+    }
+
+    pub fn diff_cursor_screen_coords(&self, doc: &Document) -> Option<Position> {
+        let cursor = self.diff_mode.cursor(doc, self.id)?;
+        let display = self.diff_mode.display(doc)?;
+        let deletion = display
+            .deletions
+            .iter()
+            .find(|d| d.before == cursor.before)?;
+        let inner = self.inner_area(doc);
+        let offset = doc.view_offset(self.id);
+        let format = doc.text_format(inner.width, None);
+        let annotations = self.text_annotations_with_diff(doc, None, Some(display.clone()));
+        let row = Self::diff_deletion_row(doc, deletion, offset.anchor, &format, &annotations)?
+            + cursor.row as isize
+            - offset.vertical_offset as isize;
+        let column = cursor.column;
+        let column = column.checked_sub(offset.horizontal_offset)?;
+        (row >= 0 && row < inner.height as isize && column < inner.width as usize)
+            .then_some(Position::new(row as usize, column))
+    }
+
+    /// Hit-test deleted rows without mapping them to editable source text.
+    pub fn diff_deletion_at_screen_coords(
+        &self,
+        doc: &Document,
+        row: u16,
+        column: u16,
+    ) -> Option<std::ops::Range<u32>> {
+        self.diff_position_at_screen_coords(doc, row, column)
+            .map(|(before, _, _)| before)
+    }
+
+    pub fn diff_position_at_screen_coords(
+        &self,
+        doc: &Document,
+        row: u16,
+        column: u16,
+    ) -> Option<(std::ops::Range<u32>, usize, usize)> {
+        let inner = self.inner_area(doc);
+        if row < inner.y || row >= inner.bottom() || column < self.area.x || column >= inner.right()
+        {
+            return None;
+        }
+        let display = self.diff_mode.display(doc)?;
+        let offset = doc.view_offset(self.id);
+        let format = doc.text_format(inner.width, None);
+        let annotations = self.text_annotations(doc, None);
+        let target_row = (row - inner.y) as usize + offset.vertical_offset;
+        display.deletions.iter().find_map(|deletion| {
+            let marker_row = if deletion.at_start {
+                if offset.anchor != 0 {
+                    return None;
+                }
+                0
+            } else {
+                visual_offset_from_anchor(
+                    doc.text().slice(..),
+                    offset.anchor,
+                    deletion.anchor,
+                    &format,
+                    &annotations,
+                    target_row + 1,
+                )
+                .ok()?
+                .0
+                .row + 1
+            };
+            (marker_row..marker_row + deletion.height())
+                .contains(&target_row)
+                .then(|| {
+                    (
+                        deletion.before.clone(),
+                        target_row - marker_row,
+                        if column < inner.x {
+                            0
+                        } else {
+                            (column - inner.x) as usize + offset.horizontal_offset
+                        },
+                    )
+                })
+        })
+    }
+
     /// Get the text annotations to display in the current view for the given document and theme.
     pub fn text_annotations<'a>(
         &self,
         doc: &'a Document,
         theme: Option<&Theme>,
     ) -> TextAnnotations<'a> {
+        self.text_annotations_with_diff(doc, theme, self.diff_mode.display(doc))
+    }
+
+    /// Use one published diff for both the view's layout and its decorations.
+    pub fn text_annotations_with_diff<'a>(
+        &self,
+        doc: &'a Document,
+        theme: Option<&Theme>,
+        diff: Option<std::sync::Arc<crate::annotations::diff::DiffDisplay>>,
+    ) -> TextAnnotations<'a> {
+        self.text_annotations_for_offset(
+            doc,
+            theme,
+            diff,
+            doc.view_offset(self.id).horizontal_offset,
+        )
+    }
+
+    fn text_annotations_for_offset<'a>(
+        &self,
+        doc: &'a Document,
+        theme: Option<&Theme>,
+        diff: Option<std::sync::Arc<crate::annotations::diff::DiffDisplay>>,
+        horizontal_offset: usize,
+    ) -> TextAnnotations<'a> {
         let mut text_annotations = TextAnnotations::default();
+
+        if let Some(display) = diff {
+            text_annotations.add_line_annotation(DiffAnnotation::new(display));
+        }
 
         if let Some(labels) = doc.jump_labels.get(&self.id) {
             let style = theme.and_then(|t| t.find_highlight("ui.virtual.jump-label"));
@@ -555,7 +1034,7 @@ impl View {
                 doc,
                 cursor,
                 width,
-                doc.view_offset(self.id).horizontal_offset,
+                horizontal_offset,
                 config,
             ));
         }
@@ -617,7 +1096,10 @@ impl View {
         );
 
         // if the cursor is on a line with only virtual text return None
-        if virt_lines != 0 && ignore_virtual_text {
+        if ignore_virtual_text
+            && (virt_lines != 0
+                || (view_offset.anchor == 0 && text_row < annotations.leading_virtual_lines()))
+        {
             return None;
         }
         Some(char_idx)

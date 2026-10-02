@@ -67,7 +67,13 @@ fn decorate_colors<'a>(
                 let (length, color) = match colors.get(color_index) {
                     Some((range, color)) if range.start <= pos => {
                         if swatches && range.start == pos {
-                            output.push(Span::styled("■ ", span.style.fg(*color)));
+                            let reference = match color {
+                                Color::Rgb(red, green, blue) if values => {
+                                    span.style.patch(Style::color_preview(*red, *green, *blue))
+                                }
+                                _ => span.style,
+                            };
+                            output.push(Span::styled("■ ", reference.color_swatch(*color)));
                         }
                         ((range.end - pos).min(available), Some(*color))
                     }
@@ -563,9 +569,6 @@ impl Markdown {
                     let color = (self.color_swatches || self.color_values)
                         .then(|| parse_css_color(&text, preview_background(theme)))
                         .flatten();
-                    if let Some(color) = color.filter(|_| self.color_swatches) {
-                        spans.push(Span::styled("■ ", code_style.fg(color)));
-                    }
                     let style = color
                         .filter(|_| self.color_values)
                         .map_or(code_style, |color| match color {
@@ -574,6 +577,9 @@ impl Markdown {
                             }
                             _ => code_style,
                         });
+                    if let Some(color) = color.filter(|_| self.color_swatches) {
+                        spans.push(Span::styled("■ ", style.color_swatch(color)));
+                    }
                     spans.push(Span::styled(text, style));
                 }
                 Event::Html(text) => {
@@ -764,6 +770,46 @@ mod tests {
         assert!(text.lines[0].0.iter().any(|span| span.content == "ff00"
             && span.style == second.patch(Style::color_preview(255, 0, 0))));
         assert_eq!(text.lines[0].0.last().unwrap().style, style);
+    }
+
+    #[test]
+    fn hover_swatches_share_the_values_displayed_background() {
+        for reversed in [false, true] {
+            let mut style = Style::default().fg(Color::Blue).bg(Color::Rgb(1, 2, 3));
+            if reversed {
+                style = style.add_modifier(Modifier::REVERSED | Modifier::DIM);
+            }
+            let mut text = Text::from(Spans::from(vec![
+                Span::styled("color: #", style),
+                Span::styled("f00;", style),
+            ]));
+            let colors = css_color_ranges(&visible(&text), None);
+            decorate_colors(&mut text, &colors, true, false);
+            let swatch = text.lines[0]
+                .0
+                .iter()
+                .find(|span| span.content == "■ ")
+                .unwrap();
+            assert_eq!(swatch.style.fg, Some(Color::Rgb(255, 0, 0)));
+            assert_eq!(swatch.style.bg, if reversed { style.fg } else { style.bg });
+            assert!(!swatch
+                .style
+                .add_modifier
+                .intersects(Modifier::DIM | Modifier::REVERSED));
+            assert!(text.lines[0]
+                .0
+                .iter()
+                .filter(|s| s.content != "■ ")
+                .all(|s| s.style == style));
+        }
+        let theme: Theme = toml::from_str(
+            "\"ui.popup\" = { bg = \"#112233\" }\n\"markup.raw.inline\" = { bg = \"#223344\" }",
+        )
+        .unwrap();
+        let markdown = markdown("`#f00`").with_color_previews(true, false);
+        let text = markdown.parse(Some(&theme));
+        assert_eq!(text.lines[0].0[0].style.bg, text.lines[0].0[1].style.bg);
+        assert_eq!(text.lines[0].0[0].style.bg, Some(Color::Rgb(34, 51, 68)));
     }
 
     #[test]

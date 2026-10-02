@@ -24,7 +24,7 @@ pub struct LinePos {
     /// The line index of the document line that contains the given visual line
     pub doc_line: usize,
     /// Vertical offset from the top of the inner view area
-    pub visual_line: u16,
+    pub visual_line: usize,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -73,7 +73,12 @@ pub fn render_text(
 ) {
     let row_off = visual_offset_from_block(text, anchor, anchor, text_fmt, text_annotations)
         .0
-        .row;
+        .row
+        - if anchor == 0 {
+            text_annotations.leading_virtual_lines()
+        } else {
+            0
+        };
 
     let mut formatter = DocumentFormatter::new_at_visual_checkpoint(
         text,
@@ -96,7 +101,7 @@ pub fn render_text(
     let mut last_line_pos = LinePos {
         first_visual_line: false,
         doc_line: usize::MAX,
-        visual_line: u16::MAX,
+        visual_line: usize::MAX,
     };
     let mut last_line_end = 0;
     let resumed_indent = if text_fmt.soft_wrap {
@@ -108,6 +113,10 @@ pub fn render_text(
     let mut last_line_indent_level = resumed_indent.unwrap_or(0);
     let mut reached_view_top = false;
     let mut tail_checked_line = usize::MAX;
+
+    if anchor == 0 {
+        decorations.render_leading_lines(renderer);
+    }
 
     loop {
         let Some(mut grapheme) = formatter.next() else {
@@ -125,12 +134,12 @@ pub fn render_text(
         }
 
         // if the end of the viewport is reached stop rendering
-        if grapheme.visual_pos.row as u16 >= renderer.viewport.height + renderer.offset.row as u16 {
+        if grapheme.visual_pos.row >= renderer.viewport.height as usize + renderer.offset.row {
             break;
         }
 
         // apply decorations before rendering a new line
-        if grapheme.visual_pos.row as u16 != last_line_pos.visual_line {
+        if grapheme.visual_pos.row != last_line_pos.visual_line {
             // we initiate doc_line with usize::MAX because no file
             // can reach that size (memory allocations are limited to isize::MAX)
             // initially there is no "previous" line (so doc_line is set to usize::MAX)
@@ -144,8 +153,9 @@ pub fn render_text(
             last_line_pos = LinePos {
                 first_visual_line: grapheme.line_idx != last_line_pos.doc_line,
                 doc_line: grapheme.line_idx,
-                visual_line: grapheme.visual_pos.row as u16,
+                visual_line: grapheme.visual_pos.row,
             };
+            renderer.line_style = Style::default();
             decorations.decorate_line(renderer, last_line_pos);
         }
 
@@ -157,7 +167,11 @@ pub fn render_text(
             overlay_highlighter.advance();
         }
 
-        let grapheme_style = if let GraphemeSource::VirtualText { highlight } = grapheme.source {
+        let grapheme_style = if let GraphemeSource::VirtualText {
+            highlight,
+            inherit_background,
+        } = grapheme.source
+        {
             let mut style = renderer.text_style;
             if let Some(highlight) = highlight {
                 style = style.patch(theme.highlight(highlight));
@@ -165,11 +179,18 @@ pub fn render_text(
             GraphemeStyle {
                 syntax_style: style,
                 overlay_style: Style::default(),
+                reference_style: inherit_background.then(|| {
+                    syntax_highlighter
+                        .style
+                        .patch(renderer.line_style)
+                        .patch(overlay_highlighter.style)
+                }),
             }
         } else {
             GraphemeStyle {
                 syntax_style: syntax_highlighter.style,
                 overlay_style: overlay_highlighter.style,
+                reference_style: None,
             }
         };
         decorations.decorate_grapheme(renderer, &grapheme);
@@ -204,13 +225,15 @@ pub fn render_text(
         }
     }
 
-    renderer.draw_indent_guides(last_line_indent_level, last_line_pos.visual_line);
-    decorations.render_virtual_lines(renderer, last_line_pos, last_line_end)
+    if last_line_pos.doc_line != usize::MAX {
+        renderer.draw_indent_guides(last_line_indent_level, last_line_pos.visual_line);
+        decorations.render_virtual_lines(renderer, last_line_pos, last_line_end)
+    }
 }
 
 #[derive(Debug)]
 pub struct TextRenderer<'a> {
-    surface: &'a mut Surface,
+    pub(super) surface: &'a mut Surface,
     pub text_style: Style,
     pub whitespace_style: Style,
     pub indent_guide_char: String,
@@ -226,11 +249,13 @@ pub struct TextRenderer<'a> {
     pub draw_indent_guides: bool,
     pub viewport: Rect,
     pub offset: Position,
+    pub line_style: Style,
 }
 
 pub struct GraphemeStyle {
     syntax_style: Style,
     overlay_style: Style,
+    reference_style: Option<Style>,
 }
 
 impl<'a> TextRenderer<'a> {
@@ -305,6 +330,7 @@ impl<'a> TextRenderer<'a> {
             draw_indent_guides: editor_config.indent_guides.render,
             viewport,
             offset,
+            line_style: Style::default(),
         }
     }
     /// Draws a single `grapheme` at the current render position with a specified `style`.
@@ -312,20 +338,15 @@ impl<'a> TextRenderer<'a> {
         &mut self,
         grapheme: Grapheme,
         mut style: Style,
-        mut row: u16,
+        row: usize,
         col: u16,
     ) -> bool {
-        if (row as usize) < self.offset.row
-            || row as usize
-                >= self
-                    .offset
-                    .row
-                    .saturating_add(self.viewport.height as usize)
-            || col >= self.viewport.width
-        {
+        let Some(row) = self.viewport_row(row) else {
+            return false;
+        };
+        if col >= self.viewport.width {
             return false;
         }
-        row -= self.offset.row as u16;
         // TODO is it correct to apply the whitspace style to all unicode white spaces?
         if grapheme.is_whitespace() {
             style = style.patch(self.whitespace_style);
@@ -341,12 +362,8 @@ impl<'a> TextRenderer<'a> {
             Grapheme::Newline => " ",
         };
 
-        self.surface.set_string(
-            self.viewport.x + col,
-            self.viewport.y + row,
-            grapheme,
-            style,
-        );
+        self.surface
+            .set_string(self.viewport.x + col, row, grapheme, style);
         true
     }
 
@@ -372,7 +389,29 @@ impl<'a> TextRenderer<'a> {
         if is_whitespace {
             style = style.patch(self.whitespace_style);
         }
-        style = style.patch(grapheme_style.overlay_style);
+        style = style
+            .patch(self.line_style)
+            .patch(grapheme_style.overlay_style);
+
+        if let Some(reference_style) = grapheme_style.reference_style {
+            // Line decorations (e.g. cursorline) may already have styled the
+            // surface. Resolve that background with syntax, diff and selection
+            // styles, while keeping the swatch's own foreground color.
+            let x = position.col.saturating_sub(self.offset.col);
+            if x < self.viewport.width as usize {
+                if let Some(cell) = self.surface.get(
+                    self.viewport.x + x as u16,
+                    self.viewport.y + position.row as u16,
+                ) {
+                    style = cell.style().patch(reference_style).color_swatch(
+                        grapheme_style
+                            .syntax_style
+                            .fg
+                            .unwrap_or(helix_view::graphics::Color::Reset),
+                    );
+                }
+            }
+        }
 
         let width = grapheme.width();
         let mut is_tab = false;
@@ -438,11 +477,13 @@ impl<'a> TextRenderer<'a> {
     /// Overlay indentation guides ontop of a rendered line
     /// The indentation level is computed in `draw_lines`.
     /// Therefore this function must always be called afterwards.
-    pub fn draw_indent_guides(&mut self, indent_level: usize, mut row: u16) {
-        if !self.draw_indent_guides || self.offset.row > row as usize {
+    pub fn draw_indent_guides(&mut self, indent_level: usize, row: usize) {
+        if !self.draw_indent_guides {
             return;
         }
-        row -= self.offset.row as u16;
+        let Some(y) = self.viewport_row(row) else {
+            return;
+        };
 
         // Don't draw indent guides outside of view
         let end_indent = min(
@@ -455,71 +496,59 @@ impl<'a> TextRenderer<'a> {
         for i in self.starting_indent..end_indent {
             let x = (self.viewport.x as usize + (i * self.indent_width as usize) - self.offset.col)
                 as u16;
-            let y = self.viewport.y + row;
             debug_assert!(self.surface.in_bounds(x, y));
-            self.surface
-                .set_string(x, y, &self.indent_guide_char, self.indent_guide_style);
+            self.surface.set_string(
+                x,
+                y,
+                &self.indent_guide_char,
+                self.indent_guide_style.patch(self.line_style),
+            );
         }
     }
 
-    pub fn set_string(&mut self, x: u16, y: u16, string: &str, style: Style) {
-        if (y as usize) < self.offset.row {
-            return;
-        }
-        let y = y - self.offset.row as u16;
-        self.surface
-            .set_string(x, y + self.viewport.y, string, style)
+    fn viewport_row(&self, row: usize) -> Option<u16> {
+        let row = row.checked_sub(self.offset.row)?;
+        (row < self.viewport.height as usize).then(|| self.viewport.y + row as u16)
     }
 
-    pub fn set_stringn(&mut self, x: u16, y: u16, string: &str, width: usize, style: Style) {
-        if (y as usize) < self.offset.row {
-            return;
+    pub fn set_string(&mut self, x: u16, row: usize, string: &str, style: Style) {
+        if let Some(y) = self.viewport_row(row) {
+            self.surface.set_string(x, y, string, style);
         }
-        let y = y - self.offset.row as u16;
-        self.surface
-            .set_stringn(x, y + self.viewport.y, string, width, style);
     }
 
-    /// Sets the style of an area **within the text viewport* this accounts
-    /// both for the renderers vertical offset and its viewport
-    pub fn set_style(&mut self, mut area: Rect, style: Style) {
-        let offset = self.offset.row as u16;
-        if area.y < offset {
-            area.height = area.height.saturating_sub(offset - area.y);
-            area.y = offset;
+    pub fn set_stringn(&mut self, x: u16, row: usize, string: &str, width: usize, style: Style) {
+        if let Some(y) = self.viewport_row(row) {
+            self.surface.set_stringn(x, y, string, width, style);
         }
-        area.y = area.y - offset + self.viewport.y;
-        self.surface.set_style(area, style);
+    }
+
+    pub fn set_row_style(&mut self, x: u16, row: usize, width: u16, style: Style) {
+        if let Some(y) = self.viewport_row(row) {
+            self.surface.set_style(Rect::new(x, y, width, 1), style);
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn set_string_truncated(
         &mut self,
         x: u16,
-        y: u16,
+        row: usize,
         string: &str,
         width: usize,
         style: impl Fn(usize) -> Style, // Map a grapheme's string offset to a style
         ellipsis: bool,
         truncate_start: bool,
     ) -> (u16, u16) {
-        if (y as usize) < self.offset.row {
-            return (x, y);
-        }
-        let y = y - self.offset.row as u16;
-        self.surface.set_string_truncated(
-            x,
-            y + self.viewport.y,
-            string,
-            width,
-            style,
-            ellipsis,
-            truncate_start,
-        )
+        let Some(y) = self.viewport_row(row) else {
+            return (x, self.viewport.y);
+        };
+        self.surface
+            .set_string_truncated(x, y, string, width, style, ellipsis, truncate_start)
     }
 }
 
-struct SyntaxHighlighter<'h, 'r, 't> {
+pub(super) struct SyntaxHighlighter<'h, 'r, 't> {
     inner: Option<DisplayHighlighter<'h>>,
     text: RopeSlice<'r>,
     /// The character index of the next highlight event, or `usize::MAX` if the highlighter is
@@ -531,7 +560,7 @@ struct SyntaxHighlighter<'h, 'r, 't> {
 }
 
 impl<'h, 'r, 't> SyntaxHighlighter<'h, 'r, 't> {
-    fn new(
+    pub(super) fn new(
         inner: Option<DisplayHighlighter<'h>>,
         text: RopeSlice<'r>,
         theme: &'t Theme,
@@ -578,6 +607,13 @@ impl<'h, 'r, 't> SyntaxHighlighter<'h, 'r, 't> {
                 acc.patch(self.theme.highlight(highlight))
             });
         self.update_pos();
+    }
+
+    pub(super) fn style_at(&mut self, char_idx: usize) -> Style {
+        if char_idx >= self.pos {
+            self.seek_to(char_idx);
+        }
+        self.style
     }
 }
 
@@ -664,6 +700,89 @@ mod test {
             decorations,
         );
         surface
+    }
+
+    #[test]
+    fn color_swatches_and_padding_follow_diff_selection_and_cursorline_backgrounds() {
+        use helix_view::graphics::{Color, Modifier};
+        let doc = document(Rope::from_str("color: #f00;\n"));
+        let swatches = [InlineAnnotation::new(7, "■").with_inherited_background()];
+        let padding = [InlineAnnotation::new(7, " ").with_inherited_background()];
+        let colors = [Theme::rgb_highlight(255, 0, 0)];
+        let mut annotations = TextAnnotations::default();
+        annotations
+            .add_inline_annotations_with_highlights(&swatches, &colors)
+            .add_inline_annotations(&padding, None);
+        let theme: Theme = toml::from_str(
+            "\"ui.text\" = { fg = \"#eeeeee\", bg = \"#121212\" }\n\
+             \"ui.selection\" = { fg = \"#ffffff\", bg = \"#223344\" }\n\
+             \"ui.selection.primary\" = { fg = \"#563412\", bg = \"#010203\", modifiers = [\"reversed\", \"dim\"] }",
+        ).unwrap();
+        for (diff, selection, explicit_text_bg) in [
+            (false, None, false),
+            (false, None, true),
+            (true, None, true),
+            (true, Some("ui.selection"), true),
+            (true, Some("ui.selection.primary"), true),
+        ] {
+            let viewport = Rect::new(0, 0, 40, 2);
+            let mut surface = Surface::empty(viewport);
+            let mut renderer =
+                TextRenderer::new(&mut surface, &doc, &theme, Position::default(), viewport);
+            if !explicit_text_bg {
+                renderer.text_style.bg = None;
+            }
+            let mut decorations = DecorationManager::default();
+            decorations.add_decoration(|renderer: &mut TextRenderer, pos: LinePos| {
+                renderer.set_row_style(
+                    0,
+                    pos.visual_line,
+                    40,
+                    Style::default().bg(Color::Rgb(40, 40, 40)),
+                );
+            });
+            if diff {
+                decorations.add_decoration(|renderer: &mut TextRenderer, pos: LinePos| {
+                    renderer.line_style = Style::default().bg(Color::Rgb(28, 57, 37));
+                    renderer.set_row_style(0, pos.visual_line, 40, renderer.line_style);
+                });
+            }
+            let overlays = selection
+                .into_iter()
+                .map(|scope| {
+                    OverlayHighlights::single(theme.find_highlight_exact(scope).unwrap(), 7..11)
+                })
+                .collect();
+            render_text(
+                &mut renderer,
+                doc.text().slice(..),
+                0,
+                &TextFormat::default(),
+                &annotations,
+                None,
+                overlays,
+                &theme,
+                decorations,
+            );
+            let value = surface.get(9, 0).unwrap();
+            assert_eq!(value.symbol.as_str(), "#");
+            let background = if value.modifier.contains(Modifier::REVERSED) {
+                value.fg
+            } else {
+                value.bg
+            };
+            for x in [7, 8] {
+                let swatch = surface.get(x, 0).unwrap();
+                assert_eq!(
+                    swatch.bg, background,
+                    "diff={diff}, selection={selection:?}, x={x}"
+                );
+                assert!(!swatch
+                    .modifier
+                    .intersects(Modifier::DIM | Modifier::REVERSED));
+            }
+            assert_eq!(surface.get(7, 0).unwrap().fg, Color::Rgb(255, 0, 0));
+        }
     }
 
     #[test]

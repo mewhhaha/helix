@@ -387,7 +387,8 @@ pub fn visual_offset_from_anchor(
     };
     let mut formatter =
         DocumentFormatter::new_at_prev_checkpoint(text, text_fmt, annotations, start);
-    let mut anchor_line = None;
+    // At BOF the viewport includes virtual rows preceding the first character.
+    let mut anchor_line = (anchor == 0 && annotations.leading_virtual_lines() != 0).then_some(0);
     let mut found_pos = None;
     let mut last_pos = Position::default();
 
@@ -421,7 +422,8 @@ pub fn visual_offset_from_anchor(
         }
 
         if let Some(anchor_line) = anchor_line {
-            if grapheme.visual_pos.row >= anchor_line + max_rows {
+            // Compare relative rows so usize::MAX can request an unbounded scan.
+            if grapheme.visual_pos.row.saturating_sub(anchor_line) >= max_rows {
                 return Err(VisualOffsetError::PosAfterMaxRow);
             }
         }
@@ -560,7 +562,12 @@ pub fn char_idx_at_visual_offset(
     loop {
         let (visual_pos_in_block, block_char_offset) =
             visual_offset_from_block(text, anchor, pos, text_fmt, annotations);
-        row_offset += visual_pos_in_block.row as isize;
+        row_offset += visual_pos_in_block.row as isize
+            - if anchor == 0 && pos == 0 {
+                annotations.leading_virtual_lines() as isize
+            } else {
+                0
+            };
         anchor = block_char_offset;
         if row_offset >= 0 {
             break;
@@ -606,6 +613,9 @@ pub fn char_idx_at_visual_block_offset(
     text_fmt: &TextFormat,
     annotations: &TextAnnotations,
 ) -> (usize, usize) {
+    if anchor == 0 && row < annotations.leading_virtual_lines() {
+        return (0, row);
+    }
     let mut formatter = DocumentFormatter::new_at_visual_checkpoint(
         text,
         text_fmt,
@@ -649,6 +659,52 @@ mod test {
     use super::*;
     use crate::text_annotations::InlineAnnotation;
     use crate::Rope;
+
+    #[test]
+    fn visual_offset_from_wrapped_anchor_accepts_unbounded_row_limit() {
+        let text = Rope::from_str(&format!("{}\ntarget\n", "wrapped source ".repeat(20)));
+        let text = text.slice(..);
+        let format = TextFormat {
+            soft_wrap: true,
+            viewport_width: 40,
+            ..TextFormat::default()
+        };
+        let annotations = TextAnnotations::default();
+        let anchor = 100;
+        let target = text.line_to_char(1);
+        let (anchor_pos, block) =
+            visual_offset_from_block(text, anchor, anchor, &format, &annotations);
+        assert!(anchor_pos.row > 0);
+        let (mut target_pos, _) =
+            visual_offset_from_block(text, anchor, target, &format, &annotations);
+        target_pos.row -= anchor_pos.row;
+        assert_eq!(
+            visual_offset_from_anchor(text, anchor, target, &format, &annotations, usize::MAX),
+            Ok((target_pos, block))
+        );
+        assert_eq!(
+            visual_offset_from_anchor(
+                text,
+                anchor,
+                target,
+                &format,
+                &annotations,
+                target_pos.row - 1
+            ),
+            Err(VisualOffsetError::PosAfterMaxRow)
+        );
+        assert_eq!(
+            visual_offset_from_anchor(
+                text,
+                anchor,
+                target,
+                &format,
+                &annotations,
+                target_pos.row + 1
+            ),
+            Ok((target_pos, block))
+        );
+    }
 
     #[test]
     fn test_ordering() {
@@ -1132,10 +1188,7 @@ mod test {
         let text = Rope::from("foo\nbar");
         let slice = text.slice(..);
         let mut text_fmt = TextFormat::default();
-        let annotations = [InlineAnnotation {
-            text: "x".repeat(100).into(),
-            char_idx: 3,
-        }];
+        let annotations = [InlineAnnotation::new(3, "x".repeat(100))];
         text_fmt.soft_wrap = true;
 
         assert_eq!(

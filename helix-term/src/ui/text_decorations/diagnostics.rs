@@ -103,9 +103,6 @@ impl Renderer<'_, '_> {
         if !self.visible_rows(row..row.saturating_add(1)).contains(&row) {
             return;
         }
-        let Ok(row) = u16::try_from(row) else {
-            return;
-        };
         self.renderer.draw_decoration_grapheme(
             Grapheme::new_decoration(g),
             self.styles.severity_style(severity),
@@ -114,7 +111,7 @@ impl Renderer<'_, '_> {
         );
     }
 
-    fn draw_eol_diagnostic(&mut self, diag: &Diagnostic, row: u16, col: usize) -> u16 {
+    fn draw_eol_diagnostic(&mut self, diag: &Diagnostic, row: usize, col: usize) -> u16 {
         let style = self.styles.severity_style(diag.severity());
         let width = self.renderer.viewport.width;
         let start_col = (col - self.renderer.offset.col) as u16;
@@ -179,10 +176,7 @@ impl Renderer<'_, '_> {
                 if row < visible.start {
                     continue;
                 }
-                let (Ok(row), Ok(col)) = (
-                    u16::try_from(row),
-                    u16::try_from(text_col as usize + grapheme.visual_pos.col),
-                ) else {
+                let Ok(col) = u16::try_from(text_col as usize + grapheme.visual_pos.col) else {
                     continue;
                 };
                 self.renderer
@@ -303,8 +297,8 @@ impl Decoration for InlineDiagnostics<'_> {
         if let Some((eol_diagnostic, _)) = eol_diagnostic {
             let mut renderer = Renderer {
                 renderer,
-                first_row: pos.visual_line as usize,
-                row: pos.visual_line as usize,
+                first_row: pos.visual_line,
+                row: pos.visual_line,
                 doc: self.doc,
                 config: &self.state.config,
                 styles: &self.styles,
@@ -315,8 +309,8 @@ impl Decoration for InlineDiagnostics<'_> {
         self.state.compute_line_diagnostics();
         let mut renderer = Renderer {
             renderer,
-            first_row: pos.visual_line as usize + virt_off.row,
-            row: pos.visual_line as usize + virt_off.row,
+            first_row: pos.visual_line + virt_off.row,
+            row: pos.visual_line + virt_off.row,
             doc: self.doc,
             config: &self.state.config,
             styles: &self.styles,

@@ -1,4 +1,5 @@
 pub(crate) mod dap;
+mod diff;
 pub(crate) mod lsp;
 pub(crate) mod syntax;
 pub(crate) mod typed;
@@ -41,8 +42,8 @@ use helix_core::{
     text_annotations::{Overlay, TextAnnotations},
     textobject,
     unicode::width::UnicodeWidthChar,
-    visual_offset_from_block, Deletion, LineEnding, Position, Range, Rope, RopeReader, RopeSlice,
-    Selection, SmallVec, Syntax, Tendril, Transaction,
+    visual_offset_from_anchor, visual_offset_from_block, Deletion, LineEnding, Position, Range,
+    Rope, RopeReader, RopeSlice, Selection, SmallVec, Syntax, Tendril, Transaction,
 };
 use helix_view::{
     document::{FormatterError, Mode, SCRATCH_BUFFER_NAME},
@@ -247,6 +248,107 @@ macro_rules! static_commands {
 
 impl MappableCommand {
     pub fn execute(&self, cx: &mut Context) {
+        if diff::execute(self, cx) {
+            return;
+        }
+        let (view, doc) = current!(cx.editor);
+        if view.diff_mode.cursor(doc, view.id).is_some() {
+            let name = self.name();
+            if name.starts_with("insert")
+                || name.starts_with("delete")
+                || name.starts_with("change_selection")
+                || name.starts_with("replace")
+                || name.starts_with("paste")
+                || name.starts_with("surround_")
+                || name.starts_with("toggle_") && name.ends_with("comments")
+                || matches!(
+                    name,
+                    "append_mode"
+                        | "open_above"
+                        | "open_below"
+                        | "indent"
+                        | "unindent"
+                        | "switch_case"
+                        | "switch_to_uppercase"
+                        | "switch_to_lowercase"
+                        | "join_selections"
+                        | "join_selections_space"
+                        | "format_selections"
+                        | "toggle_comments"
+                        | "increment"
+                        | "decrement"
+                        | "rename_symbol"
+                        | "append_char_interactive"
+                        | "align_selections"
+                        | "reverse_selection_contents"
+                        | "rotate_selection_contents_forward"
+                        | "rotate_selection_contents_backward"
+                        | "smart_tab"
+                        | "shell_pipe"
+                        | "shell_insert_output"
+                        | "shell_append_output"
+                        | "add_newline_above"
+                        | "add_newline_below"
+                        | "kill_to_line_start"
+                        | "kill_to_line_end"
+                        | "undo"
+                        | "redo"
+                        | "earlier"
+                        | "later"
+                )
+            {
+                cx.editor
+                    .set_error("Deleted rows are read-only; move to a current row to edit");
+                return;
+            }
+            if name != "select_register"
+                && (name.starts_with("select_")
+                    || name.starts_with("extend_")
+                    || name.starts_with("copy_selection_")
+                    || matches!(
+                        name,
+                        "split_selection"
+                            | "split_selection_on_newline"
+                            | "merge_selections"
+                            | "merge_consecutive_selections"
+                    ))
+            {
+                cx.editor
+                    .set_error("This selection command is unavailable on deleted text");
+                return;
+            }
+            if matches!(self, Self::Static { .. })
+                && !name.starts_with("yank")
+                && !matches!(
+                    name,
+                    "move_visual_line_up"
+                        | "move_visual_line_down"
+                        | "command_mode"
+                        | "scroll_up"
+                        | "scroll_down"
+                        | "page_up"
+                        | "page_down"
+                        | "half_page_up"
+                        | "half_page_down"
+                        | "page_cursor_up"
+                        | "page_cursor_down"
+                        | "page_cursor_half_up"
+                        | "page_cursor_half_down"
+                        | "align_view_top"
+                        | "align_view_center"
+                        | "align_view_bottom"
+                        | "goto_first_diag"
+                        | "goto_last_diag"
+                        | "goto_next_diag"
+                        | "goto_prev_diag"
+                        | "repeat_last_motion"
+                        | "no_op"
+                        | "select_register"
+                )
+            {
+                view.diff_mode.clear_cursor();
+            }
+        }
         match &self {
             Self::Typable { name, args, doc: _ } => {
                 if let Some(command) = typed::TYPABLE_COMMAND_MAP.get(name.as_str()) {
@@ -766,6 +868,9 @@ fn move_line_down(cx: &mut Context) {
 }
 
 fn move_visual_line_up(cx: &mut Context) {
+    if move_diff_cursor(cx, false) {
+        return;
+    }
     move_impl(
         cx,
         move_vertically_visual,
@@ -775,12 +880,29 @@ fn move_visual_line_up(cx: &mut Context) {
 }
 
 fn move_visual_line_down(cx: &mut Context) {
+    if move_diff_cursor(cx, true) {
+        return;
+    }
     move_impl(
         cx,
         move_vertically_visual,
         Direction::Forward,
         Movement::Move,
     )
+}
+
+fn move_diff_cursor(cx: &mut Context, down: bool) -> bool {
+    if cx.editor.mode() != Mode::Normal {
+        return false;
+    }
+    let count = cx.count();
+    let scrolloff = cx.editor.config().scrolloff;
+    let (view, doc) = current!(cx.editor);
+    if !view.move_diff_cursor(doc, down, count) {
+        return false;
+    }
+    view.ensure_cursor_in_view(doc, scrolloff);
+    true
 }
 
 fn extend_char_left(cx: &mut Context) {
@@ -1928,7 +2050,17 @@ fn switch_to_lowercase(cx: &mut Context) {
     });
 }
 
-pub fn scroll(cx: &mut Context, offset: usize, direction: Direction, sync_cursor: bool) {
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ScrollCursor {
+    /// Move the cursor to the viewport edge if scrolling puts it outside.
+    Clamp,
+    /// Move the cursor by the same number of visual rows as the viewport.
+    Follow,
+    /// Mouse scrolling can leave the review cursor offscreen in diff mode.
+    Preserve,
+}
+
+pub fn scroll(cx: &mut Context, offset: usize, direction: Direction, cursor_scroll: ScrollCursor) {
     use Direction::*;
     let config = cx.editor.config();
     let (view, doc) = current!(cx.editor);
@@ -1949,21 +2081,60 @@ pub fn scroll(cx: &mut Context, offset: usize, direction: Direction, sync_cursor
     let doc_text = doc.text().slice(..);
     let viewport = view.inner_area(doc);
     let text_fmt = doc.text_format(viewport.width, None);
+    let annotations = view.text_annotations(&*doc, None);
+    let old_anchor = view_offset.anchor;
+    let target_row = view_offset.vertical_offset as isize + offset;
     (view_offset.anchor, view_offset.vertical_offset) = char_idx_at_visual_offset(
         doc_text,
         view_offset.anchor,
-        view_offset.vertical_offset as isize + offset,
+        target_row,
         0,
         &text_fmt,
-        // &annotations,
-        &view.text_annotations(&*doc, None),
+        &annotations,
     );
+    let leading = annotations.leading_virtual_lines();
+    if leading != 0 && view_offset.anchor == 0 && view_offset.vertical_offset == 0 {
+        let row = if old_anchor == 0 {
+            target_row
+        } else {
+            visual_offset_from_anchor(doc_text, 0, old_anchor, &text_fmt, &annotations, usize::MAX)
+                .map_or(0, |(pos, _)| pos.row as isize)
+                + target_row
+        };
+        if row >= leading as isize {
+            view_offset.vertical_offset = leading;
+        }
+    }
+    drop(annotations);
     doc.set_view_offset(view.id, view_offset);
+
+    if view.diff_mode.enabled && cursor_scroll == ScrollCursor::Preserve {
+        view.diff_mode.hold_scroll(doc, view.id);
+        return;
+    }
+    view.diff_mode.release_scroll();
+
+    if cx.editor.mode == Mode::Normal || cx.editor.mode == Mode::Select {
+        let moved = match cursor_scroll {
+            ScrollCursor::Follow if cx.editor.mode == Mode::Select => {
+                view.move_diff_selection(doc, direction == Forward, offset.unsigned_abs())
+            }
+            ScrollCursor::Follow => {
+                view.move_diff_cursor(doc, direction == Forward, offset.unsigned_abs())
+            }
+            ScrollCursor::Clamp | ScrollCursor::Preserve => {
+                view.clamp_diff_cursor(doc, scrolloff, cx.editor.mode == Mode::Select)
+            }
+        };
+        if moved {
+            return;
+        }
+    }
 
     let doc_text = doc.text().slice(..);
     let mut annotations = view.text_annotations(&*doc, None);
 
-    if sync_cursor {
+    if cursor_scroll == ScrollCursor::Follow {
         let movement = match cx.editor.mode {
             Mode::Select => Movement::Extend,
             _ => Movement::Move,
@@ -2041,49 +2212,49 @@ pub fn scroll(cx: &mut Context, offset: usize, direction: Direction, sync_cursor
 fn page_up(cx: &mut Context) {
     let view = view!(cx.editor);
     let offset = view.inner_height();
-    scroll(cx, offset, Direction::Backward, false);
+    scroll(cx, offset, Direction::Backward, ScrollCursor::Clamp);
 }
 
 fn page_down(cx: &mut Context) {
     let view = view!(cx.editor);
     let offset = view.inner_height();
-    scroll(cx, offset, Direction::Forward, false);
+    scroll(cx, offset, Direction::Forward, ScrollCursor::Clamp);
 }
 
 fn half_page_up(cx: &mut Context) {
     let view = view!(cx.editor);
     let offset = view.inner_height() / 2;
-    scroll(cx, offset, Direction::Backward, false);
+    scroll(cx, offset, Direction::Backward, ScrollCursor::Clamp);
 }
 
 fn half_page_down(cx: &mut Context) {
     let view = view!(cx.editor);
     let offset = view.inner_height() / 2;
-    scroll(cx, offset, Direction::Forward, false);
+    scroll(cx, offset, Direction::Forward, ScrollCursor::Clamp);
 }
 
 fn page_cursor_up(cx: &mut Context) {
     let view = view!(cx.editor);
     let offset = view.inner_height();
-    scroll(cx, offset, Direction::Backward, true);
+    scroll(cx, offset, Direction::Backward, ScrollCursor::Follow);
 }
 
 fn page_cursor_down(cx: &mut Context) {
     let view = view!(cx.editor);
     let offset = view.inner_height();
-    scroll(cx, offset, Direction::Forward, true);
+    scroll(cx, offset, Direction::Forward, ScrollCursor::Follow);
 }
 
 fn page_cursor_half_up(cx: &mut Context) {
     let view = view!(cx.editor);
     let offset = view.inner_height() / 2;
-    scroll(cx, offset, Direction::Backward, true);
+    scroll(cx, offset, Direction::Backward, ScrollCursor::Follow);
 }
 
 fn page_cursor_half_down(cx: &mut Context) {
     let view = view!(cx.editor);
     let offset = view.inner_height() / 2;
-    scroll(cx, offset, Direction::Forward, true);
+    scroll(cx, offset, Direction::Forward, ScrollCursor::Follow);
 }
 
 #[allow(deprecated)]
@@ -4210,6 +4381,9 @@ fn exit_select_mode(cx: &mut Context) {
 }
 
 fn goto_first_diag(cx: &mut Context) {
+    if diff::goto_diagnostic(cx.editor, diff::DiagnosticNavigation::First) {
+        return;
+    }
     let (view, doc) = current!(cx.editor);
     let selection = match doc.diagnostics().first() {
         Some(diag) => Selection::single(diag.range.start, diag.range.end),
@@ -4222,6 +4396,9 @@ fn goto_first_diag(cx: &mut Context) {
 }
 
 fn goto_last_diag(cx: &mut Context) {
+    if diff::goto_diagnostic(cx.editor, diff::DiagnosticNavigation::Last) {
+        return;
+    }
     let (view, doc) = current!(cx.editor);
     let selection = match doc.diagnostics().last() {
         Some(diag) => Selection::single(diag.range.start, diag.range.end),
@@ -4234,7 +4411,11 @@ fn goto_last_diag(cx: &mut Context) {
 }
 
 fn goto_next_diag(cx: &mut Context) {
+    let count = cx.count();
     let motion = move |editor: &mut Editor| {
+        if diff::goto_diagnostic(editor, diff::DiagnosticNavigation::Next(count)) {
+            return;
+        }
         let (view, doc) = current!(editor);
 
         let cursor_pos = doc
@@ -4261,7 +4442,11 @@ fn goto_next_diag(cx: &mut Context) {
 }
 
 fn goto_prev_diag(cx: &mut Context) {
+    let count = cx.count();
     let motion = move |editor: &mut Editor| {
+        if diff::goto_diagnostic(editor, diff::DiagnosticNavigation::Previous(count)) {
+            return;
+        }
         let (view, doc) = current!(editor);
 
         let cursor_pos = doc
@@ -4906,14 +5091,7 @@ fn yank_to_primary_clipboard(cx: &mut Context) {
 }
 
 fn yank_impl(editor: &mut Editor, register: char) {
-    let (view, doc) = current!(editor);
-    let text = doc.text().slice(..);
-
-    let values: Vec<String> = doc
-        .selection(view.id)
-        .fragments(text)
-        .map(Cow::into_owned)
-        .collect();
+    let values = yank_values(editor, false);
     let selections = values.len();
 
     match editor.registers.write(register, values) {
@@ -4925,21 +5103,40 @@ fn yank_impl(editor: &mut Editor, register: char) {
     }
 }
 
-fn yank_joined_impl(editor: &mut Editor, separator: &str, register: char) {
-    let (view, doc) = current!(editor);
-    let text = doc.text().slice(..);
-
+fn yank_values(editor: &Editor, primary_only: bool) -> Vec<String> {
+    let (view, doc) = current_ref!(editor);
+    if let Some(text) = view.diff_mode.selected_text(doc, view.id) {
+        return vec![text];
+    }
     let selection = doc.selection(view.id);
-    let selections = selection.len();
-    let joined = selection
-        .fragments(text)
-        .fold(String::new(), |mut acc, fragment| {
-            if !acc.is_empty() {
-                acc.push_str(separator);
-            }
-            acc.push_str(&fragment);
-            acc
-        });
+    let text = doc.text().slice(..);
+    if primary_only {
+        vec![selection.primary().fragment(text).into_owned()]
+    } else {
+        selection.fragments(text).map(Cow::into_owned).collect()
+    }
+}
+
+pub(crate) fn review_is_read_only(editor: &mut Editor) -> bool {
+    let (view, doc) = current_ref!(editor);
+    if view.diff_mode.cursor(doc, view.id).is_some() {
+        editor.set_error("Deleted rows are read-only; move to a current row to edit");
+        true
+    } else {
+        false
+    }
+}
+
+fn yank_joined_impl(editor: &mut Editor, separator: &str, register: char) {
+    let values = yank_values(editor, false);
+    let selections = values.len();
+    let joined = values.iter().fold(String::new(), |mut acc, fragment| {
+        if !acc.is_empty() {
+            acc.push_str(separator);
+        }
+        acc.push_str(fragment);
+        acc
+    });
 
     match editor.registers.write(register, vec![joined]) {
         Ok(_) => editor.set_status(format!(
@@ -4974,12 +5171,9 @@ fn yank_joined_to_primary_clipboard(cx: &mut Context) {
 }
 
 pub(crate) fn yank_main_selection_to_register(editor: &mut Editor, register: char) {
-    let (view, doc) = current!(editor);
-    let text = doc.text().slice(..);
+    let selection = yank_values(editor, true);
 
-    let selection = doc.selection(view.id).primary().fragment(text).to_string();
-
-    match editor.registers.write(register, vec![selection]) {
+    match editor.registers.write(register, selection) {
         Ok(_) => editor.set_status(format!("yanked primary selection to register {register}",)),
         Err(err) => editor.set_error(err.to_string()),
     }
@@ -5088,6 +5282,9 @@ fn paste_impl(
 }
 
 pub(crate) fn paste_bracketed_value(cx: &mut Context, contents: String) {
+    if review_is_read_only(cx.editor) {
+        return;
+    }
     let count = cx.count();
     let paste = match cx.editor.mode {
         Mode::Insert | Mode::Select => Paste::Cursor,
@@ -5129,6 +5326,9 @@ fn replace_with_yanked(cx: &mut Context) {
 }
 
 pub(crate) fn replace_selections_with_register(editor: &mut Editor, register: char, count: usize) {
+    if review_is_read_only(editor) {
+        return;
+    }
     let Some(values) = editor
         .registers
         .read(register, editor)
@@ -5182,6 +5382,9 @@ fn replace_selections_with_primary_clipboard(cx: &mut Context) {
 }
 
 pub(crate) fn paste(editor: &mut Editor, register: char, pos: Paste, count: usize) {
+    if review_is_read_only(editor) {
+        return;
+    }
     let Some(values) = editor.registers.read(register, editor) else {
         return;
     };
@@ -6219,11 +6422,11 @@ fn align_view_middle(cx: &mut Context) {
 }
 
 fn scroll_up(cx: &mut Context) {
-    scroll(cx, cx.count(), Direction::Backward, false);
+    scroll(cx, cx.count(), Direction::Backward, ScrollCursor::Clamp);
 }
 
 fn scroll_down(cx: &mut Context) {
-    scroll(cx, cx.count(), Direction::Forward, false);
+    scroll(cx, cx.count(), Direction::Forward, ScrollCursor::Clamp);
 }
 
 fn goto_ts_object_impl(cx: &mut Context, object: &'static str, direction: Direction) {

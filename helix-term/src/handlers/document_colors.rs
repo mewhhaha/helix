@@ -206,8 +206,8 @@ fn color_annotations(mut doc_colors: Vec<DocumentColor>) -> Option<DocumentColor
 
     for DocumentColor { range, color, .. } in doc_colors {
         let pos = range.start;
-        color_swatches_padding.push(InlineAnnotation::new(pos, " "));
-        color_swatches.push(InlineAnnotation::new(pos, "■"));
+        color_swatches_padding.push(InlineAnnotation::new(pos, " ").with_inherited_background());
+        color_swatches.push(InlineAnnotation::new(pos, "■").with_inherited_background());
         let highlight = Theme::rgb_highlight(
             (color.red * 255.).round() as u8,
             (color.green * 255.).round() as u8,

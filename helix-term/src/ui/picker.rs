@@ -1261,13 +1261,12 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                     .unwrap_or_else(|| cx.editor.theme.get("ui.selection"));
                 let draw_highlight = move |renderer: &mut TextRenderer, pos: LinePos| {
                     if (start..=end).contains(&pos.doc_line) {
-                        let area = Rect::new(
+                        renderer.set_row_style(
                             renderer.viewport.x,
                             pos.visual_line,
                             renderer.viewport.width,
-                            1,
-                        );
-                        renderer.set_style(area, style)
+                            style,
+                        )
                     }
                 };
                 decorations.add_decoration(draw_highlight);

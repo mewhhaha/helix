@@ -138,6 +138,11 @@ pub struct Diff<'a> {
 }
 
 impl Diff<'_> {
+    /// Identity of this published diff, including its direction.
+    pub fn render_key(&self) -> (u64, bool) {
+        (self.diff.generation, self.inverted)
+    }
+
     /// Returns the base [Rope] of the [Diff]
     pub fn diff_base(&self) -> &Rope {
         if self.inverted {

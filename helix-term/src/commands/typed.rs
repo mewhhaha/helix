@@ -2676,6 +2676,41 @@ fn run_shell_command(
     Ok(())
 }
 
+fn diff_mode(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    let scrolloff = cx.editor.config().scrolloff;
+    let (view, doc) = current!(cx.editor);
+    let enabled = match args.first() {
+        None => !view.diff_mode.enabled,
+        Some("on") => true,
+        Some("off") => false,
+        Some(_) => bail!("Usage: diff-mode [on|off]"),
+    };
+    ensure!(
+        !enabled || doc.diff_handle().is_some(),
+        "Diff is not available in the current buffer"
+    );
+    view.diff_mode.enabled = enabled;
+    view.diff_mode.clear_cursor();
+    let mut offset = doc.view_offset(view.id);
+    offset.vertical_offset = 0;
+    doc.set_view_offset(view.id, offset);
+    if enabled {
+        view.diff_mode.hold_scroll(doc, view.id);
+    } else {
+        view.diff_mode.release_scroll();
+    }
+    view.ensure_cursor_in_view(doc, scrolloff);
+    cx.editor.set_status(if enabled {
+        "Diff mode enabled"
+    } else {
+        "Diff mode disabled"
+    });
+    Ok(())
+}
+
 fn reset_diff_change(
     cx: &mut compositor::Context,
     _args: Args,
@@ -3977,6 +4012,14 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         },
     },
     TypableCommand {
+        name: "diff-mode",
+        aliases: &[],
+        doc: "Toggle the current view's Git diff display, or set it with on/off.",
+        fun: diff_mode,
+        completer: CommandCompleter::none(),
+        signature: Signature { positionals: (0, Some(1)), ..Signature::DEFAULT },
+    },
+    TypableCommand {
         name: "clear-register",
         aliases: &[],
         doc: "Clear given register. If no argument is provided, clear all registers.",
@@ -4142,6 +4185,27 @@ pub(super) fn execute_command(
     args: &str,
     event: PromptEvent,
 ) -> anyhow::Result<()> {
+    if event == PromptEvent::Validate
+        && matches!(
+            cmd.name,
+            "sort"
+                | "reflow"
+                | "pipe"
+                | "insert-output"
+                | "append-output"
+                | "format"
+                | "earlier"
+                | "later"
+                | "line-ending"
+                | "read"
+                | "trim-trailing-whitespace"
+                | "trim-final-newlines"
+                | "insert-final-newline"
+        )
+        && review_is_read_only(cx.editor)
+    {
+        bail!("Deleted rows are read-only; move to a current row to edit");
+    }
     let args = if event == PromptEvent::Validate {
         Args::parse(args, cmd.signature, true, |token| {
             expansion::expand(cx.editor, token).map_err(|err| err.into())

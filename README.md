@@ -30,15 +30,16 @@ performance improvements throughout editing, rendering, and background work.
   Animation frames run independently of full editor redraws and stop when the
   cursor settles. The feature is opt-in; other terminals and sessions inside
   tmux, GNU Screen, or Zellij use the ordinary cursor.
-- **Tailwind CSS and LSP colors:** color-value backgrounds with contrasting black
-  or white text in both hover popups and editor text. Hover previews recognize CSS
+- **Tailwind CSS and LSP colors:** inline color swatches in both hover popups and
+  editor text, using the referenced text's background so diff and selection
+  highlighting stay visible. Hover previews recognize CSS
   colors, including hex, named colors, RGB/HSL, and modern Lab/LCH/OKLab/OKLCH
   values, plus Tailwind v4 resolved-color comments. Editor previews use colors
-  reported by the language server. Color backgrounds are enabled by default;
-  optional inline swatches are disabled by default.
+  reported by the language server. Swatches are enabled by default;
+  optional color-value backgrounds are disabled by default.
 
 Add this to your Helix `config.toml` to enable the cursor animation and color
-backgrounds:
+swatches:
 
 ```toml
 [editor.cursor-smear]
@@ -47,12 +48,35 @@ duration = 120 # milliseconds
 max-distance = 40
 
 [editor.lsp]
-display-color-swatches = false
-display-color-values = true
+display-color-swatches = true
+display-color-values = false
 ```
 
 See the [cursor configuration](./book/src/configuration.md) and
 [LSP display settings](./book/src/editor.md#editorlsp-section) for details.
+
+## Diff mode
+
+Use `:diff-mode` to toggle a Git diff against HEAD in the current view
+(`:diff-mode on` and `:diff-mode off` also work). Added and changed rows have a
+green background and a `+` gutter before the line numbers. Diff backgrounds cover
+the full row, including its gutters. Deleted rows use a red background and a
+`-` gutter. All deleted lines remain visible before the added lines.
+Deleted text uses a separate syntax pass over the original file, preserving
+multiline strings, comments, and embedded languages. Use `j`/`k` or the arrow
+keys to navigate onto deleted rows.
+Use `v` with character, word, or line movements to select old text, `x` to select
+lines, `%` to select the deleted block, and `y` or clipboard yank commands to
+copy it. Mouse dragging also selects old text. Selections stay within one deleted
+block. Deleted text is read-only virtual content; editing and saving affect the
+current file. Deleted lines follow horizontal scrolling and do not soft-wrap.
+Page Up/Down keep the cursor at the visible edge, including within deleted rows.
+Ctrl-U/D move the cursor with the viewport. Mouse scrolling can leave the cursor
+offscreen while reviewing deleted text; moving the cursor brings it back into view.
+While diff mode is on, `]d`/`[d` jump through diff hunks and LSP diagnostics
+together; `[D`/`]D` go to the first/last stop. Each hunk is one stop, with deletions
+focused on their old text. Counts such as `3]d` skip multiple stops.
+Themes can customize the backgrounds with `ui.diff.added` and `ui.diff.deleted`.
 
 ## Performance improvements
 

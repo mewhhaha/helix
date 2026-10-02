@@ -9,6 +9,7 @@ use crate::ui::document::{LinePos, TextRenderer};
 pub use diagnostics::InlineDiagnostics;
 
 mod diagnostics;
+pub mod diff;
 
 /// Decorations are the primary mechanism for extending the text rendering.
 ///
@@ -22,6 +23,10 @@ mod diagnostics;
 /// To reserve space for virtual text lines (which is then filled by this trait) emit appropriate
 /// [`LineAnnotation`](helix_core::text_annotations::LineAnnotation)s in [`helix_view::View::text_annotations`]
 pub trait Decoration {
+    fn render_leading_lines(&mut self, _renderer: &mut TextRenderer, _row: usize) -> usize {
+        0
+    }
+
     /// Called **before** a **visual** line is rendered. A visual line does not
     /// necessarily correspond to a single line in a document as soft wrapping can
     /// spread a single document line across multiple visual lines.
@@ -97,6 +102,13 @@ pub struct DecorationManager<'a> {
 }
 
 impl<'a> DecorationManager<'a> {
+    pub fn render_leading_lines(&mut self, renderer: &mut TextRenderer) {
+        let mut row = 0;
+        for (decoration, _) in &mut self.decorations {
+            row += decoration.render_leading_lines(renderer, row);
+        }
+    }
+
     pub fn add_decoration(&mut self, decoration: impl Decoration + 'a) {
         self.decorations.push((Box::new(decoration), 0));
     }

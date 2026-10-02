@@ -663,8 +663,8 @@ impl Default for LspConfig {
             inlay_hints_length_limit: None,
             snippets: true,
             goto_reference_include_declaration: true,
-            display_color_swatches: false,
-            display_color_values: true,
+            display_color_swatches: true,
+            display_color_values: false,
         }
     }
 }
@@ -3036,7 +3036,11 @@ impl CursorCache {
 
         let text = doc.text().slice(..);
         let cursor = doc.selection(view.id).primary().cursor(text);
-        let res = view.screen_coords_at_pos(doc, text, cursor);
+        let res = if view.diff_mode.cursor(doc, view.id).is_some() {
+            view.diff_cursor_screen_coords(doc)
+        } else {
+            view.screen_coords_at_pos(doc, text, cursor)
+        };
         self.set(res);
         res
     }

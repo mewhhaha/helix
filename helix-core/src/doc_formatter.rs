@@ -41,6 +41,7 @@ pub enum GraphemeSource {
     /// is emitted right by the document formatter
     VirtualText {
         highlight: Option<Highlight>,
+        inherit_background: bool,
     },
 }
 
@@ -484,7 +485,7 @@ pub struct DocumentFormatter<'t> {
     line_pos: usize,
     exhausted: bool,
 
-    inline_annotation_graphemes: Option<(Graphemes<'t>, Option<Highlight>)>,
+    inline_annotation_graphemes: Option<(Graphemes<'t>, Option<Highlight>, bool)>,
 
     // softwrap specific
     /// The indentation of the current line
@@ -571,7 +572,14 @@ impl<'t> DocumentFormatter<'t> {
             rendered_indent: None,
             text_fmt,
             annotations,
-            visual_pos: Position::default(),
+            visual_pos: Position::new(
+                if block_char_idx == 0 {
+                    annotations.leading_virtual_lines()
+                } else {
+                    0
+                },
+                0,
+            ),
             graphemes: text.graphemes_at(text.char_to_byte(block_char_idx)),
             char_pos: block_char_idx,
             exhausted: false,
@@ -767,13 +775,13 @@ impl<'t> DocumentFormatter<'t> {
     fn next_inline_annotation_grapheme(
         &mut self,
         char_pos: usize,
-    ) -> Option<(&'t str, Option<Highlight>)> {
+    ) -> Option<(&'t str, Option<Highlight>, bool)> {
         loop {
-            if let Some(&mut (ref mut annotation, highlight)) =
+            if let Some(&mut (ref mut annotation, highlight, inherit_background)) =
                 self.inline_annotation_graphemes.as_mut()
             {
                 if let Some(grapheme) = annotation.next() {
-                    return Some((grapheme, highlight));
+                    return Some((grapheme, highlight, inherit_background));
                 }
             }
 
@@ -783,6 +791,7 @@ impl<'t> DocumentFormatter<'t> {
                 self.inline_annotation_graphemes = Some((
                     UnicodeSegmentation::graphemes(&*annotation.text, true),
                     highlight,
+                    annotation.inherit_background,
                 ))
             } else {
                 return None;
@@ -791,31 +800,38 @@ impl<'t> DocumentFormatter<'t> {
     }
 
     fn advance_grapheme(&mut self, col: usize, char_pos: usize) -> Option<GraphemeWithSource<'t>> {
-        let (grapheme, source) =
-            if let Some((grapheme, highlight)) = self.next_inline_annotation_grapheme(char_pos) {
-                (grapheme.into(), GraphemeSource::VirtualText { highlight })
-            } else if let Some(grapheme) = self.graphemes.next() {
-                let codepoints = grapheme.len_chars() as u32;
+        let (grapheme, source) = if let Some((grapheme, highlight, inherit_background)) =
+            self.next_inline_annotation_grapheme(char_pos)
+        {
+            (
+                grapheme.into(),
+                GraphemeSource::VirtualText {
+                    highlight,
+                    inherit_background,
+                },
+            )
+        } else if let Some(grapheme) = self.graphemes.next() {
+            let codepoints = grapheme.len_chars() as u32;
 
-                let overlay = self.annotations.overlay_at(char_pos);
-                let grapheme = match overlay {
-                    Some((overlay, _)) => overlay.grapheme.as_str().into(),
-                    None => Cow::from(grapheme).into(),
-                };
-
-                (grapheme, GraphemeSource::Document { codepoints })
-            } else {
-                if self.exhausted {
-                    return None;
-                }
-                self.exhausted = true;
-                // EOF grapheme is required for rendering
-                // and correct position computations
-                return Some(GraphemeWithSource {
-                    grapheme: Grapheme::Other { g: " ".into() },
-                    source: GraphemeSource::Document { codepoints: 0 },
-                });
+            let overlay = self.annotations.overlay_at(char_pos);
+            let grapheme = match overlay {
+                Some((overlay, _)) => overlay.grapheme.as_str().into(),
+                None => Cow::from(grapheme).into(),
             };
+
+            (grapheme, GraphemeSource::Document { codepoints })
+        } else {
+            if self.exhausted {
+                return None;
+            }
+            self.exhausted = true;
+            // EOF grapheme is required for rendering
+            // and correct position computations
+            return Some(GraphemeWithSource {
+                grapheme: Grapheme::Other { g: " ".into() },
+                source: GraphemeSource::Document { codepoints: 0 },
+            });
+        };
 
         let grapheme = GraphemeWithSource::new(grapheme, col, self.text_fmt.tab_width, source);
 
@@ -853,6 +869,7 @@ impl<'t> DocumentFormatter<'t> {
                     self.text_fmt.tab_width,
                     GraphemeSource::VirtualText {
                         highlight: self.text_fmt.wrap_indicator_highlight,
+                        inherit_background: false,
                     },
                 );
                 word_width += grapheme.width();

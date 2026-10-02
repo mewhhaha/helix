@@ -245,7 +245,7 @@ mod tests {
     }
 
     #[test]
-    fn default_hover_color_background_does_not_change_layout() {
+    fn default_hover_swatches_add_space_without_tinting_values() {
         let contents = || {
             lsp::HoverContents::Markup(lsp::MarkupContent {
                 kind: lsp::MarkupKind::Markdown,
@@ -264,7 +264,16 @@ mod tests {
 
         let plain_size = plain.required_size((200, 100)).unwrap();
         let colored_size = colored.required_size((200, 100)).unwrap();
-        assert_eq!(colored_size, plain_size);
+        assert_eq!(colored_size, (plain_size.0 + 2, plain_size.1));
+        let theme = Theme::default();
+        let contents = colored.content().1.parse(Some(&theme));
+        let spans = &contents.lines[0].0;
+        assert!(spans
+            .iter()
+            .any(|s| s.content == "■ " && s.style.fg == Some(Color::Rgb(255, 0, 0))));
+        assert!(spans
+            .iter()
+            .any(|s| s.content == "#f00" && s.style.bg != Some(Color::Rgb(255, 0, 0))));
     }
 
     #[test]
@@ -280,14 +289,19 @@ mod tests {
         let contents = hover.content().1.parse(Some(&theme));
         let spans: Vec<_> = contents.lines.iter().flat_map(|line| &line.0).collect();
 
-        assert!(spans.iter().any(|span| {
-            span.content == "#fb2c36"
-                && span.style.bg == Some(Color::Rgb(251, 44, 54))
-                && span.style.fg == Some(Color::Rgb(0, 0, 0))
-        }));
-        assert!(spans.iter().any(|span| {
-            span.content.starts_with("oklch(") && matches!(span.style.bg, Some(Color::Rgb(..)))
-        }));
-        assert!(!spans.iter().any(|span| span.content.contains('■')));
+        let value = spans
+            .iter()
+            .position(|span| span.content == "#fb2c36")
+            .unwrap();
+        assert_eq!(spans[value - 1].content, "■ ");
+        assert_eq!(spans[value - 1].style.fg, Some(Color::Rgb(251, 44, 54)));
+        assert_eq!(spans[value - 1].style.bg, spans[value].style.bg);
+        assert_ne!(spans[value].style.bg, Some(Color::Rgb(251, 44, 54)));
+        let oklch = spans
+            .iter()
+            .position(|span| span.content.starts_with("oklch("))
+            .unwrap();
+        assert_eq!(spans[oklch - 1].content, "■ ");
+        assert_eq!(spans[oklch - 1].style.bg, spans[oklch].style.bg);
     }
 }

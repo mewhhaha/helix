@@ -18,6 +18,8 @@ use crate::{Position, Tendril};
 pub struct InlineAnnotation {
     pub text: Tendril,
     pub char_idx: usize,
+    /// Use the background of the document text at this annotation's anchor.
+    pub inherit_background: bool,
 }
 
 impl InlineAnnotation {
@@ -25,7 +27,13 @@ impl InlineAnnotation {
         Self {
             char_idx,
             text: text.into(),
+            inherit_background: false,
         }
+    }
+
+    pub fn with_inherited_background(mut self) -> Self {
+        self.inherit_background = true;
+        self
     }
 
     /// Fingerprint immutable annotation positions and text once at their source.
@@ -35,6 +43,7 @@ impl InlineAnnotation {
         for annotation in annotations {
             annotation.char_idx.hash(&mut hasher);
             annotation.text.as_bytes().hash(&mut hasher);
+            annotation.inherit_background.hash(&mut hasher);
         }
         hasher.finish()
     }
@@ -127,6 +136,12 @@ impl Overlay {
 /// caches is preferable as otherwise a lot of lifetimes become invariant
 /// which complicates APIs a lot.
 pub trait LineAnnotation {
+    /// Virtual rows before the first document line. These are part of the
+    /// view's layout, but contain no editable document positions.
+    fn leading_virtual_lines(&self) -> usize {
+        0
+    }
+
     /// Stable identity of the annotation's layout inputs. Opaque annotations
     /// keep the default and use ordinary traversal.
     fn checkpoint_key(&self) -> Option<u64> {
@@ -515,6 +530,13 @@ impl Debug for TextAnnotations<'_> {
 }
 
 impl<'a> TextAnnotations<'a> {
+    pub fn leading_virtual_lines(&self) -> usize {
+        self.line_annotations
+            .iter()
+            .map(|(_, layer)| unsafe { layer.get().leading_virtual_lines() })
+            .sum()
+    }
+
     /// Prepare the TextAnnotations for iteration starting at char_idx
     pub fn reset_pos(&self, char_idx: usize) {
         reset_pos(&self.inline_annotations, char_idx, |annot| annot.char_idx);
