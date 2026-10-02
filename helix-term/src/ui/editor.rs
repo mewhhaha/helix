@@ -1829,7 +1829,7 @@ mod color_value_tests {
             Arc::new(ArcSwap::from_pointee(syntax::Loader::default())),
         );
         doc.color_swatches = Some(DocumentColorSwatches {
-            color_ranges: Arc::new(vec![(Theme::rgb_highlight(251, 44, 54), 0..10)]),
+            color_ranges: Arc::new(vec![(Theme::rgb_background_highlight(251, 44, 54), 0..10)]),
             ..DocumentColorSwatches::default()
         });
         doc
@@ -1898,7 +1898,7 @@ mod color_value_tests {
     }
 
     #[test]
-    fn lsp_color_values_have_rgb_foreground_without_inline_swatches() {
+    fn lsp_color_values_have_rgb_background_and_contrasting_text_without_swatches() {
         let doc = document(true, false);
         let overlay = EditorView::doc_color_value_highlights(&doc, 0, 1).unwrap();
         let OverlayHighlights::SharedHeterogenous {
@@ -1912,8 +1912,12 @@ mod color_value_tests {
         assert_eq!(indices, 0..1);
         assert_eq!(highlights[0].1, 0..10);
         assert_eq!(
-            Theme::default().highlight(highlights[0].0).fg,
+            Theme::default().highlight(highlights[0].0).bg,
             Some(Color::Rgb(251, 44, 54))
+        );
+        assert_eq!(
+            Theme::default().highlight(highlights[0].0).fg,
+            Some(Color::Rgb(0, 0, 0))
         );
     }
 
@@ -1929,7 +1933,7 @@ mod color_value_tests {
             (0..10_000)
                 .map(|index| {
                     (
-                        Theme::rgb_highlight((index >> 8) as u8, index as u8, 0),
+                        Theme::rgb_background_highlight((index >> 8) as u8, index as u8, 0),
                         index * 2..index * 2 + 1,
                     )
                 })

@@ -30,15 +30,15 @@ performance improvements throughout editing, rendering, and background work.
   Animation frames run independently of full editor redraws and stop when the
   cursor settles. The feature is opt-in; other terminals and sessions inside
   tmux, GNU Screen, or Zellij use the ordinary cursor.
-- **Tailwind CSS and LSP colors:** color swatches and color-value tinting in both
-  hover popups and editor text. Hover previews recognize CSS colors, including
-  hex, named colors, RGB/HSL, and modern Lab/LCH/OKLab/OKLCH values, plus Tailwind
-  v4 resolved-color comments. Editor previews use colors reported by the language
-  server. Swatches and tinting can be configured independently and are enabled
-  by default.
+- **Tailwind CSS and LSP colors:** color-value backgrounds with contrasting black
+  or white text in both hover popups and editor text. Hover previews recognize CSS
+  colors, including hex, named colors, RGB/HSL, and modern Lab/LCH/OKLab/OKLCH
+  values, plus Tailwind v4 resolved-color comments. Editor previews use colors
+  reported by the language server. Color backgrounds are enabled by default;
+  optional inline swatches are disabled by default.
 
-Add this to your Helix `config.toml` to enable the cursor animation and keep both
-color previews enabled:
+Add this to your Helix `config.toml` to enable the cursor animation and color
+backgrounds:
 
 ```toml
 [editor.cursor-smear]
@@ -47,7 +47,7 @@ duration = 120 # milliseconds
 max-distance = 40
 
 [editor.lsp]
-display-color-swatches = true
+display-color-swatches = false
 display-color-values = true
 ```
 

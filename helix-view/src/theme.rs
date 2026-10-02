@@ -397,6 +397,10 @@ impl Theme {
     /// we interpret the last 256^3 numbers as RGB.
     const RGB_START: u32 = (u32::MAX << (8 + 8 + 8)) - 1 - (u32::MAX - Highlight::MAX);
 
+    // Two preceding RGB ranges store background previews, with black or white
+    // text encoded in the high byte so rendering needs no contrast calculation.
+    const RGB_BACKGROUND_START: u32 = Self::RGB_START - 2 * 256_u32.pow(3);
+
     /// Interpret a Highlight with the RGB foreground
     fn decode_rgb_highlight(highlight: Highlight) -> Option<(u8, u8, u8)> {
         (highlight.get() > Self::RGB_START).then(|| {
@@ -412,10 +416,24 @@ impl Theme {
         Highlight::new(u32::from_le_bytes([b, g, r, u8::MAX]) - 1)
     }
 
+    /// Create a color background with a contrasting black or white foreground.
+    pub fn rgb_background_highlight(r: u8, g: u8, b: u8) -> Highlight {
+        let white = Style::color_preview(r, g, b).fg == Some(Color::Rgb(255, 255, 255));
+        let tag = if white { 0xfe } else { 0xfd };
+        Highlight::new(u32::from_le_bytes([b, g, r, tag]) - 1)
+    }
+
     #[inline]
     pub fn highlight(&self, highlight: Highlight) -> Style {
         if let Some((red, green, blue)) = Self::decode_rgb_highlight(highlight) {
             Style::new().fg(Color::Rgb(red, green, blue))
+        } else if highlight.get() > Self::RGB_BACKGROUND_START {
+            let [blue, green, red, tag] = (highlight.get() + 1).to_le_bytes();
+            let text = if tag == 0xfe { 255 } else { 0 };
+            Style::new()
+                .bg(Color::Rgb(red, green, blue))
+                .fg(Color::Rgb(text, text, text))
+                .remove_modifier(Modifier::DIM | Modifier::REVERSED)
         } else {
             self.highlights[highlight.idx()]
         }
@@ -769,9 +787,37 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "index out of bounds: the len is 0 but the index is 4278190078")]
+    fn color_backgrounds_encode_contrast_without_affecting_foreground_highlights() {
+        let theme = Theme::default();
+        for ((red, green, blue), text) in [
+            ((0, 0, 0), 255),
+            ((255, 255, 255), 0),
+            ((255, 0, 0), 0),
+            ((0, 255, 0), 0),
+            ((0, 0, 255), 255),
+            ((112, 112, 112), 255),
+            ((128, 128, 128), 0),
+            ((252, 206, 232), 0),
+        ] {
+            let preview = Style::color_preview(red, green, blue);
+            let background = Theme::rgb_background_highlight(red, green, blue);
+            assert_eq!(preview.bg, Some(Color::Rgb(red, green, blue)));
+            assert_eq!(preview.fg, Some(Color::Rgb(text, text, text)));
+            assert_eq!(theme.highlight(background), preview);
+            assert_eq!(Theme::decode_rgb_highlight(background), None);
+            let foreground = Theme::rgb_highlight(red, green, blue);
+            assert_ne!(background, foreground);
+            assert_eq!(
+                theme.highlight(foreground),
+                Style::new().fg(Color::Rgb(red, green, blue))
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "index out of bounds")]
     fn out_of_bounds() {
-        let highlight = Highlight::new(Theme::rgb_highlight(0, 0, 0).get() - 1);
+        let highlight = Highlight::new(Theme::RGB_BACKGROUND_START);
         Theme::default().highlight(highlight);
     }
 }

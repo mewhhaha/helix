@@ -357,8 +357,8 @@ mod tests {
             .clear_document_highlights(view);
         assert_matches_fresh(&component, editor);
         for color in [
-            helix_view::Theme::rgb_highlight(255, 0, 0),
-            helix_view::Theme::rgb_highlight(0, 0, 255),
+            helix_view::Theme::rgb_background_highlight(255, 0, 0),
+            helix_view::Theme::rgb_background_highlight(0, 0, 255),
         ] {
             editor.document_mut(doc_id).unwrap().color_swatches =
                 Some(helix_view::document::DocumentColorSwatches {

@@ -233,7 +233,11 @@ mod tests {
                     .collect();
                 assert_eq!(value_spans.len(), 1);
                 assert_eq!(
-                    value_spans[0].style.fg == Some(Color::Rgb(239, 68, 68)),
+                    value_spans[0].style.bg == Some(Color::Rgb(239, 68, 68)),
+                    display_color_values
+                );
+                assert_eq!(
+                    value_spans[0].style.fg == Some(Color::Rgb(0, 0, 0)),
                     display_color_values
                 );
             }
@@ -241,7 +245,7 @@ mod tests {
     }
 
     #[test]
-    fn hover_size_includes_inline_swatches() {
+    fn default_hover_color_background_does_not_change_layout() {
         let contents = || {
             lsp::HoverContents::Markup(lsp::MarkupContent {
                 kind: lsp::MarkupKind::Markdown,
@@ -260,7 +264,7 @@ mod tests {
 
         let plain_size = plain.required_size((200, 100)).unwrap();
         let colored_size = colored.required_size((200, 100)).unwrap();
-        assert_eq!(colored_size, (plain_size.0 + 2, plain_size.1));
+        assert_eq!(colored_size, plain_size);
     }
 
     #[test]
@@ -277,11 +281,13 @@ mod tests {
         let spans: Vec<_> = contents.lines.iter().flat_map(|line| &line.0).collect();
 
         assert!(spans.iter().any(|span| {
-            span.content == "#fb2c36" && span.style.fg == Some(Color::Rgb(251, 44, 54))
+            span.content == "#fb2c36"
+                && span.style.bg == Some(Color::Rgb(251, 44, 54))
+                && span.style.fg == Some(Color::Rgb(0, 0, 0))
         }));
         assert!(spans.iter().any(|span| {
-            span.content.starts_with("oklch(") && matches!(span.style.fg, Some(Color::Rgb(..)))
+            span.content.starts_with("oklch(") && matches!(span.style.bg, Some(Color::Rgb(..)))
         }));
-        assert!(spans.iter().any(|span| span.content.contains('■')));
+        assert!(!spans.iter().any(|span| span.content.contains('■')));
     }
 }

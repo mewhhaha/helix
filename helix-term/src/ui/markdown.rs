@@ -75,8 +75,10 @@ fn decorate_colors<'a>(
                     None => (available, None),
                 };
                 let style = match color.filter(|_| values) {
-                    Some(color) => span.style.fg(color),
-                    None => span.style,
+                    Some(Color::Rgb(red, green, blue)) => {
+                        span.style.patch(Style::color_preview(red, green, blue))
+                    }
+                    _ => span.style,
                 };
                 output.push(Span::styled(
                     span.content[offset..offset + length].to_owned(),
@@ -566,7 +568,12 @@ impl Markdown {
                     }
                     let style = color
                         .filter(|_| self.color_values)
-                        .map_or(code_style, |color| code_style.fg(color));
+                        .map_or(code_style, |color| match color {
+                            Color::Rgb(red, green, blue) => {
+                                code_style.patch(Style::color_preview(red, green, blue))
+                            }
+                            _ => code_style,
+                        });
                     spans.push(Span::styled(text, style));
                 }
                 Event::Html(text) => {
@@ -670,8 +677,12 @@ mod tests {
             let value = text.lines[0].0.iter().find(|span| span.content == "#f00");
             if swatches || values {
                 assert_eq!(
-                    value.unwrap().style.fg,
+                    value.unwrap().style.bg,
                     values.then_some(Color::Rgb(255, 0, 0))
+                );
+                assert_eq!(
+                    value.unwrap().style.fg,
+                    values.then_some(Color::Rgb(0, 0, 0))
                 );
             }
         }
@@ -680,13 +691,13 @@ mod tests {
     #[test]
     fn tailwind_hover_comments_and_named_values() {
         let markdown = markdown("```css\n.bg-red-500 { background-color: var(--color-red-500) /* oklch(63.7% 0.237 25.331) = #fb2c36 */; color: rebeccapurple; }\n```")
-            .with_color_previews(true, true);
+            .with_color_previews(false, true);
         let text = markdown.parse(None);
-        assert_eq!(visible(&text).matches('■').count(), 3);
-        assert!(visible(&text).contains("/* ■ oklch(63.7% 0.237 25.331) = ■ #fb2c36 */"));
-        assert!(text.lines[0].0.iter().any(
-            |span| span.content == "#fb2c36" && span.style.fg == Some(Color::Rgb(251, 44, 54))
-        ));
+        assert!(!visible(&text).contains('■'));
+        assert!(visible(&text).contains("/* oklch(63.7% 0.237 25.331) = #fb2c36 */"));
+        assert!(text.lines[0].0.iter().any(|span| span.content == "#fb2c36"
+            && span.style.bg == Some(Color::Rgb(251, 44, 54))
+            && span.style.fg == Some(Color::Rgb(0, 0, 0))));
     }
 
     #[test]
@@ -699,10 +710,14 @@ mod tests {
             "red",
             "`oklab(0.5 0.1 0.1)`",
         ] {
-            let markdown = markdown(source).with_color_previews(true, true);
-            assert_eq!(
-                visible(&markdown.parse(None)).matches('■').count(),
-                1,
+            let markdown = markdown(source).with_color_previews(false, true);
+            let text = markdown.parse(None);
+            assert!(!visible(&text).contains('■'), "{source}");
+            assert!(
+                text.lines
+                    .iter()
+                    .flat_map(|line| &line.0)
+                    .any(|span| { matches!(span.style.bg, Some(Color::Rgb(..))) }),
                 "{source}"
             );
         }
@@ -714,8 +729,16 @@ mod tests {
             "`bad`",
             "`var(--red)`",
         ] {
-            let markdown = markdown(source).with_color_previews(true, true);
-            assert!(!visible(&markdown.parse(None)).contains('■'), "{source}");
+            let markdown = markdown(source).with_color_previews(false, true);
+            assert!(
+                markdown
+                    .parse(None)
+                    .lines
+                    .iter()
+                    .flat_map(|line| &line.0)
+                    .all(|span| span.style.bg.is_none()),
+                "{source}"
+            );
         }
     }
 
@@ -724,7 +747,7 @@ mod tests {
         let style = Style::default()
             .bg(Color::Rgb(1, 2, 3))
             .fg(Color::Blue)
-            .add_modifier(Modifier::BOLD)
+            .add_modifier(Modifier::BOLD | Modifier::DIM | Modifier::REVERSED)
             .underline_color(Color::Green);
         let second = style.add_modifier(Modifier::ITALIC);
         let mut text = Text::from(Spans::from(vec![
@@ -735,13 +758,11 @@ mod tests {
         ]));
         let source = visible(&text);
         let colors = css_color_ranges(&source, None);
-        decorate_colors(&mut text, &colors, true, true);
-        assert_eq!(visible(&text), ".é { color: ■ #ff0000; }");
+        decorate_colors(&mut text, &colors, false, true);
+        assert_eq!(visible(&text), source);
         assert_eq!(text.lines[0].0[0].style, style);
-        assert!(text.lines[0]
-            .0
-            .iter()
-            .any(|span| span.content == "ff00" && span.style == second.fg(Color::Rgb(255, 0, 0))));
+        assert!(text.lines[0].0.iter().any(|span| span.content == "ff00"
+            && span.style == second.patch(Style::color_preview(255, 0, 0))));
         assert_eq!(text.lines[0].0.last().unwrap().style, style);
     }
 
@@ -749,18 +770,19 @@ mod tests {
     fn multiline_values_and_tabs_have_the_same_measured_layout() {
         let markdown =
             markdown("```css\n.é {\n\tcolor: rgb(\n\t\t255 0 0\n\t);\n\tbackground: #00f;\n}\n```")
-                .with_color_previews(true, true);
+                .with_color_previews(false, true);
         let theme = Theme::default();
         let measured = markdown.parse(None);
         let rendered = markdown.parse(Some(&theme));
         assert_eq!(visible(&measured), visible(&rendered));
-        assert_eq!(visible(&rendered).matches('■').count(), 2);
-        assert!(visible(&rendered).contains("    color: ■ rgb(\n        255 0 0\n    );"));
+        assert!(!visible(&rendered).contains('■'));
+        assert!(visible(&rendered).contains("    color: rgb(\n        255 0 0\n    );"));
         assert!(rendered.lines[2]
             .0
             .iter()
             .any(|span| span.content == "        255 0 0"
-                && span.style.fg == Some(Color::Rgb(255, 0, 0))));
+                && span.style.bg == Some(Color::Rgb(255, 0, 0))
+                && span.style.fg == Some(Color::Rgb(0, 0, 0))));
         assert_eq!(measured.width(), rendered.width());
     }
 
@@ -770,12 +792,13 @@ mod tests {
             "\"ui.popup\" = { bg = \"#0000ff\" }\n\"ui.background\" = { bg = \"#00ff00\" }",
         )
         .unwrap();
-        let markdown = markdown("`rgb(255 0 0 / 50%)`").with_color_previews(true, true);
+        let markdown = markdown("`rgb(255 0 0 / 50%)`").with_color_previews(false, true);
         let text = markdown.parse(Some(&theme));
         assert!(text.lines[0]
             .0
             .iter()
-            .all(|span| span.style.fg == Some(Color::Rgb(128, 0, 128))));
+            .all(|span| span.style.bg == Some(Color::Rgb(128, 0, 128))
+                && span.style.fg == Some(Color::Rgb(255, 255, 255))));
         let background: Theme = toml::from_str("\"ui.background\" = { bg = \"#00ff00\" }").unwrap();
         assert_eq!(
             preview_background(Some(&background)),
@@ -811,16 +834,16 @@ mod tests {
 
     #[test]
     fn cached_styles_invalidate_for_theme_loader_and_scope_changes() {
-        let markdown = markdown("`rgb(255 0 0 / 50%)`").with_color_previews(true, true);
+        let markdown = markdown("`rgb(255 0 0 / 50%)`").with_color_previews(false, true);
         let blue: Theme = toml::from_str("\"ui.popup\" = { bg = \"#0000ff\" }").unwrap();
         let green: Theme = toml::from_str("\"ui.popup\" = { bg = \"#00ff00\" }").unwrap();
         let first = markdown.parse(Some(&blue));
         assert!(Arc::ptr_eq(&first, &markdown.parse(Some(&blue.clone()))));
         let changed = markdown.parse(Some(&green));
         assert!(!Arc::ptr_eq(&first, &changed));
-        assert_eq!(first.lines[0].0[0].style.fg, Some(Color::Rgb(128, 0, 128)));
+        assert_eq!(first.lines[0].0[0].style.bg, Some(Color::Rgb(128, 0, 128)));
         assert_eq!(
-            changed.lines[0].0[0].style.fg,
+            changed.lines[0].0[0].style.bg,
             Some(Color::Rgb(128, 128, 0))
         );
         markdown

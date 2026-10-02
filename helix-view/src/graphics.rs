@@ -611,6 +611,33 @@ impl Style {
         }
     }
 
+    /// Preview an RGB color as a background with the more contrasting of black
+    /// and white text. Use explicit RGB foregrounds rather than theme-dependent
+    /// terminal palette colors.
+    pub fn color_preview(red: u8, green: u8, blue: u8) -> Self {
+        fn linear(channel: u8) -> f64 {
+            let channel = f64::from(channel) / 255.0;
+            if channel <= 0.04045 {
+                channel / 12.92
+            } else {
+                ((channel + 0.055) / 1.055).powf(2.4)
+            }
+        }
+
+        let luminance = 0.2126 * linear(red) + 0.7152 * linear(green) + 0.0722 * linear(blue);
+        let black_contrast = (luminance + 0.05) / 0.05;
+        let white_contrast = 1.05 / (luminance + 0.05);
+        let text = if black_contrast >= white_contrast {
+            0
+        } else {
+            255
+        };
+        Self::new()
+            .bg(Color::Rgb(red, green, blue))
+            .fg(Color::Rgb(text, text, text))
+            .remove_modifier(Modifier::DIM | Modifier::REVERSED)
+    }
+
     /// Returns a `Style` resetting all properties.
     pub const fn reset() -> Self {
         Self {

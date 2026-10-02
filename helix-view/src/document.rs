@@ -706,7 +706,8 @@ pub struct DocumentColorSwatches {
     pub color_swatches: Vec<InlineAnnotation>,
     pub colors: Vec<syntax::Highlight>,
     pub color_swatches_padding: Vec<InlineAnnotation>,
-    /// Sorted, non-overlapping character ranges tinted with their LSP color.
+    /// Sorted, non-overlapping character ranges with LSP color backgrounds
+    /// and contrasting foregrounds.
     pub color_ranges: Arc<Vec<(syntax::Highlight, std::ops::Range<usize>)>>,
     /// Immutable content/color fingerprints, refreshed when positions change.
     pub layout_keys: Option<[u64; 3]>,

@@ -641,7 +641,8 @@ pub struct LspConfig {
     pub inlay_hints_length_limit: Option<NonZeroU8>,
     /// Display document color swatches
     pub display_color_swatches: bool,
-    /// Tint document color values with their LSP color.
+    /// Highlight document color values with their LSP color as the background
+    /// and a contrasting foreground.
     pub display_color_values: bool,
     /// Whether to enable snippet support
     pub snippets: bool,
@@ -662,7 +663,7 @@ impl Default for LspConfig {
             inlay_hints_length_limit: None,
             snippets: true,
             goto_reference_include_declaration: true,
-            display_color_swatches: true,
+            display_color_swatches: false,
             display_color_values: true,
         }
     }

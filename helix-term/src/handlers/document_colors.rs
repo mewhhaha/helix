@@ -220,7 +220,14 @@ fn color_annotations(mut doc_colors: Vec<DocumentColor>) -> Option<DocumentColor
             .last()
             .is_none_or(|(_, previous)| previous.end <= range.start)
         {
-            color_ranges.push((highlight, range));
+            color_ranges.push((
+                Theme::rgb_background_highlight(
+                    (color.red * 255.).round() as u8,
+                    (color.green * 255.).round() as u8,
+                    (color.blue * 255.).round() as u8,
+                ),
+                range,
+            ));
         }
     }
 
@@ -467,14 +474,18 @@ mod tests {
         assert_eq!(
             *colors.color_ranges,
             vec![
-                (Theme::rgb_highlight(255, 0, 0), 0..4),
-                (Theme::rgb_highlight(0, 0, 255), 4..8),
-                (Theme::rgb_highlight(255, 0, 0), 10..12),
+                (Theme::rgb_background_highlight(255, 0, 0), 0..4),
+                (Theme::rgb_background_highlight(0, 0, 255), 4..8),
+                (Theme::rgb_background_highlight(255, 0, 0), 10..12),
             ]
         );
         assert_eq!(
-            Theme::default().highlight(colors.color_ranges[1].0).fg,
+            Theme::default().highlight(colors.color_ranges[1].0).bg,
             Some(Color::Rgb(0, 0, 255))
+        );
+        assert_eq!(
+            Theme::default().highlight(colors.color_ranges[1].0).fg,
+            Some(Color::Rgb(255, 255, 255))
         );
     }
 
