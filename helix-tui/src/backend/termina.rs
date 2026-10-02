@@ -32,6 +32,16 @@ fn supports_cursor_graphics(term: Option<&str>, program: Option<&str>, multiplex
             || matches!(program, Some("kitty" | "ghostty")))
 }
 
+fn cursor_graphics_compression(term: Option<&str>, program: Option<&str>) -> kitty::Compression {
+    if term == Some("xterm-ghostty") || program == Some("ghostty") {
+        // Ghostty 1.3.1 can segfault when inflating valid cursor frames. Raw RGBA
+        // avoids its zlib decoder while retaining the same image and animation.
+        kitty::Compression::None
+    } else {
+        kitty::Compression::Zlib
+    }
+}
+
 fn cell_size(size: WindowSize) -> Option<CellSize> {
     let width = size.pixel_width?.checked_div(size.cols)?;
     let height = size.pixel_height?.checked_div(size.rows)?;
@@ -123,9 +133,11 @@ impl TerminaBackend {
 
         let mut capabilities = Capabilities::default();
         let mut original_background_color = None;
+        let term = std::env::var("TERM").ok();
+        let program = std::env::var("TERM_PROGRAM").ok();
         capabilities.cursor_graphics = supports_cursor_graphics(
-            std::env::var("TERM").ok().as_deref(),
-            std::env::var("TERM_PROGRAM").ok().as_deref(),
+            term.as_deref(),
+            program.as_deref(),
             ["TMUX", "STY", "ZELLIJ"]
                 .iter()
                 .any(|name| std::env::var_os(name).is_some()),
@@ -299,7 +311,10 @@ impl TerminaBackend {
             original_background_color,
             cursor_image_id,
             cursor_image_active,
-            cursor_encoder: kitty::Encoder::default(),
+            cursor_encoder: kitty::Encoder::new(cursor_graphics_compression(
+                term.as_deref(),
+                program.as_deref(),
+            )),
         })
     }
 
@@ -835,6 +850,31 @@ fn diff_modifiers(from: Modifier, to: Modifier) -> SgrModifiers {
 #[cfg(test)]
 mod cursor_graphics_tests {
     use super::*;
+
+    #[test]
+    fn ghostty_uses_raw_rgba_and_kitty_keeps_zlib() {
+        for (term, program) in [
+            (Some("xterm-ghostty"), None),
+            (Some("xterm-ghostty"), Some("ghostty")),
+            (Some("xterm-256color"), Some("ghostty")),
+            (None, Some("ghostty")),
+        ] {
+            assert_eq!(
+                cursor_graphics_compression(term, program),
+                kitty::Compression::None
+            );
+        }
+        for (term, program) in [
+            (Some("xterm-kitty"), None),
+            (Some("xterm-kitty"), Some("kitty")),
+            (Some("xterm-256color"), Some("kitty")),
+        ] {
+            assert_eq!(
+                cursor_graphics_compression(term, program),
+                kitty::Compression::Zlib
+            );
+        }
+    }
 
     #[test]
     fn advertised_graphics_support_rejects_other_terminals_and_multiplexers() {

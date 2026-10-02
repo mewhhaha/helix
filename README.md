@@ -16,6 +16,118 @@
 
 </div>
 
+# Changes in this fork
+
+This fork adds a Neovide-inspired cursor smear, richer LSP color previews, and
+performance improvements throughout editing, rendering, and background work.
+
+## Cursor smear and color previews
+
+- **Neovide-inspired cursor smear:** a pixel-rendered cursor whose corners stretch
+  and settle as it moves, using the Kitty graphics protocol in direct Kitty and
+  Ghostty sessions. It follows the configured block, bar, or underline shape and
+  animates long jumps, including `gw` jumps that scroll the destination into view.
+  Animation frames run independently of full editor redraws and stop when the
+  cursor settles. The feature is opt-in; other terminals and sessions inside
+  tmux, GNU Screen, or Zellij use the ordinary cursor.
+- **Tailwind CSS and LSP colors:** color swatches and color-value tinting in both
+  hover popups and editor text. Hover previews recognize CSS colors, including
+  hex, named colors, RGB/HSL, and modern Lab/LCH/OKLab/OKLCH values, plus Tailwind
+  v4 resolved-color comments. Editor previews use colors reported by the language
+  server. Swatches and tinting can be configured independently and are enabled
+  by default.
+
+Add this to your Helix `config.toml` to enable the cursor animation and keep both
+color previews enabled:
+
+```toml
+[editor.cursor-smear]
+enabled = true
+duration = 120 # milliseconds
+max-distance = 40
+
+[editor.lsp]
+display-color-swatches = true
+display-color-values = true
+```
+
+See the [cursor configuration](./book/src/configuration.md) and
+[LSP display settings](./book/src/editor.md#editorlsp-section) for details.
+
+## Performance improvements
+
+- **Editor rendering:** reuse unchanged view contents and cache visible syntax
+  highlights, rainbow brackets, textobject queries, and decorations to reduce
+  repeated parsing, queries, and drawing.
+- **Scrolling and cursor positioning:** cache layout and grapheme checkpoints
+  so movement and scrolling through long, soft-wrapped lines can resume near
+  the target instead of repeatedly scanning from the line's start.
+- **Text layout:** reuse annotation measurements and paragraph wrapping, with
+  ASCII fast paths for common text and grapheme-aware handling for Unicode.
+- **Popups and documentation:** cache parsed Markdown, styled content, dimensions,
+  and signature-help layouts across redraws.
+- **Pickers and completion menus:** cache rendered rows and previews, limit work
+  to visible rows, reuse fuzzy matchers, and score large completion sets in
+  parallel while preserving candidate order. Stale background requests are
+  canceled.
+- **Word completion:** update the word index incrementally from changed regions,
+  stream ASCII word extraction, and prepare updates for different documents
+  concurrently. Superseded revisions are coalesced or canceled before their
+  results reach the index.
+- **Background concurrency:** share a bounded CPU worker pool between indexing,
+  completion scoring, and large LSP decoding jobs. Picker, search, and Git work
+  also have worker limits to reduce contention with interactive editing.
+- **LSP decoding:** use SIMD-assisted JSON parsing, retain incoming parameters
+  and results as raw JSON, and decode directly into their target types. Large
+  payloads are decoded on background workers.
+- **Language-server updates:** coalesce queued full-document changes and
+  serialize their snapshots in the background while preserving request order.
+- **Diagnostics:** batch incoming updates, coalesce superseded publications,
+  prepare large batches off the editor loop, and reuse diagnostic range and
+  annotation data during rendering.
+- **Debugger responsiveness:** fetch thread lists and stack traces asynchronously
+  and discard replies that belong to an outdated debugger session or request.
+- **Input and terminal output:** process bursts of ready events before drawing,
+  skip unchanged terminal rows, and stream changed cells to the backend without
+  allocating a separate diff vector.
+- **Cursor graphics:** fill solid image regions in bulk, reserve antialiasing
+  work for edges, and reuse a SIMD-capable zlib compressor and output buffers
+  between frames in Kitty. Ghostty uses uncompressed RGBA transfers to avoid
+  crashes in its zlib decoder.
+- **Search and multiple selections:** cache repeated reverse-search scans and
+  reuse grapheme traversal when mapping many selection endpoints through edits.
+- **Diffs and Git integration:** skip equal text edges, bound expensive character
+  diffs, reuse diff storage, and prepare Git baselines and changed-file scans on
+  cancellable background workers.
+- **Optimized builds:** provide native CPU builds and a profile-guided
+  optimization (PGO) workflow that builds, trains on editing workloads, merges
+  profiles, and installs the resulting binary.
+
+The fork also includes correctness fixes for LSP/DAP request cancellation and
+cleanup, workspace edits and queued saves, Unicode handling, stale asynchronous
+results, and cache invalidation when configuration or themes change.
+
+## Building this fork
+
+From the repository root, with Rust and `just` installed:
+
+```sh
+just install
+```
+
+This uses the `opt` profile and `target-cpu=native` for the build machine's CPU.
+The repository selects the nightly Rust toolchain. To build with PGO, also
+install Python 3 and the matching LLVM tools:
+
+```sh
+rustup component add llvm-tools-preview
+just install-pgo
+```
+
+PGO runs two builds, and its benefit depends on how closely the training matches
+your editing workload. See [building from source](./book/src/building-from-source.md)
+for runtime setup, requirements, and training with your own projects.
+
 ![Screenshot](./screenshot.png)
 
 A [Kakoune](https://github.com/mawww/kakoune) / [Neovim](https://github.com/neovim/neovim) inspired editor, written in Rust.

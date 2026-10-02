@@ -7,12 +7,20 @@ use super::CursorImage;
 const RAW_CHUNK_SIZE: usize = 3072;
 const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Compression {
+    None,
+    #[default]
+    Zlib,
+}
+
 pub(super) fn delete_image(writer: &mut impl Write, image_id: u32) -> io::Result<()> {
     write!(writer, "\x1b_Ga=d,d=I,i={image_id},q=2;\x1b\\")
 }
 
 #[derive(Default)]
 pub(super) struct Encoder {
+    compression: Compression,
     compressor: Option<zlib_rs::Deflate>,
     compressed: Vec<u8>,
 }
@@ -20,12 +28,20 @@ pub(super) struct Encoder {
 impl std::fmt::Debug for Encoder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Encoder")
+            .field("compression", &self.compression)
             .field("capacity", &self.compressed.capacity())
             .finish_non_exhaustive()
     }
 }
 
 impl Encoder {
+    pub(super) fn new(compression: Compression) -> Self {
+        Self {
+            compression,
+            ..Self::default()
+        }
+    }
+
     pub(super) fn draw_image(
         &mut self,
         writer: &mut impl Write,
@@ -35,27 +51,34 @@ impl Encoder {
         image.validate()?;
 
         // Positioning the placement must not move the real cursor (including on timer-only frames).
-        let capacity = zlib_rs::compress_bound(image.rgba.len());
-        if self.compressed.len() < capacity {
-            self.compressed.resize(capacity, 0);
-        }
-        let compressor = self
-            .compressor
-            .get_or_insert_with(|| zlib_rs::Deflate::new(1, true, 15));
-        compressor.reset();
-        let status = compressor
-            .compress(
-                image.rgba,
-                &mut self.compressed,
-                zlib_rs::DeflateFlush::Finish,
-            )
-            .map_err(|error| io::Error::other(format!("cursor compression failed: {error:?}")))?;
-        if status != zlib_rs::Status::StreamEnd
-            || compressor.total_in() as usize != image.rgba.len()
-        {
-            return Err(io::Error::other("incomplete cursor image compression"));
-        }
-        let compressed = &self.compressed[..compressor.total_out() as usize];
+        let (data, compression) = match self.compression {
+            Compression::None => (image.rgba, ""),
+            Compression::Zlib => {
+                let capacity = zlib_rs::compress_bound(image.rgba.len());
+                if self.compressed.len() < capacity {
+                    self.compressed.resize(capacity, 0);
+                }
+                let compressor = self
+                    .compressor
+                    .get_or_insert_with(|| zlib_rs::Deflate::new(1, true, 15));
+                compressor.reset();
+                let status = compressor
+                    .compress(
+                        image.rgba,
+                        &mut self.compressed,
+                        zlib_rs::DeflateFlush::Finish,
+                    )
+                    .map_err(|error| {
+                        io::Error::other(format!("cursor compression failed: {error:?}"))
+                    })?;
+                if status != zlib_rs::Status::StreamEnd
+                    || compressor.total_in() as usize != image.rgba.len()
+                {
+                    return Err(io::Error::other("incomplete cursor image compression"));
+                }
+                (&self.compressed[..compressor.total_out() as usize], ",o=z")
+            }
+        };
         writer.write_all(b"\x1b7")?;
         let result = (|| {
             write!(
@@ -65,14 +88,14 @@ impl Encoder {
                 image.position.col + 1
             )?;
             let mut encoded = [0; 4096];
-            let mut chunks = compressed.chunks(RAW_CHUNK_SIZE).peekable();
+            let mut chunks = data.chunks(RAW_CHUNK_SIZE).peekable();
             let mut first = true;
             while let Some(chunk) = chunks.next() {
                 let more = u8::from(chunks.peek().is_some());
                 if first {
                     write!(
                     writer,
-                    "\x1b_Ga=T,t=d,f=32,o=z,i={image_id},p=1,s={},v={},X={},Y={},z=-1,C=1,q=2,m={more};",
+                    "\x1b_Ga=T,t=d,f=32{compression},i={image_id},p=1,s={},v={},X={},Y={},z=-1,C=1,q=2,m={more};",
                     image.width, image.height, image.offset_x, image.offset_y,
                 )?;
                     first = false;
@@ -118,6 +141,45 @@ mod tests {
     use super::*;
     use helix_core::Position;
 
+    fn transmitted_bytes(output: &str) -> Vec<u8> {
+        let uploads: Vec<_> = output.split("\x1b_G").skip(1).collect();
+        assert!(uploads.last().unwrap().starts_with("m=0;") || uploads.len() == 1);
+        let mut bytes = Vec::new();
+        for (index, upload) in uploads.iter().enumerate() {
+            let (control, payload) = upload.split_once(';').unwrap();
+            let payload = payload.split("\x1b\\").next().unwrap();
+            assert!(payload.len() <= 4096);
+            assert_eq!(payload.len() % 4, 0);
+            let more = u8::from(index + 1 != uploads.len());
+            assert!(control.ends_with(&format!("m={more}")));
+            if more != 0 {
+                assert_eq!(payload.len(), 4096);
+            }
+            for chunk in payload.as_bytes().chunks_exact(4) {
+                let mut value = 0_u32;
+                for &byte in chunk {
+                    let digit = if byte == b'=' {
+                        0
+                    } else {
+                        BASE64
+                            .iter()
+                            .position(|&candidate| candidate == byte)
+                            .unwrap()
+                    };
+                    value = (value << 6) | digit as u32;
+                }
+                bytes.push((value >> 16) as u8);
+                if chunk[2] != b'=' {
+                    bytes.push((value >> 8) as u8);
+                }
+                if chunk[3] != b'=' {
+                    bytes.push(value as u8);
+                }
+            }
+        }
+        bytes
+    }
+
     #[test]
     fn rgba_upload_chunks_preserves_alpha_position_and_cursor() {
         let mut state = 42_u32;
@@ -157,43 +219,42 @@ mod tests {
             .unwrap();
         assert_eq!(first_payload.len(), 4096);
         assert!(uploads.last().unwrap().starts_with("m=0;"));
-        let mut compressed = Vec::new();
-        for (index, upload) in uploads.iter().enumerate() {
-            let payload = upload
-                .split_once(';')
-                .unwrap()
-                .1
-                .split("\x1b\\")
-                .next()
-                .unwrap();
-            assert!(payload.len() <= 4096);
-            assert_eq!(payload.len() % 4, 0);
-            if index + 1 != uploads.len() {
-                assert!(upload.split_once(';').unwrap().0.ends_with("m=1"));
-                assert_eq!(payload.len(), 4096);
-            }
-            for chunk in payload.as_bytes().chunks_exact(4) {
-                let mut value = 0_u32;
-                for &byte in chunk {
-                    let digit = BASE64
-                        .iter()
-                        .position(|&candidate| candidate == byte)
-                        .unwrap_or(0);
-                    value = (value << 6) | digit as u32;
-                }
-                compressed.push((value >> 16) as u8);
-                if chunk[2] != b'=' {
-                    compressed.push((value >> 8) as u8);
-                }
-                if chunk[3] != b'=' {
-                    compressed.push(value as u8);
-                }
-            }
-        }
+        let compressed = transmitted_bytes(&output);
         assert_eq!(
             miniz_oxide::inflate::decompress_to_vec_zlib(&compressed).unwrap(),
             rgba
         );
+    }
+
+    #[test]
+    fn uncompressed_frames_preserve_rgba_and_chunking_without_allocating_a_compressor() {
+        let mut encoder = Encoder::new(Compression::None);
+        // Include a frame larger than the Ghostty inflater's 32 KiB window,
+        // the maximum animation frame size, and smaller frames after both.
+        for (width, height) in [(10, 20), (218, 99), (512, 512), (1, 1), (10, 20)] {
+            let rgba: Vec<_> = (0..width * height * 4)
+                .map(|index| (index % 251) as u8)
+                .collect();
+            let image = CursorImage {
+                position: Position::new(2, 5),
+                offset_x: 3,
+                offset_y: 4,
+                width,
+                height,
+                rgba: &rgba,
+            };
+            let mut output = Vec::new();
+            encoder.draw_image(&mut output, 123, &image).unwrap();
+            let output = String::from_utf8(output).unwrap();
+            assert!(output.starts_with(&format!(
+                "\x1b7\x1b[3;6H\x1b_Ga=T,t=d,f=32,i=123,p=1,s={width},v={height},X=3,Y=4,z=-1,C=1,q=2,m="
+            )));
+            assert!(output.ends_with("\x1b\\\x1b8"));
+            assert!(!output.contains("o=z"));
+            assert_eq!(transmitted_bytes(&output), rgba);
+            assert!(encoder.compressor.is_none());
+            assert!(encoder.compressed.is_empty());
+        }
     }
 
     #[test]
