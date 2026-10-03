@@ -216,6 +216,12 @@ impl View {
         self.docs_access_history.push(id);
     }
 
+    pub fn set_diff_mode(&mut self, doc: &mut Document, enabled: bool) {
+        debug_assert_eq!(self.doc, doc.id());
+        self.diff_mode.enabled = enabled;
+        doc.set_view_diff_mode(self.id, enabled);
+    }
+
     pub fn inner_area(&self, doc: &Document) -> Rect {
         self.area.clip_left(self.gutter_offset(doc)).clip_bottom(1) // -1 for statusline
     }

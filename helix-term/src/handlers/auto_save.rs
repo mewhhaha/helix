@@ -88,6 +88,7 @@ fn request_auto_save(editor: &mut Editor) {
     };
 
     let options = commands::WriteAllOptions {
+        skip_read_only: true,
         force: false,
         write_scratch: false,
         auto_format: false,

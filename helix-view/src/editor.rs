@@ -29,7 +29,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fs,
     io::{self, stdin},
-    num::{NonZeroU8, NonZeroUsize},
+    num::NonZeroU8,
     path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
@@ -2202,10 +2202,15 @@ impl Editor {
         let scrolloff = self.config().scrolloff;
         let view = self.tree.get_mut(current_view);
 
+        if let Some(doc) = self.documents.get_mut(&view.doc) {
+            doc.set_view_diff_mode(view.id, false);
+        }
+
         view.doc = doc_id;
         let doc = doc_mut!(self, &doc_id);
 
         doc.ensure_view_init(view.id);
+        doc.set_view_diff_mode(view.id, view.diff_mode.enabled);
         view.sync_changes(doc);
         doc.mark_as_focused();
 
@@ -2307,6 +2312,7 @@ impl Editor {
                 // initialize selection for view
                 let doc = doc_mut!(self, &id);
                 doc.ensure_view_init(view_id);
+                doc.set_view_diff_mode(view_id, self.tree.get(view_id).diff_mode.enabled);
                 doc.mark_as_focused();
                 focus_lost
             }
@@ -2324,9 +2330,12 @@ impl Editor {
     /// Generate an id for a new document and register it.
     fn new_document(&mut self, mut doc: Document) -> DocumentId {
         let id = self.next_document_id;
-        // Safety: adding 1 from 1 is fine, practically impossible to reach usize max
-        self.next_document_id =
-            DocumentId(unsafe { NonZeroUsize::new_unchecked(self.next_document_id.0.get() + 1) });
+        self.next_document_id = DocumentId(
+            self.next_document_id
+                .0
+                .checked_add(1)
+                .expect("Document IDs exhausted"),
+        );
         doc.id = id;
         self.documents.insert(id, doc);
 
@@ -2546,13 +2555,17 @@ impl Editor {
             return true;
         }
         let status = format!(
-            "Diff mode enabled against {} ({})",
+            "Review mode enabled against {} ({})",
             prepared.reference,
             &commit[..commit.len().min(8)]
         );
+        if self.tree.focus == prepared.view && self.mode == Mode::Insert {
+            self.enter_normal_mode();
+        }
+        let doc = self.documents.get_mut(&prepared.document).unwrap();
         doc.set_review_diff_base(prepared.reference, commit, base);
         let view = self.tree.get_mut(prepared.view);
-        view.diff_mode.enabled = true;
+        view.set_diff_mode(doc, true);
         view.diff_mode.clear_cursor();
         let mut offset = doc.view_offset(view.id);
         offset.vertical_offset = 0;
@@ -3259,6 +3272,137 @@ mod vcs_loading_tests {
     }
 
     #[tokio::test]
+    async fn diff_read_only_state_follows_splits_buffer_switches_and_view_closure() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut editor = editor();
+        let first_doc = document(&mut editor, &dir.path().join("first.txt"));
+        let second_doc = document(&mut editor, &dir.path().join("second.txt"));
+        editor.switch(first_doc, Action::VerticalSplit);
+        let first = editor.tree.focus;
+        {
+            let view = editor.tree.get_mut(first);
+            let doc = editor.documents.get_mut(&first_doc).unwrap();
+            view.set_diff_mode(doc, true);
+        }
+        editor.switch(first_doc, Action::VerticalSplit);
+        let second = editor.tree.focus;
+        assert_ne!(first, second);
+        editor.close(first);
+        assert!(editor.documents[&first_doc].is_diff_mode_read_only());
+        editor.switch(second_doc, Action::Replace);
+        assert!(!editor.documents[&first_doc].is_diff_mode_read_only());
+        assert!(editor.documents[&second_doc].is_diff_mode_read_only());
+        editor.switch(first_doc, Action::Load);
+        assert!(!editor.documents[&first_doc].is_diff_mode_read_only());
+        editor.close(second);
+        assert!(!editor.documents[&second_doc].is_diff_mode_read_only());
+    }
+
+    #[tokio::test]
+    async fn diff_read_only_rejects_lsp_text_and_file_edits_without_affecting_other_buffers() {
+        use crate::handlers::lsp::ApplyEditErrorKind;
+        use helix_lsp::{lsp, OffsetEncoding};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reviewed.txt");
+        let other = dir.path().join("other.txt");
+        std::fs::write(&path, "committed\n").unwrap();
+        std::fs::write(&other, "other\n").unwrap();
+        let uri = lsp::Url::from_file_path(&path).unwrap();
+        let other_uri = lsp::Url::from_file_path(&other).unwrap();
+        let mut editor = editor();
+        let id = document(&mut editor, &path);
+        editor.switch(id, Action::VerticalSplit);
+        let view_id = editor.tree.focus;
+        editor
+            .tree
+            .get_mut(view_id)
+            .set_diff_mode(editor.documents.get_mut(&id).unwrap(), true);
+        let edits = |uri: lsp::Url, end: u32| lsp::WorkspaceEdit {
+            changes: Some(HashMap::from([(
+                uri,
+                vec![lsp::TextEdit {
+                    range: lsp::Range::new(lsp::Position::new(0, 0), lsp::Position::new(0, end)),
+                    new_text: "server edit".into(),
+                }],
+            )])),
+            ..Default::default()
+        };
+        let reviewed_edit = edits(uri.clone(), 9);
+        let error = editor
+            .apply_workspace_edit(OffsetEncoding::Utf16, &reviewed_edit)
+            .unwrap_err();
+        assert!(matches!(error.kind, ApplyEditErrorKind::DiffModeReadOnly));
+        for op in [
+            lsp::ResourceOp::Create(lsp::CreateFile {
+                uri: uri.clone(),
+                options: Some(lsp::CreateFileOptions {
+                    overwrite: Some(true),
+                    ignore_if_exists: None,
+                }),
+                annotation_id: None,
+            }),
+            lsp::ResourceOp::Delete(lsp::DeleteFile {
+                uri: uri.clone(),
+                options: None,
+            }),
+            lsp::ResourceOp::Rename(lsp::RenameFile {
+                old_uri: uri.clone(),
+                new_uri: other_uri.clone(),
+                options: None,
+                annotation_id: None,
+            }),
+            lsp::ResourceOp::Rename(lsp::RenameFile {
+                old_uri: other_uri.clone(),
+                new_uri: uri.clone(),
+                options: Some(lsp::RenameFileOptions {
+                    overwrite: Some(true),
+                    ignore_if_exists: None,
+                }),
+                annotation_id: None,
+            }),
+            lsp::ResourceOp::Delete(lsp::DeleteFile {
+                uri: lsp::Url::from_file_path(dir.path()).unwrap(),
+                options: Some(lsp::DeleteFileOptions {
+                    recursive: Some(true),
+                    ignore_if_not_exists: None,
+                    annotation_id: None,
+                }),
+            }),
+        ] {
+            let edit = lsp::WorkspaceEdit {
+                document_changes: Some(lsp::DocumentChanges::Operations(vec![
+                    lsp::DocumentChangeOperation::Op(op),
+                ])),
+                ..Default::default()
+            };
+            let error = editor
+                .apply_workspace_edit(OffsetEncoding::Utf16, &edit)
+                .unwrap_err();
+            assert!(matches!(error.kind, ApplyEditErrorKind::DiffModeReadOnly));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "committed\n");
+            assert_eq!(std::fs::read_to_string(&other).unwrap(), "other\n");
+        }
+        editor
+            .apply_workspace_edit(OffsetEncoding::Utf16, &edits(other_uri, 5))
+            .unwrap();
+        let other_id = editor.document_id_by_path(&other).unwrap();
+        assert_eq!(
+            editor.documents[&other_id].text().to_string(),
+            "server edit\n"
+        );
+        assert_eq!(editor.documents[&id].text().to_string(), "committed\n");
+        editor
+            .tree
+            .get_mut(view_id)
+            .set_diff_mode(editor.documents.get_mut(&id).unwrap(), false);
+        editor
+            .apply_workspace_edit(OffsetEncoding::Utf16, &reviewed_edit)
+            .unwrap();
+        assert_eq!(editor.documents[&id].text().to_string(), "server edit\n");
+    }
+
+    #[tokio::test]
     async fn prepared_review_rejects_superseded_canceled_renamed_and_closed_requests() {
         let dir = tempfile::tempdir().unwrap();
         let mut editor = editor();
@@ -3274,7 +3418,10 @@ mod vcs_loading_tests {
 
         let canceled = prepared_review(&mut editor, id);
         editor.cancel_review_diff(id);
-        editor.tree.get_mut(editor.tree.focus).diff_mode.enabled = false;
+        editor
+            .tree
+            .get_mut(editor.tree.focus)
+            .set_diff_mode(editor.documents.get_mut(&id).unwrap(), false);
         assert!(!editor.apply_prepared_review_diff(canceled));
         assert!(!editor.tree.get(editor.tree.focus).diff_mode.enabled);
         assert_eq!(editor.documents[&id].review_diff_reference(), Some("main"));

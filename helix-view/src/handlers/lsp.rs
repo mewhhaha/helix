@@ -63,6 +63,7 @@ pub struct ApplyEditError {
 #[derive(Debug)]
 pub enum ApplyEditErrorKind {
     DocumentChanged,
+    DiffModeReadOnly,
     FileNotFound,
     InvalidUrl(helix_core::uri::UrlConversionError),
     IoError(std::io::Error),
@@ -86,6 +87,9 @@ impl Display for ApplyEditErrorKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ApplyEditErrorKind::DocumentChanged => f.write_str("document has changed"),
+            ApplyEditErrorKind::DiffModeReadOnly => {
+                f.write_str(crate::document::DIFF_MODE_READ_ONLY)
+            }
             ApplyEditErrorKind::FileNotFound => f.write_str("file not found"),
             ApplyEditErrorKind::InvalidUrl(err) => f.write_str(&format!("{err}")),
             ApplyEditErrorKind::IoError(err) => f.write_str(&format!("{err}")),
@@ -125,6 +129,9 @@ impl Editor {
         };
 
         let doc = doc_mut!(self, &doc_id);
+        if doc.is_diff_mode_read_only() {
+            return Err(ApplyEditErrorKind::DiffModeReadOnly);
+        }
         if let Some(version) = version {
             if version != doc.version() {
                 let err = format!("outdated workspace edit for {path:?}");
@@ -250,6 +257,7 @@ impl Editor {
             ResourceOp::Create(op) => {
                 let uri = Uri::try_from(&op.uri)?;
                 let path = uri.as_path().expect("URIs are valid paths");
+                self.ensure_resource_not_reviewed(path)?;
                 let overwrite = op
                     .options
                     .as_ref()
@@ -280,6 +288,7 @@ impl Editor {
             ResourceOp::Delete(op) => {
                 let uri = Uri::try_from(&op.uri)?;
                 let path = uri.as_path().expect("URIs are valid paths");
+                self.ensure_resource_not_reviewed(path)?;
                 let ignore_if_not_exists = op
                     .options
                     .as_ref()
@@ -299,6 +308,8 @@ impl Editor {
                 let from = from_uri.as_path().expect("URIs are valid paths");
                 let to_uri = Uri::try_from(&op.new_uri)?;
                 let to = to_uri.as_path().expect("URIs are valid paths");
+                self.ensure_resource_not_reviewed(from)?;
+                self.ensure_resource_not_reviewed(to)?;
                 let overwrite = op
                     .options
                     .as_ref()
@@ -326,6 +337,19 @@ impl Editor {
                     }
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn ensure_resource_not_reviewed(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<(), ApplyEditErrorKind> {
+        let path = helix_stdx::path::canonicalize(path);
+        if self.documents.values().any(|doc| {
+            doc.is_diff_mode_read_only() && doc.path().is_some_and(|file| file.starts_with(&path))
+        }) {
+            return Err(ApplyEditErrorKind::DiffModeReadOnly);
         }
         Ok(())
     }

@@ -557,7 +557,7 @@ mod tests {
             let id = editor.tree.focus;
             let doc_id = editor.tree.get(id).doc;
             diff_language(editor, "javascript")?;
-            typed(editor, "diff-mode", "on")?;
+            typed(editor, "review-mode", "on")?;
             let component = EditorView::new(Keymaps::default());
             let inner = editor
                 .tree
@@ -598,7 +598,7 @@ mod tests {
         let id = editor.tree.focus;
         let doc_id = editor.tree.get(id).doc;
         let loader = diff_language(editor, "javascript")?;
-        typed(editor, "diff-mode", "on")?;
+        typed(editor, "review-mode", "on")?;
         let view = editor.tree.get(id);
         let doc = editor.document(doc_id).unwrap();
         let display = view.diff_mode.display(doc).unwrap();
@@ -621,6 +621,7 @@ mod tests {
         assert_matches_fresh(&component, editor);
 
         // Editing the current file must not reparse the unchanged original file.
+        typed(editor, "review-mode", "off")?;
         let doc = editor.document_mut(doc_id).unwrap();
         let start = doc.text().len_chars() - 3;
         let change = Transaction::change(
@@ -628,6 +629,7 @@ mod tests {
             [(start, start + 1, Some("1".into()))].into_iter(),
         );
         assert!(doc.apply(&change, id));
+        typed(editor, "review-mode", "on")?;
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while editor
                 .tree
@@ -751,6 +753,119 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn diff_source_rows_reject_edits_but_keep_navigation_selection_and_yanking(
+    ) -> anyhow::Result<()> {
+        use crate::commands::MappableCommand as Command;
+
+        let mut app = diff_application("same\nold\nlast\n", "same\nnew\nlast\n").await?;
+        let editor = &mut app.editor;
+        let id = editor.tree.focus;
+        let doc_id = editor.tree.get(id).doc;
+        {
+            let (view, doc) = helix_view::current!(editor);
+            doc.append_changes_to_history(view);
+        }
+        let original = editor.document(doc_id).unwrap().text().clone();
+        let version = editor.document(doc_id).unwrap().version();
+        editor
+            .registers
+            .write('"', vec!["preserve register".into()])?;
+        typed(editor, "review-mode", "on")?;
+        for line in [0, 1, 2] {
+            let doc = editor.document_mut(doc_id).unwrap();
+            doc.set_selection(id, Selection::point(doc.text().line_to_char(line)));
+            for edit in [
+                Command::insert_mode,
+                Command::append_mode,
+                Command::open_above,
+                Command::open_below,
+                Command::delete_selection,
+                Command::change_selection,
+                Command::replace,
+                Command::paste_after,
+                Command::indent,
+                Command::toggle_comments,
+                Command::undo,
+                Command::redo,
+                Command::rename_symbol,
+                Command::code_action,
+                Command::format_selections,
+                Command::shell_pipe,
+            ] {
+                editor.clear_status();
+                command(editor, edit);
+                assert!(editor.is_err());
+                assert_eq!(editor.mode, Mode::Normal);
+                let doc = editor.document(doc_id).unwrap();
+                assert!(doc.text().is_instance(&original));
+                assert_eq!(doc.version(), version);
+                assert_eq!(register_text(editor, '"'), "preserve register");
+            }
+        }
+        for edit in [
+            ":sort",
+            ":reflow",
+            ":format",
+            ":diffget",
+            ":read missing.txt",
+            ":line-ending crlf",
+            ":encoding windows-1252",
+            ":write",
+            ":write!",
+            ":write-all",
+            ":write-all!",
+            ":reload",
+            ":earlier",
+            ":later",
+            ":insert-output printf changed",
+        ] {
+            editor.clear_status();
+            command(editor, edit.parse()?);
+            assert!(editor.is_err(), "{edit}");
+            assert!(
+                editor
+                    .document(doc_id)
+                    .unwrap()
+                    .text()
+                    .is_instance(&original),
+                "{edit}"
+            );
+            assert_eq!(
+                editor.document(doc_id).unwrap().version(),
+                version,
+                "{edit}"
+            );
+        }
+        command(editor, Command::goto_file_start);
+        command(editor, Command::select_all);
+        command(editor, Command::yank);
+        assert_eq!(register_text(editor, '"'), "same\nnew\nlast\n");
+        command(editor, Command::goto_last_diag);
+        assert!(editor
+            .tree
+            .get(id)
+            .diff_mode
+            .cursor(editor.document(doc_id).unwrap(), id)
+            .is_some());
+        command(editor, Command::extend_line_below);
+        command(editor, Command::yank);
+        assert_eq!(register_text(editor, '"'), "old\n");
+        typed(editor, "review-mode", "off")?;
+        command(editor, Command::delete_selection);
+        assert!(!editor
+            .document(doc_id)
+            .unwrap()
+            .text()
+            .is_instance(&original));
+        command(editor, Command::undo);
+        assert_eq!(
+            editor.document(doc_id).unwrap().text().to_string(),
+            original.to_string()
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn diagnostic_navigation_merges_diff_hunks_and_real_diagnostics() -> anyhow::Result<()> {
         use crate::commands::MappableCommand as Command;
         use helix_core::diagnostic::{Diagnostic, DiagnosticProvider, Severity};
@@ -802,7 +917,7 @@ mod tests {
         doc.replace_diagnostics(diagnostics, &[], None);
         let version = doc.version();
         let diagnostics_generation = doc.diagnostics_generation();
-        typed(editor, "diff-mode", "on")?;
+        typed(editor, "review-mode", "on")?;
         assert_eq!(
             editor
                 .tree
@@ -908,8 +1023,8 @@ mod tests {
         command(editor, Command::goto_last_diag);
         assert_stop(editor, stops[8]);
 
-        // Switching diff mode off restores diagnostic-only navigation.
-        typed(editor, "diff-mode", "off")?;
+        // Switching review mode off restores diagnostic-only navigation.
+        typed(editor, "review-mode", "off")?;
         command(editor, Command::goto_first_diag);
         assert_stop(editor, Stop::Source(positions[0]));
         command(editor, Command::goto_next_diag);
@@ -987,7 +1102,7 @@ mod tests {
                     doc.replace_diagnostics(diagnostics, &[], None);
                     let component = EditorView::new(Keymaps::default());
                     for diff in [false, true] {
-                        typed(editor, "diff-mode", if diff { "on" } else { "off" })?;
+                        typed(editor, "review-mode", if diff { "on" } else { "off" })?;
                         for command_name in [Command::goto_first_diag, Command::goto_last_diag] {
                             command(editor, command_name);
                             for direction in [Command::goto_next_diag, Command::goto_prev_diag] {
@@ -1070,7 +1185,7 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             doc.replace_diagnostics(diagnostics, &[], None);
-            typed(editor, "diff-mode", "on")?;
+            typed(editor, "review-mode", "on")?;
             let component = EditorView::new(Keymaps::default());
             for command_name in [
                 Command::goto_first_diag,
@@ -1132,7 +1247,7 @@ mod tests {
         let editor = &mut app.editor;
         let id = editor.tree.focus;
         let doc_id = editor.tree.get(id).doc;
-        typed(editor, "diff-mode", "on")?;
+        typed(editor, "review-mode", "on")?;
         let component = EditorView::new(Keymaps::default());
         for navigation in [
             Command::goto_next_diag,
@@ -1197,7 +1312,7 @@ mod tests {
         let doc_id = editor.tree.get(id).doc;
         let first = editor.document(doc_id).unwrap().text().line_to_char(1);
         let last = editor.document(doc_id).unwrap().text().line_to_char(4);
-        typed(editor, "diff-mode", "on")?;
+        typed(editor, "review-mode", "on")?;
         let assert_source = |editor: &Editor, pos| {
             let doc = editor.document(doc_id).unwrap();
             assert!(editor.tree.get(id).diff_mode.cursor(doc, id).is_none());
@@ -1222,7 +1337,7 @@ mod tests {
         assert_source(editor, last);
         command(editor, Command::goto_first_diag);
         assert_source(editor, first);
-        typed(editor, "diff-mode", "off")?;
+        typed(editor, "review-mode", "off")?;
         command(editor, Command::goto_last_diag);
         assert_source(editor, first);
         Ok(())
@@ -1237,7 +1352,7 @@ mod tests {
         let editor = &mut app.editor;
         let id = editor.tree.focus;
         let doc_id = editor.tree.get(id).doc;
-        typed(editor, "diff-mode", "on")?;
+        typed(editor, "review-mode", "on")?;
         command(editor, Command::move_visual_line_down);
         let original = editor.document(doc_id).unwrap().text().clone();
         let selection = editor.document(doc_id).unwrap().selection(id).clone();
@@ -1325,7 +1440,7 @@ mod tests {
         let editor = &mut app.editor;
         let id = editor.tree.focus;
         let doc_id = editor.tree.get(id).doc;
-        typed(editor, "diff-mode", "on")?;
+        typed(editor, "review-mode", "on")?;
         command(editor, Command::move_visual_line_down);
         command(editor, Command::move_char_right);
         command(editor, Command::select_mode);
@@ -1372,7 +1487,7 @@ mod tests {
         let editor = &mut app.editor;
         let id = editor.tree.focus;
         let doc_id = editor.tree.get(id).doc;
-        typed(editor, "diff-mode", "on")?;
+        typed(editor, "review-mode", "on")?;
         let x = editor
             .tree
             .get(id)
@@ -1446,7 +1561,7 @@ mod tests {
         let editor = &mut app.editor;
         let id = editor.tree.focus;
         let doc_id = editor.tree.get(id).doc;
-        typed(editor, "diff-mode", "on")?;
+        typed(editor, "review-mode", "on")?;
         command(editor, Command::move_visual_line_down);
         command(editor, Command::select_mode);
         command(editor, Command::page_cursor_half_down);
@@ -1499,7 +1614,7 @@ mod tests {
             let id = editor.tree.focus;
             let doc_id = editor.tree.get(id).doc;
             let original = editor.document(doc_id).unwrap().text().clone();
-            typed(editor, "diff-mode", "on")?;
+            typed(editor, "review-mode", "on")?;
             command(editor, Command::goto_first_diag);
 
             let component = EditorView::new(Keymaps::default());
@@ -1558,7 +1673,7 @@ mod tests {
         let editor = &mut app.editor;
         let id = editor.tree.focus;
         let doc_id = editor.tree.get(id).doc;
-        typed(editor, "diff-mode", "on")?;
+        typed(editor, "review-mode", "on")?;
         command(editor, Command::move_visual_line_down);
         let count = editor.tree.get(id).inner_height() / 2;
         for _ in 0..3 {
@@ -1624,7 +1739,7 @@ mod tests {
         let editor = &mut app.editor;
         let id = editor.tree.focus;
         let doc_id = editor.tree.get(id).doc;
-        typed(editor, "diff-mode", "on")?;
+        typed(editor, "review-mode", "on")?;
         for _ in 0..3 {
             command(editor, Command::page_down);
             let view = editor.tree.get(id);
@@ -1667,7 +1782,7 @@ mod tests {
         let original = editor.document(doc_id).unwrap().text().clone();
         let component = EditorView::new(Keymaps::default());
         let before = rendered(&component, editor);
-        typed(editor, "diff-mode", "")?;
+        typed(editor, "review-mode", "")?;
         let inner = editor
             .tree
             .get(id)
@@ -1704,7 +1819,7 @@ mod tests {
             .unwrap()
             .text()
             .is_instance(&original));
-        assert!(typed(editor, "diff-mode", "invalid").is_err());
+        assert!(typed(editor, "review-mode", "invalid").is_err());
         Ok(())
     }
 
@@ -1732,7 +1847,7 @@ mod tests {
             let editor = &mut app.editor;
             let id = editor.tree.focus;
             editor.tree.get_mut(id).gutters.layout.clear();
-            typed(editor, "diff-mode", "on")?;
+            typed(editor, "review-mode", "on")?;
             let doc_id = editor.tree.get(id).doc;
             // Review deleted text without moving the editable cursor or source.
             editor
@@ -1776,7 +1891,7 @@ mod tests {
         let editor = &mut app.editor;
         let id = editor.tree.focus;
         let doc_id = editor.tree.get(id).doc;
-        typed(editor, "diff-mode", "on")?;
+        typed(editor, "review-mode", "on")?;
         let component = EditorView::new(Keymaps::default());
         let inner = editor
             .tree
@@ -1843,7 +1958,7 @@ mod tests {
             let editor = &mut app.editor;
             let id = editor.tree.focus;
             let doc_id = editor.tree.get(id).doc;
-            typed(editor, "diff-mode", "on")?;
+            typed(editor, "review-mode", "on")?;
             let before_selection = editor.document(doc_id).unwrap().selection(id).clone();
             let mut jobs = crate::job::Jobs::new();
             let mut context = crate::commands::Context {
@@ -1883,7 +1998,7 @@ mod tests {
                 .get(id)
                 .diff_mode
                 .preserves_scroll(editor.document(doc_id).unwrap(), id));
-            typed(editor, "diff-mode", "off")?;
+            typed(editor, "review-mode", "off")?;
             let buffer = rendered(&component, editor);
             let inner = editor
                 .tree

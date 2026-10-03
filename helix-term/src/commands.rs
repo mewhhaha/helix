@@ -46,7 +46,7 @@ use helix_core::{
     Rope, RopeReader, RopeSlice, Selection, SmallVec, Syntax, Tendril, Transaction,
 };
 use helix_view::{
-    document::{FormatterError, Mode, SCRATCH_BUFFER_NAME},
+    document::{FormatterError, Mode, DIFF_MODE_READ_ONLY, SCRATCH_BUFFER_NAME},
     editor::{Action, Motion},
     expansion,
     info::Info,
@@ -248,59 +248,15 @@ macro_rules! static_commands {
 
 impl MappableCommand {
     pub fn execute(&self, cx: &mut Context) {
+        if self.modifies_buffer() && review_is_read_only(cx.editor) {
+            return;
+        }
         if diff::execute(self, cx) {
             return;
         }
         let (view, doc) = current!(cx.editor);
         if view.diff_mode.cursor(doc, view.id).is_some() {
             let name = self.name();
-            if name.starts_with("insert")
-                || name.starts_with("delete")
-                || name.starts_with("change_selection")
-                || name.starts_with("replace")
-                || name.starts_with("paste")
-                || name.starts_with("surround_")
-                || name.starts_with("toggle_") && name.ends_with("comments")
-                || matches!(
-                    name,
-                    "append_mode"
-                        | "open_above"
-                        | "open_below"
-                        | "indent"
-                        | "unindent"
-                        | "switch_case"
-                        | "switch_to_uppercase"
-                        | "switch_to_lowercase"
-                        | "join_selections"
-                        | "join_selections_space"
-                        | "format_selections"
-                        | "toggle_comments"
-                        | "increment"
-                        | "decrement"
-                        | "rename_symbol"
-                        | "append_char_interactive"
-                        | "align_selections"
-                        | "reverse_selection_contents"
-                        | "rotate_selection_contents_forward"
-                        | "rotate_selection_contents_backward"
-                        | "smart_tab"
-                        | "shell_pipe"
-                        | "shell_insert_output"
-                        | "shell_append_output"
-                        | "add_newline_above"
-                        | "add_newline_below"
-                        | "kill_to_line_start"
-                        | "kill_to_line_end"
-                        | "undo"
-                        | "redo"
-                        | "earlier"
-                        | "later"
-                )
-            {
-                cx.editor
-                    .set_error("Deleted rows are read-only; move to a current row to edit");
-                return;
-            }
             if name != "select_register"
                 && (name.starts_with("select_")
                     || name.starts_with("extend_")
@@ -403,6 +359,54 @@ impl MappableCommand {
         }
     }
 
+    fn modifies_buffer(&self) -> bool {
+        let name = self.name();
+        name.starts_with("insert")
+            || name.starts_with("delete")
+            || name.starts_with("change_selection")
+            || name.starts_with("replace")
+            || name.starts_with("paste")
+            || name.starts_with("surround_")
+            || name.starts_with("toggle_") && name.ends_with("comments")
+            || matches!(
+                name,
+                "append_mode"
+                    | "open_above"
+                    | "open_below"
+                    | "indent"
+                    | "unindent"
+                    | "switch_case"
+                    | "switch_to_uppercase"
+                    | "switch_to_lowercase"
+                    | "join_selections"
+                    | "join_selections_space"
+                    | "format_selections"
+                    | "toggle_comments"
+                    | "increment"
+                    | "decrement"
+                    | "rename_symbol"
+                    | "code_action"
+                    | "completion"
+                    | "append_char_interactive"
+                    | "align_selections"
+                    | "reverse_selection_contents"
+                    | "rotate_selection_contents_forward"
+                    | "rotate_selection_contents_backward"
+                    | "smart_tab"
+                    | "shell_pipe"
+                    | "shell_insert_output"
+                    | "shell_append_output"
+                    | "add_newline_above"
+                    | "add_newline_below"
+                    | "kill_to_line_start"
+                    | "kill_to_line_end"
+                    | "undo"
+                    | "redo"
+                    | "earlier"
+                    | "later"
+            )
+    }
+
     #[rustfmt::skip]
     static_commands!(
         no_op, "Do nothing",
@@ -502,6 +506,7 @@ impl MappableCommand {
         insert_mode, "Insert before selection",
         append_mode, "Append after selection",
         command_mode, "Enter command mode",
+        toggle_review_mode, "Toggle read-only Git review mode",
         file_picker, "Open file picker",
         file_picker_in_current_buffer_directory, "Open file picker at current buffer's directory",
         file_picker_in_current_directory, "Open file picker at current working directory",
@@ -2056,7 +2061,7 @@ pub enum ScrollCursor {
     Clamp,
     /// Move the cursor by the same number of visual rows as the viewport.
     Follow,
-    /// Mouse scrolling can leave the review cursor offscreen in diff mode.
+    /// Mouse scrolling can leave the review cursor offscreen in review mode.
     Preserve,
 }
 
@@ -4014,6 +4019,10 @@ async fn make_format_callback(
         if !editor.documents.contains_key(&doc_id) || !editor.tree.contains(view_id) {
             return;
         }
+        if editor.document(doc_id).unwrap().is_diff_mode_read_only() {
+            editor.set_error(DIFF_MODE_READ_ONLY);
+            return;
+        }
 
         let scrolloff = editor.config().scrolloff;
         let doc = doc_mut!(editor, &doc_id);
@@ -4595,6 +4604,9 @@ pub mod insert {
     use helix_view::editor::SmartTabConfig;
 
     pub fn insert_char(cx: &mut Context, c: char) {
+        if review_is_read_only(cx.editor) {
+            return;
+        }
         let (view, doc) = current_ref!(cx.editor);
         let text = doc.text();
         let selection = doc.selection(view.id);
@@ -5119,8 +5131,8 @@ fn yank_values(editor: &Editor, primary_only: bool) -> Vec<String> {
 
 pub(crate) fn review_is_read_only(editor: &mut Editor) -> bool {
     let (view, doc) = current_ref!(editor);
-    if view.diff_mode.cursor(doc, view.id).is_some() {
-        editor.set_error("Deleted rows are read-only; move to a current row to edit");
+    if view.diff_mode.enabled || doc.is_diff_mode_read_only() {
+        editor.set_error(DIFF_MODE_READ_ONLY);
         true
     } else {
         false

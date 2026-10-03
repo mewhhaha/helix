@@ -224,11 +224,11 @@ impl Jobs {
                     wait_futures = tail;
 
                     if let Some(callback) = callback {
-                        // clippy doesn't realize this is an error without the derefs
-                        #[allow(clippy::needless_option_as_deref)]
                         if let Some(job) = match callback {
-                            Callback::EditorCompositor(call) if compositor.is_some() => {
-                                call(editor, compositor.as_deref_mut().unwrap());
+                            Callback::EditorCompositor(call) => {
+                                if let Some(compositor) = &mut compositor {
+                                    call(editor, compositor);
+                                }
                                 None
                             }
                             Callback::Editor(call) => {
@@ -236,9 +236,6 @@ impl Jobs {
                                 None
                             }
                             Callback::Followup(call) => call(editor),
-
-                            // skip callbacks for which we don't have the necessary references
-                            _ => None,
                         } {
                             if job.wait {
                                 wait_futures.push(job.future);

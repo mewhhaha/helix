@@ -31,21 +31,25 @@
 
 Normal mode is the default mode when you launch helix. You can return to it from other modes by pressing the `Escape` key.
 
-`:diff-mode` toggles a diff against HEAD by default. Use `:diff-mode main` or
-`:diff-mode origin/main` to compare the current buffer, including unsaved edits,
-with the common ancestor of HEAD and that revision. `:diff-mode HEAD` returns to
-local changes. `:diff-mode off` and `:diff-mode on` retain the selected base for the
+`z r` or `:review-mode` toggles a diff against HEAD by default, in normal or select
+mode. Use `:review-mode main` or `:review-mode origin/main` to compare the current
+buffer, including unsaved edits,
+with the common ancestor of HEAD and that revision. `:review-mode HEAD` returns to
+local changes. `:review-mode off` and `:review-mode on` retain the selected base for the
 buffer; repeat the revision command to refresh it. References are resolved locally.
+`:diff-mode` is an alias for `:review-mode`.
 
-In `:diff-mode`, all deleted rows stay visible before the added rows, with syntax
+In `:review-mode`, all deleted rows stay visible before the added rows, with syntax
 highlighting from the original file. `j`/`k` and the arrow keys also visit deleted
 rows. Use `v` and character, word, or line movements to select deleted text,
 `x` to select lines, `%` to select the deleted block, and `y` or clipboard yank
 commands to copy it. Mouse dragging selects old text. Selections stay within one
-deleted block. Deleted rows are read-only; move to a
-current source row to edit.
+deleted block. All text in review mode is read-only, including current source rows.
+Editing, undo/redo, formatting, pasting, saving, and language-server edits stay
+disabled until all review views of that buffer are switched off or closed.
+Use `:review-mode off` to resume editing.
 Diagnostic navigation (`]d`, `[d`, `]D`, `[D`) also includes diff hunks while
-diff mode is on, without requiring an LSP. Each hunk is one stop; deletions focus
+review mode is on, without requiring an LSP. Each hunk is one stop; deletions focus
 their old text. Counts such as `3]d` skip multiple stops. These commands include
 real LSP diagnostics in file order and stop at the first or last available target.
 
@@ -218,6 +222,7 @@ useful when you're simply looking over text and not actively editing it.
 | `t`                  | Align the line to the top of the screen                   | `align_view_top`        |
 | `b`                  | Align the line to the bottom of the screen                | `align_view_bottom`     |
 | `m`                  | Align the line to the middle of the screen (horizontally) | `align_view_middle`     |
+| `r`                  | Toggle read-only Git review mode                         | `toggle_review_mode`    |
 | `j`, `down`          | Scroll the view downwards                                 | `scroll_down`           |
 | `k`, `up`            | Scroll the view upwards                                   | `scroll_up`             |
 | `Ctrl-f`, `PageDown` | Move page down                                            | `page_down`             |

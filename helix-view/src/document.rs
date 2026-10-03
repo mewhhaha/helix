@@ -55,6 +55,8 @@ use crate::{
 const MAX_DIAGNOSTIC_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_DIAGNOSTIC_MESSAGES: usize = 128;
 
+pub const DIFF_MODE_READ_ONLY: &str = "Review mode is read-only; use :review-mode off to edit";
+
 #[derive(Default)]
 struct DiagnosticMessageDimensionsCache {
     entries: HashMap<Box<str>, DiagnosticMessageDimensions>,
@@ -670,6 +672,7 @@ pub struct Document {
     pub(crate) language_servers: HashMap<LanguageServerName, Arc<Client>>,
 
     diff_handle: Option<DiffHandle>,
+    diff_mode_views: HashSet<ViewId>,
     review_diff: Option<(String, String, DiffHandle)>,
     review_diff_generation: u64,
     pub(crate) review_diff_controller: TaskController,
@@ -1324,6 +1327,7 @@ impl Document {
             modified_since_accessed: false,
             language_servers: HashMap::new(),
             diff_handle: None,
+            diff_mode_views: HashSet::new(),
             review_diff: None,
             review_diff_generation: 0,
             review_diff_controller: TaskController::new(),
@@ -1427,6 +1431,9 @@ impl Document {
         &self,
         editor: &Editor,
     ) -> Option<BoxFuture<'static, Result<Transaction, FormatterError>>> {
+        if self.is_diff_mode_read_only() {
+            return None;
+        }
         if let Some((fmt_cmd, fmt_args)) = self
             .language_config()
             .and_then(|c| c.formatter.as_ref())
@@ -1572,6 +1579,9 @@ impl Document {
         impl Future<Output = Result<DocumentSavedEvent, anyhow::Error>> + 'static + Send,
         anyhow::Error,
     > {
+        if self.is_diff_mode_read_only() {
+            bail!(DIFF_MODE_READ_ONLY);
+        }
         log::debug!(
             "submitting save of doc '{:?}'",
             self.path().map(|path| path.to_string_lossy())
@@ -1880,6 +1890,9 @@ impl Document {
     /// Reload text synchronously for commands that immediately consume it;
     /// the editor schedules VCS metadata separately in its bounded worker.
     pub fn reload_text(&mut self, view: &mut View) -> Result<(), Error> {
+        if self.is_diff_mode_read_only() {
+            bail!(DIFF_MODE_READ_ONLY);
+        }
         self.vcs_controller.cancel();
         self.review_diff_controller.cancel();
         let encoding = self.encoding;
@@ -1912,6 +1925,9 @@ impl Document {
 
     /// Sets the [`Document`]'s encoding with the encoding correspondent to `label`.
     pub fn set_encoding(&mut self, label: &str) -> Result<(), Error> {
+        if self.is_diff_mode_read_only() {
+            bail!(DIFF_MODE_READ_ONLY);
+        }
         let encoding =
             Encoding::for_label(label.as_bytes()).ok_or_else(|| anyhow!("unknown encoding"))?;
 
@@ -2059,6 +2075,7 @@ impl Document {
 
     /// Remove a view's selection and inlay hints from this document.
     pub fn remove_view(&mut self, view_id: ViewId) {
+        self.diff_mode_views.remove(&view_id);
         self.selections.remove(&view_id);
         self.view_data.remove(&view_id);
         self.inlay_hints.remove(&view_id);
@@ -2312,6 +2329,9 @@ impl Document {
         view_id: ViewId,
         emit_lsp_notification: bool,
     ) -> bool {
+        if self.is_diff_mode_read_only() && !transaction.changes().is_empty() {
+            return false;
+        }
         // store the state just before any changes are made. This allows us to undo to the
         // state just before a transaction was applied.
         if self.changes.is_empty() && !transaction.changes().is_empty() {
@@ -2344,6 +2364,9 @@ impl Document {
     }
 
     fn undo_redo_impl(&mut self, view: &mut View, undo: bool) -> bool {
+        if self.is_diff_mode_read_only() {
+            return false;
+        }
         if undo {
             self.append_changes_to_history(view);
         } else if !self.changes.is_empty() {
@@ -2409,6 +2432,9 @@ impl Document {
     }
 
     pub fn restore(&mut self, view: &mut View, savepoint: &SavePoint, emit_lsp_notification: bool) {
+        if self.is_diff_mode_read_only() && !savepoint.revert.lock().changes().is_empty() {
+            return;
+        }
         assert_eq!(
             savepoint.view, view.id,
             "Savepoint must not be used with a different view!"
@@ -2429,6 +2455,9 @@ impl Document {
     }
 
     fn earlier_later_impl(&mut self, view: &mut View, uk: UndoKind, earlier: bool) -> bool {
+        if self.is_diff_mode_read_only() {
+            return false;
+        }
         if earlier {
             self.append_changes_to_history(view);
         } else if !self.changes.is_empty() {
@@ -2651,6 +2680,19 @@ impl Document {
 
     pub fn diff_handle(&self) -> Option<&DiffHandle> {
         self.diff_handle.as_ref()
+    }
+
+    /// Protect the buffer until its last diff view is disabled or closed.
+    pub fn is_diff_mode_read_only(&self) -> bool {
+        !self.diff_mode_views.is_empty()
+    }
+
+    pub(crate) fn set_view_diff_mode(&mut self, view: ViewId, enabled: bool) {
+        if enabled {
+            self.diff_mode_views.insert(view);
+        } else {
+            self.diff_mode_views.remove(&view);
+        }
     }
 
     pub fn review_diff_handle(&self) -> Option<&DiffHandle> {
@@ -3491,6 +3533,78 @@ mod test {
         );
         doc.set_path(Some(path));
         doc
+    }
+
+    #[tokio::test]
+    async fn diff_mode_preserves_text_history_and_pending_edits_until_the_last_view_is_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.txt");
+        std::fs::write(&path, "first\n").unwrap();
+        let mut doc = document_for_save(&path);
+        let mut view = View::new(doc.id(), Config::default().gutters);
+        doc.ensure_view_init(view.id);
+        let edited = Transaction::change(doc.text(), [(0, 5, Some("edited".into()))].into_iter());
+        assert!(doc.apply(&edited, view.id));
+        doc.append_changes_to_history(&mut view);
+        let savepoint = doc.savepoint(&view);
+        let pending = Transaction::change(doc.text(), [(0, 6, Some("second".into()))].into_iter());
+        assert!(doc.apply(&pending, view.id));
+        let original = doc.text().clone();
+        let version = doc.version();
+        let changes = doc.changes().clone();
+        view.set_diff_mode(&mut doc, true);
+
+        let denied = Transaction::change(doc.text(), [(0, 6, Some("denied".into()))].into_iter());
+        assert!(!doc.apply(&denied, view.id));
+        assert!(!doc.apply_temporary(&denied, view.id));
+        assert!(!doc.undo(&mut view));
+        assert!(!doc.redo(&mut view));
+        assert!(!doc.earlier(&mut view, UndoKind::Steps(1)));
+        assert!(!doc.later(&mut view, UndoKind::Steps(1)));
+        doc.restore(&mut view, &savepoint, true);
+        for force in [false, true] {
+            assert_eq!(
+                doc.save::<PathBuf>(None, force).err().unwrap().to_string(),
+                DIFF_MODE_READ_ONLY
+            );
+        }
+        assert!(doc.reload_text(&mut view).is_err());
+        assert!(doc.set_encoding("windows-1252").is_err());
+        assert!(std::ptr::eq(doc.encoding(), encoding::UTF_8));
+        assert!(doc.text().is_instance(&original));
+        assert_eq!(doc.version(), version);
+        assert_eq!(doc.changes().changes(), changes.changes());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first\n");
+
+        let select = Transaction::new(doc.text()).with_selection(Selection::point(3));
+        assert!(doc.apply(&select, view.id));
+        assert_eq!(
+            doc.selection(view.id)
+                .primary()
+                .cursor(doc.text().slice(..)),
+            3
+        );
+
+        let mut ids = slotmap::SlotMap::<ViewId, ()>::with_key();
+        let mut second = View::new(doc.id(), Config::default().gutters);
+        second.id = ids.insert(());
+        doc.ensure_view_init(second.id);
+        second.set_diff_mode(&mut doc, true);
+        view.set_diff_mode(&mut doc, false);
+        assert!(doc.is_diff_mode_read_only());
+        assert!(!doc.apply(&denied, view.id));
+        doc.remove_view(second.id);
+        assert!(!doc.is_diff_mode_read_only());
+        assert!(doc.undo(&mut view));
+        assert_eq!(doc.text().to_string(), "edited\n");
+        assert!(doc.undo(&mut view));
+        assert_eq!(doc.text().to_string(), "first\n");
+        assert!(doc.redo(&mut view));
+        assert_eq!(doc.text().to_string(), "edited\n");
+        assert!(doc.redo(&mut view));
+        assert_eq!(doc.text().to_string(), "second\n");
+        doc.restore(&mut view, &savepoint, true);
+        assert_eq!(doc.text().to_string(), "edited\n");
     }
 
     #[test]

@@ -382,6 +382,10 @@ fn write_impl(
     path: Option<&str>,
     options: WriteOptions,
 ) -> anyhow::Result<()> {
+    ensure!(
+        !doc!(cx.editor).is_diff_mode_read_only(),
+        DIFF_MODE_READ_ONLY
+    );
     let config = cx.editor.config();
     let (view, doc) = current!(cx.editor);
     let doc_id = doc.id();
@@ -855,6 +859,7 @@ pub struct WriteAllOptions {
     pub write_scratch: bool,
     pub auto_format: bool,
     pub code_actions: bool,
+    pub skip_read_only: bool,
 }
 
 pub fn write_all_impl(
@@ -873,6 +878,12 @@ pub fn write_all_impl(
         .filter_map(|id| {
             let doc = doc!(cx.editor, &id);
             if !doc.is_modified() {
+                return None;
+            }
+            if doc.is_diff_mode_read_only() {
+                if !options.skip_read_only {
+                    errors.push(DIFF_MODE_READ_ONLY);
+                }
                 return None;
             }
             if doc.path().is_none() {
@@ -959,7 +970,7 @@ pub fn write_all_impl(
         }
     }
 
-    if !errors.is_empty() && !options.force {
+    if !errors.is_empty() && (!options.force || errors.contains(&DIFF_MODE_READ_ONLY)) {
         bail!("{:?}", errors);
     }
 
@@ -976,6 +987,7 @@ fn write_all(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> an
         WriteAllOptions {
             force: false,
             write_scratch: true,
+            skip_read_only: false,
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
             code_actions: !args.has_flag(WRITE_NO_CODE_ACTIONS_FLAG.name),
         },
@@ -996,6 +1008,7 @@ fn force_write_all(
         WriteAllOptions {
             force: true,
             write_scratch: true,
+            skip_read_only: false,
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
             code_actions: !args.has_flag(WRITE_NO_CODE_ACTIONS_FLAG.name),
         },
@@ -1015,6 +1028,7 @@ fn write_all_quit(
         WriteAllOptions {
             force: false,
             write_scratch: true,
+            skip_read_only: false,
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
             code_actions: !args.has_flag(WRITE_NO_CODE_ACTIONS_FLAG.name),
         },
@@ -1035,6 +1049,7 @@ fn force_write_all_quit(
         WriteAllOptions {
             force: true,
             write_scratch: true,
+            skip_read_only: false,
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
             code_actions: !args.has_flag(WRITE_NO_CODE_ACTIONS_FLAG.name),
         },
@@ -2676,7 +2691,18 @@ fn run_shell_command(
     Ok(())
 }
 
-fn diff_mode(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
+pub(super) fn toggle_review_mode(cx: &mut Context) {
+    let mut context = compositor::Context {
+        editor: cx.editor,
+        jobs: cx.jobs,
+        scroll: None,
+    };
+    if let Err(err) = review_mode(&mut context, Args::default(), PromptEvent::Validate) {
+        context.editor.set_error(err.to_string());
+    }
+}
+
+fn review_mode(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
     if event != PromptEvent::Validate {
         return Ok(());
     }
@@ -2688,7 +2714,7 @@ fn diff_mode(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> an
     let scrolloff = cx.editor.config().scrolloff;
     cx.editor
         .cancel_review_diff(cx.editor.tree.get(cx.editor.tree.focus).doc);
-    let (view, doc) = current!(cx.editor);
+    let (view, doc) = current_ref!(cx.editor);
     let enabled = match args.first() {
         None => !view.diff_mode.enabled,
         Some("on") => true,
@@ -2699,7 +2725,11 @@ fn diff_mode(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> an
         !enabled || doc.review_diff_handle().is_some(),
         "Diff is not available in the current buffer"
     );
-    view.diff_mode.enabled = enabled;
+    if enabled && cx.editor.mode == Mode::Insert {
+        cx.editor.enter_normal_mode();
+    }
+    let (view, doc) = current!(cx.editor);
+    view.set_diff_mode(doc, enabled);
     view.diff_mode.clear_cursor();
     let mut offset = doc.view_offset(view.id);
     offset.vertical_offset = 0;
@@ -2712,11 +2742,11 @@ fn diff_mode(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> an
     view.ensure_cursor_in_view(doc, scrolloff);
     let status = if enabled {
         doc.review_diff_reference().map_or_else(
-            || "Diff mode enabled".to_owned(),
-            |reference| format!("Diff mode enabled against {reference}"),
+            || "Review mode enabled".to_owned(),
+            |reference| format!("Review mode enabled against {reference}"),
         )
     } else {
-        "Diff mode disabled".to_owned()
+        "Review mode disabled".to_owned()
     };
     cx.editor.set_status(status);
     Ok(())
@@ -4028,10 +4058,10 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         },
     },
     TypableCommand {
-        name: "diff-mode",
-        aliases: &[],
-        doc: "Toggle Git diff display, set on/off, or compare with the merge base of HEAD and a Git revision (e.g. main, origin/main, HEAD).",
-        fun: diff_mode,
+        name: "review-mode",
+        aliases: &["diff-mode"],
+        doc: "Toggle read-only Git review mode, set on/off, or compare with the merge base of HEAD and a Git revision (e.g. main, origin/main, HEAD).",
+        fun: review_mode,
         completer: CommandCompleter::none(),
         signature: Signature { positionals: (0, Some(1)), ..Signature::DEFAULT },
     },
@@ -4217,10 +4247,12 @@ pub(super) fn execute_command(
                 | "trim-trailing-whitespace"
                 | "trim-final-newlines"
                 | "insert-final-newline"
+                | "diffget"
+                | "reset-diff-change"
         )
         && review_is_read_only(cx.editor)
     {
-        bail!("Deleted rows are read-only; move to a current row to edit");
+        bail!(DIFF_MODE_READ_ONLY);
     }
     let args = if event == PromptEvent::Validate {
         Args::parse(args, cmd.signature, true, |token| {

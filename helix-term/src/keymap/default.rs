@@ -294,6 +294,7 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
             "?" => command_palette,
         },
         "z" => { "View"
+            "r" => toggle_review_mode,
             "z" | "c" => align_view_center,
             "t" => align_view_top,
             "b" => align_view_bottom,
@@ -311,6 +312,7 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
             "N" => search_prev,
         },
         "Z" => { "View" sticky=true
+            "r" => toggle_review_mode,
             "z" | "c" => align_view_center,
             "t" => align_view_top,
             "b" => align_view_bottom,

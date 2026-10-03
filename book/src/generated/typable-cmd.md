@@ -88,6 +88,7 @@
 | `:pipe-to` | Pipe each selection to the shell command, ignoring output. |
 | `:run-shell-command`, `:sh`, `:!` | Run a shell command |
 | `:reset-diff-change`, `:diffget`, `:diffg` | Reset the diff change at the cursor position. |
+| `:review-mode`, `:diff-mode` | Toggle read-only Git review mode, set on/off, or compare with the merge base of HEAD and a Git revision (e.g. main, origin/main, HEAD). |
 | `:clear-register` | Clear given register. If no argument is provided, clear all registers. |
 | `:set-register` | Set contents of the given register. |
 | `:redraw` | Clear and re-render the whole UI |

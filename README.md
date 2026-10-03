@@ -55,16 +55,17 @@ display-color-values = false
 See the [cursor configuration](./book/src/configuration.md) and
 [LSP display settings](./book/src/editor.md#editorlsp-section) for details.
 
-## Diff mode
+## Review mode
 
-Use `:diff-mode` to toggle a Git diff in the current view
-(`:diff-mode on` and `:diff-mode off` also work). The default base is HEAD.
-Use `:diff-mode main` or `:diff-mode origin/main` to review the current buffer
+Use `z r` or `:review-mode` to toggle a Git diff in the current view
+(`:review-mode on` and `:review-mode off` also work). The default base is HEAD.
+Use `:review-mode main` or `:review-mode origin/main` to review the current buffer
 against the common ancestor of HEAD and that revision, like a pull request.
 This includes committed branch changes and unsaved edits while excluding changes
-made only on the target branch. `:diff-mode HEAD` returns to local changes.
+made only on the target branch. `:review-mode HEAD` returns to local changes.
 The selected base is remembered for the buffer; repeat the revision command to
 refresh its pinned commit. These commands use local Git references.
+`:diff-mode` is an alias for `:review-mode`.
 
 Added and changed rows have a
 green background and a `+` gutter before the line numbers. Diff backgrounds cover
@@ -76,12 +77,14 @@ keys to navigate onto deleted rows.
 Use `v` with character, word, or line movements to select old text, `x` to select
 lines, `%` to select the deleted block, and `y` or clipboard yank commands to
 copy it. Mouse dragging also selects old text. Selections stay within one deleted
-block. Deleted text is read-only virtual content; editing and saving affect the
-current file. Deleted lines follow horizontal scrolling and do not soft-wrap.
+block. Review mode is read-only for the entire buffer, including current source
+rows. Editing, undo/redo, formatting, pasting, saving, and language-server edits
+are disabled while any view of the buffer is in review mode. Use `:review-mode off`
+to resume editing. Deleted lines follow horizontal scrolling and do not soft-wrap.
 Page Up/Down keep the cursor at the visible edge, including within deleted rows.
 Ctrl-U/D move the cursor with the viewport. Mouse scrolling can leave the cursor
 offscreen while reviewing deleted text; moving the cursor brings it back into view.
-While diff mode is on, `]d`/`[d` jump through diff hunks and LSP diagnostics
+While review mode is on, `]d`/`[d` jump through diff hunks and LSP diagnostics
 together; `[D`/`]D` go to the first/last stop. Each hunk is one stop, with deletions
 focused on their old text. Counts such as `3]d` skip multiple stops.
 Themes can customize the backgrounds with `ui.diff.added` and `ui.diff.deleted`.

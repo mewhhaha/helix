@@ -1048,6 +1048,10 @@ impl EditorView {
     }
 
     fn insert_mode(&mut self, cx: &mut commands::Context, event: KeyEvent) {
+        if commands::review_is_read_only(cx.editor) {
+            cx.editor.enter_normal_mode();
+            return;
+        }
         if let Some(keyresult) = self.handle_keymap_event(Mode::Insert, cx, event) {
             match keyresult {
                 KeymapResult::NotFound => {
@@ -1094,6 +1098,9 @@ impl EditorView {
             }
             // special handling for repeat operator
             (key!('.'), _) if self.keymaps.pending().is_empty() => {
+                if commands::review_is_read_only(cxt.editor) {
+                    return;
+                }
                 for _ in 0..cxt.editor.count.map_or(1, NonZeroUsize::into) {
                     // first execute whatever put us into insert mode
                     self.last_insert.0.execute(cxt);
@@ -1735,6 +1742,7 @@ impl Component for EditorView {
             Event::FocusLost => {
                 if context.editor.config().auto_save.focus_lost {
                     let options = commands::WriteAllOptions {
+                        skip_read_only: true,
                         force: false,
                         write_scratch: false,
                         auto_format: false,
