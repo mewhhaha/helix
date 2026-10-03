@@ -55,6 +55,10 @@ display-color-values = false
 See the [cursor configuration](./book/src/configuration.md) and
 [LSP display settings](./book/src/editor.md#editorlsp-section) for details.
 
+Cursor smear recorded in Ghostty with a 120 ms animation duration:
+
+![Helix cursor smear moving through Rust code](./docs/demos/cursor-smear.gif)
+
 ## Review mode
 
 Use `z r` or `:review-mode` to toggle a Git diff in the current view
