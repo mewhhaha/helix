@@ -794,7 +794,7 @@ impl EditorView {
     ) {
         let cursors: Rc<[_]> = Self::visible_cursor_lines(doc, view).into();
 
-        let mut offset = u16::from(view.diff_mode.enabled);
+        let mut offset = u16::from(view.diff_mode.enabled());
 
         let gutter_style = theme.get("ui.gutter");
         let gutter_selected_style = theme.get("ui.gutter.selected");
@@ -802,7 +802,7 @@ impl EditorView {
         let gutter_selected_style_virtual = theme.get("ui.gutter.selected.virtual");
 
         for gutter_type in view.gutters() {
-            if view.diff_mode.enabled && *gutter_type == helix_view::editor::GutterType::Diff {
+            if view.diff_mode.enabled() && *gutter_type == helix_view::editor::GutterType::Diff {
                 continue;
             }
             let mut gutter = gutter_type.style(editor, doc, view, theme, is_focused);

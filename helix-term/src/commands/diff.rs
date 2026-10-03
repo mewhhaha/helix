@@ -14,7 +14,7 @@ pub(super) enum DiagnosticNavigation {
 /// document. Deleted blocks sort before the source row which follows them.
 pub(super) fn goto_diagnostic(editor: &mut Editor, navigation: DiagnosticNavigation) -> bool {
     let (view, doc) = current!(editor);
-    if !view.diff_mode.enabled {
+    if !view.diff_mode.enabled() {
         return false;
     }
     let display = view.diff_mode.display(doc);

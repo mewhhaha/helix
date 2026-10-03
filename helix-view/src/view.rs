@@ -218,8 +218,17 @@ impl View {
 
     pub fn set_diff_mode(&mut self, doc: &mut Document, enabled: bool) {
         debug_assert_eq!(self.doc, doc.id());
-        self.diff_mode.enabled = enabled;
-        doc.set_view_diff_mode(self.id, enabled);
+        self.diff_mode.set_enabled(doc, self.id, enabled);
+    }
+
+    pub(crate) fn register_review(&self, doc: &mut Document) {
+        debug_assert_eq!(self.doc, doc.id());
+        doc.set_view_diff_mode(self.id, self.diff_mode.enabled());
+    }
+
+    pub(crate) fn unregister_review(&self, doc: &mut Document) {
+        debug_assert_eq!(self.doc, doc.id());
+        doc.set_view_diff_mode(self.id, false);
     }
 
     pub fn inner_area(&self, doc: &Document) -> Rect {
@@ -243,10 +252,10 @@ impl View {
             .gutters
             .layout
             .iter()
-            .filter(|&&gutter| !self.diff_mode.enabled || gutter != GutterType::Diff)
+            .filter(|&&gutter| !self.diff_mode.enabled() || gutter != GutterType::Diff)
             .map(|gutter| gutter.width(self, doc) as u16)
             .sum::<u16>()
-            + u16::from(self.diff_mode.enabled);
+            + u16::from(self.diff_mode.enabled());
         if total_width < self.area.width {
             total_width
         } else {

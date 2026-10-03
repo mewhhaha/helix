@@ -1,8 +1,8 @@
-use std::{collections::VecDeque, ops::Range, sync::Arc};
+use std::{ops::Range, sync::Arc};
 
 use super::{Highlight, Loader, OverlayHighlights, Syntax};
 use crate::RopeSlice;
-use helix_stdx::rope::RopeSliceExt as _;
+use helix_stdx::{cache::BoundedCache, rope::RopeSliceExt as _};
 
 const MAX_ENTRIES: usize = 4;
 const MAX_BYTES: usize = 2 * 1024 * 1024;
@@ -16,8 +16,14 @@ struct Entry {
     highlights: Highlights,
 }
 
-#[derive(Debug, Default)]
-pub(super) struct RainbowCache(VecDeque<Entry>);
+#[derive(Debug)]
+pub(super) struct RainbowCache(BoundedCache<Entry>);
+
+impl Default for RainbowCache {
+    fn default() -> Self {
+        Self(BoundedCache::new(MAX_ENTRIES, MAX_BYTES))
+    }
+}
 
 impl RainbowCache {
     pub(super) fn clear(&mut self) {
@@ -30,28 +36,18 @@ impl RainbowCache {
         palette: usize,
         scopes: &Arc<Vec<String>>,
     ) -> Option<Highlights> {
-        let index = self.0.iter().position(|entry| {
-            entry.range == *range && entry.palette == palette && Arc::ptr_eq(&entry.scopes, scopes)
-        })?;
-        let entry = self.0.remove(index).unwrap();
-        let highlights = entry.highlights.clone();
-        self.0.push_back(entry);
-        Some(highlights)
+        self.0
+            .get(|entry| {
+                entry.range == *range
+                    && entry.palette == palette
+                    && Arc::ptr_eq(&entry.scopes, scopes)
+            })
+            .map(|entry| Arc::clone(&entry.highlights))
     }
 
     fn insert(&mut self, entry: Entry) {
-        let bytes = |entry: &Entry| {
-            entry.highlights.capacity() * std::mem::size_of::<(Highlight, Range<usize>)>()
-        };
-        if bytes(&entry) > MAX_BYTES {
-            return;
-        }
-        while self.0.len() >= MAX_ENTRIES
-            || self.0.iter().map(bytes).sum::<usize>() + bytes(&entry) > MAX_BYTES
-        {
-            self.0.pop_front();
-        }
-        self.0.push_back(entry);
+        let bytes = entry.highlights.capacity() * std::mem::size_of::<(Highlight, Range<usize>)>();
+        self.0.insert(entry, bytes);
     }
 }
 

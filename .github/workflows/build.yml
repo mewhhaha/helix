@@ -37,6 +37,37 @@ jobs:
       - name: Run cargo check
         run: cargo check
 
+  native:
+    name: Optimized build (pinned nightly)
+    runs-on: ubuntu-latest
+    if: github.repository == 'helix-editor/helix' || github.event_name != 'schedule'
+    timeout-minutes: 30
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v7
+
+      - name: Read pinned toolchain
+        id: toolchain
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import tomllib
+          with open("rust-toolchain.toml", "rb") as file:
+              print("channel=" + tomllib.load(file)["toolchain"]["channel"])
+          PY
+
+      - uses: ./.github/actions/rust-setup
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+          cache-key: native
+          cache-grammars: 'true'
+          grammar-cache-version: ${{ env.GRAMMAR_CACHE_VERSION }}
+
+      - name: Build optimized native binary
+        run: cargo build --profile opt --config 'target."cfg(all())".rustflags=["-C", "target-cpu=native"]' --package helix-term --locked
+
+      - name: Check terminal graphics and review mode
+        run: python3 contrib/terminal-smoke.py target/opt/hx
+
   test:
     name: Test Suite
     runs-on: ${{ matrix.os }}

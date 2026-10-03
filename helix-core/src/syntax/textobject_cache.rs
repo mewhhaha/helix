@@ -1,4 +1,6 @@
-use std::{collections::VecDeque, ops::Range, sync::Arc};
+use std::{ops::Range, sync::Arc};
+
+use helix_stdx::cache::BoundedCache;
 
 use super::Layer;
 
@@ -69,8 +71,14 @@ struct Entry {
     ranges: Arc<CaptureRanges>,
 }
 
-#[derive(Debug, Default)]
-pub(super) struct TextObjectCache(VecDeque<Entry>);
+#[derive(Debug)]
+pub(super) struct TextObjectCache(BoundedCache<Entry>);
+
+impl Default for TextObjectCache {
+    fn default() -> Self {
+        Self(BoundedCache::new(MAX_ENTRIES, MAX_BYTES))
+    }
+}
 
 impl TextObjectCache {
     pub fn clear(&mut self) {
@@ -78,41 +86,29 @@ impl TextObjectCache {
     }
 
     pub fn get(&mut self, layer: Layer, query: u64, capture: &str) -> Option<Arc<CaptureRanges>> {
-        let index = self.0.iter().position(|entry| {
-            entry.layer == layer && entry.query == query && entry.capture == capture
-        })?;
-        let entry = self.0.remove(index).unwrap();
-        let ranges = entry.ranges.clone();
-        self.0.push_back(entry);
-        Some(ranges)
+        self.0
+            .get(|entry| entry.layer == layer && entry.query == query && entry.capture == capture)
+            .map(|entry| Arc::clone(&entry.ranges))
     }
 
     pub fn insert(&mut self, layer: Layer, query: u64, capture: &str, ranges: CaptureRanges) {
         let capture = String::from(capture);
-        if ranges.bytes.saturating_add(capture.capacity()) > MAX_BYTES {
+        let bytes = ranges.bytes.saturating_add(capture.capacity());
+        if !self.0.admits(bytes) {
             return;
         }
         self.0.retain(|entry| {
             !(entry.layer == layer && entry.query == query && entry.capture == capture)
         });
-        while self.0.len() >= MAX_ENTRIES
-            || self
-                .0
-                .iter()
-                .map(|entry| entry.ranges.bytes + entry.capture.capacity())
-                .sum::<usize>()
-                + ranges.bytes
-                + capture.capacity()
-                > MAX_BYTES
-        {
-            self.0.pop_front();
-        }
-        self.0.push_back(Entry {
-            layer,
-            query,
-            capture,
-            ranges: Arc::new(ranges),
-        });
+        self.0.insert(
+            Entry {
+                layer,
+                query,
+                capture,
+                ranges: Arc::new(ranges),
+            },
+            bytes,
+        );
     }
 }
 

@@ -3,13 +3,16 @@ use anyhow::Context;
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::{collections::HashMap, fmt::Debug};
 use tokio::{
-    io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt},
     sync::{
         mpsc::{unbounded_channel, Sender, UnboundedReceiver, UnboundedSender},
-        Mutex,
+        Mutex, Notify,
     },
 };
 
@@ -54,6 +57,8 @@ pub struct Transport {
     #[allow(unused)]
     id: DebugAdapterId,
     pending_requests: Mutex<HashMap<u64, Sender<Result<Response>>>>,
+    disconnected: AtomicBool,
+    disconnect_notify: Notify,
 }
 
 impl Transport {
@@ -69,15 +74,17 @@ impl Transport {
         let transport = Self {
             id,
             pending_requests: Mutex::new(HashMap::default()),
+            disconnected: AtomicBool::new(false),
+            disconnect_notify: Notify::new(),
         };
 
         let transport = Arc::new(transport);
 
         tokio::spawn(Self::recv(id, transport.clone(), server_stdout, client_tx));
-        tokio::spawn(Self::send(transport, server_stdin, client_rx));
         if let Some(stderr) = server_stderr {
-            tokio::spawn(Self::err(stderr));
+            tokio::spawn(Self::err(transport.clone(), stderr));
         }
+        tokio::spawn(Self::send(transport, server_stdin, client_rx));
 
         (rx, tx)
     }
@@ -88,39 +95,9 @@ impl Transport {
         buffer: &mut String,
         content: &mut Vec<u8>,
     ) -> Result<Payload> {
-        let mut content_length = None;
-        loop {
-            buffer.clear();
-            if reader.read_line(buffer).await? == 0 {
-                return Err(Error::StreamClosed);
-            };
-
-            if buffer == "\r\n" {
-                // look for an empty CRLF line
-                break;
-            }
-
-            let header = buffer.trim();
-            let parts = header.split_once(": ");
-
-            match parts {
-                Some(("Content-Length", value)) => {
-                    content_length = Some(value.parse().context("invalid content length")?);
-                }
-                Some((_, _)) => {}
-                None => {
-                    // Workaround: Some non-conformant language servers will output logging and other garbage
-                    // into the same stream as JSON-RPC messages. This can also happen from shell scripts that spawn
-                    // the server. Skip such lines and log a warning.
-
-                    // warn!("Failed to parse header: {:?}", header);
-                }
-            }
+        if !helix_stdx::protocol::read_frame(reader, buffer, content).await? {
+            return Err(Error::StreamClosed);
         }
-
-        let content_length = content_length.context("missing content length")?;
-        content.resize(content_length, 0);
-        reader.read_exact(content).await?;
         let msg = std::str::from_utf8(content).context("invalid utf8 from server")?;
 
         info!("[{}] <- DAP {}", id, msg);
@@ -153,8 +130,15 @@ impl Transport {
         server_stdin: &mut Box<dyn AsyncWrite + Unpin + Send>,
         mut payload: Payload,
     ) -> Result<()> {
+        if self.disconnected.load(Ordering::Acquire) {
+            return Err(Error::StreamClosed);
+        }
         if let Payload::Request(request) = &mut payload {
             let mut pending = self.pending_requests.lock().await;
+            // Serialize registration with disconnect's final drain.
+            if self.disconnected.load(Ordering::Acquire) {
+                return Err(Error::StreamClosed);
+            }
             // Guarded background workflows drop their waiters on cancellation.
             // Prune these entries before the next request instead of retaining
             // them indefinitely when an adapter never sends a reply.
@@ -241,14 +225,28 @@ impl Transport {
                 ..
             }) => {
                 info!("[{}] <- DAP request {} #{}", self.id, command, seq);
-                client_tx.send(msg).expect("Failed to send");
-                Ok(())
+                client_tx.send(msg).map_err(|_| Error::StreamClosed)
             }
             Payload::Event(ref event) => {
                 info!("[{}] <- DAP event {:?}", self.id, event);
-                client_tx.send(msg).expect("Failed to send");
-                Ok(())
+                client_tx.send(msg).map_err(|_| Error::StreamClosed)
             }
+        }
+    }
+
+    /// All transport exits use this path, including a disappearing event consumer.
+    async fn disconnect(&self) {
+        let pending = {
+            let mut pending = self.pending_requests.lock().await;
+            if self.disconnected.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            std::mem::take(&mut *pending)
+        };
+        self.disconnect_notify.notify_waiters();
+        for callback in pending.into_values() {
+            // Each RPC has one reply. A closed/full callback must not hold up shutdown.
+            let _ = callback.try_send(Err(Error::StreamClosed));
         }
     }
 
@@ -260,40 +258,30 @@ impl Transport {
     ) {
         let mut recv_buffer = String::new();
         let mut content_buffer = Vec::new();
-        loop {
-            match Self::recv_server_message(
-                id,
-                &mut server_stdout,
-                &mut recv_buffer,
-                &mut content_buffer,
-            )
-            .await
-            {
-                Ok(msg) => match transport.process_server_message(&client_tx, msg).await {
-                    Ok(_) => (),
-                    Err(err) => {
-                        error!(" [{id}] err: <- {err:?}");
-                        break;
-                    }
-                },
-                Err(err) => {
-                    if !matches!(err, Error::StreamClosed) {
-                        error!("Exiting after unexpected error: {err:?}");
-                    }
-
-                    // Close any outstanding requests.
-                    for (id, tx) in transport.pending_requests.lock().await.drain() {
-                        match tx.send(Err(Error::StreamClosed)).await {
-                            Ok(_) => (),
-                            Err(_) => {
-                                error!("Could not close request on a closed channel (id={id})");
-                            }
-                        }
-                    }
-                    break;
+        let disconnected = transport.disconnect_notify.notified();
+        tokio::pin!(disconnected);
+        disconnected.as_mut().enable();
+        while !transport.disconnected.load(Ordering::Acquire) {
+            let message = tokio::select! {
+                biased;
+                _ = &mut disconnected => break,
+                _ = client_tx.closed() => break,
+                message = Self::recv_server_message(
+                    id, &mut server_stdout, &mut recv_buffer, &mut content_buffer,
+                ) => message,
+            };
+            let result = match message {
+                Ok(message) => transport.process_server_message(&client_tx, message).await,
+                Err(error) => Err(error),
+            };
+            if let Err(error) = result {
+                if !matches!(error, Error::StreamClosed) {
+                    error!("[{id}] receive failed: {error:?}");
                 }
+                break;
             }
         }
+        transport.disconnect().await;
     }
 
     async fn send_inner(
@@ -314,154 +302,44 @@ impl Transport {
         server_stdin: Box<dyn AsyncWrite + Unpin + Send>,
         client_rx: UnboundedReceiver<Payload>,
     ) {
-        if let Err(err) = Self::send_inner(transport, server_stdin, client_rx).await {
-            error!("err: <- {:?}", err);
+        let disconnected = transport.disconnect_notify.notified();
+        tokio::pin!(disconnected);
+        disconnected.as_mut().enable();
+        if !transport.disconnected.load(Ordering::Acquire) {
+            let result = tokio::select! {
+                biased;
+                _ = &mut disconnected => Ok(()),
+                result = Self::send_inner(transport.clone(), server_stdin, client_rx) => result,
+            };
+            if let Err(error) = result {
+                if !matches!(error, Error::StreamClosed) {
+                    error!("[{}] send failed: {error:?}", transport.id);
+                }
+            }
         }
+        transport.disconnect().await;
     }
 
-    async fn err(mut server_stderr: Box<dyn AsyncBufRead + Unpin + Send>) {
+    async fn err(transport: Arc<Self>, mut server_stderr: Box<dyn AsyncBufRead + Unpin + Send>) {
         let mut recv_buffer = String::new();
-        loop {
-            match Self::recv_server_error(&mut server_stderr, &mut recv_buffer).await {
-                Ok(_) => {}
-                Err(err) => {
-                    error!("err: <- {:?}", err);
-                    break;
+        let disconnected = transport.disconnect_notify.notified();
+        tokio::pin!(disconnected);
+        disconnected.as_mut().enable();
+        while !transport.disconnected.load(Ordering::Acquire) {
+            let result = tokio::select! {
+                biased;
+                _ = &mut disconnected => break,
+                result = Self::recv_server_error(&mut server_stderr, &mut recv_buffer) => result,
+            };
+            if let Err(error) = result {
+                if !matches!(error, Error::StreamClosed) {
+                    error!("[{}] stderr failed: {error:?}", transport.id);
                 }
+                break;
             }
         }
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::Duration;
-    use tokio::io::BufReader;
-    use tokio::sync::mpsc::channel;
-
-    fn request(seq: u64, callback: Sender<Result<Response>>) -> Payload {
-        Payload::Request(Request {
-            seq,
-            command: "stackTrace".into(),
-            arguments: Some(serde_json::json!({"threadId":7})),
-            back_ch: Some(callback),
-        })
-    }
-
-    fn transport() -> Transport {
-        Transport {
-            id: DebugAdapterId::default(),
-            pending_requests: Mutex::new(HashMap::new()),
-        }
-    }
-
-    #[tokio::test]
-    async fn new_requests_prune_abandoned_callbacks_and_keep_live_requests() {
-        let transport = transport();
-        let mut writer: Box<dyn AsyncWrite + Send + Unpin> = Box::new(tokio::io::sink());
-        let (abandoned_tx, abandoned_rx) = channel(1);
-        let (live_tx, mut live_rx) = channel(1);
-        transport
-            .send_payload_to_server(&mut writer, request(1, abandoned_tx))
-            .await
-            .unwrap();
-        transport
-            .send_payload_to_server(&mut writer, request(2, live_tx))
-            .await
-            .unwrap();
-        drop(abandoned_rx);
-        let (next_tx, _next_rx) = channel(1);
-        transport
-            .send_payload_to_server(&mut writer, request(3, next_tx))
-            .await
-            .unwrap();
-        {
-            let pending = transport.pending_requests.lock().await;
-            assert!(!pending.contains_key(&1));
-            assert!(pending.contains_key(&2));
-            assert!(pending.contains_key(&3));
-        }
-        let (events, mut events_rx) = unbounded_channel();
-        transport
-            .process_server_message(
-                &events,
-                Payload::Response(Response {
-                    request_seq: 1,
-                    command: "stackTrace".into(),
-                    success: true,
-                    message: None,
-                    body: None,
-                }),
-            )
-            .await
-            .unwrap();
-        transport
-            .process_server_message(
-                &events,
-                Payload::Response(Response {
-                    request_seq: 2,
-                    command: "stackTrace".into(),
-                    success: true,
-                    message: None,
-                    body: None,
-                }),
-            )
-            .await
-            .unwrap();
-        assert!(live_rx.recv().await.unwrap().unwrap().success);
-        assert!(
-            matches!(
-                events_rx.try_recv(),
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-            ),
-            "late canceled responses must not enter the debugger event stream"
-        );
-        assert!(!transport.pending_requests.lock().await.contains_key(&2));
-    }
-
-    #[tokio::test]
-    async fn canceled_queued_request_is_not_written_or_registered() {
-        let transport = transport();
-        let (client, adapter) = tokio::io::duplex(4096);
-        let mut writer: Box<dyn AsyncWrite + Send + Unpin> = Box::new(client);
-        let mut reader: Box<dyn AsyncBufRead + Send + Unpin> = Box::new(BufReader::new(adapter));
-        let (canceled_tx, canceled_rx) = channel(1);
-        drop(canceled_rx);
-        transport
-            .send_payload_to_server(&mut writer, request(1, canceled_tx))
-            .await
-            .unwrap();
-        assert!(transport.pending_requests.lock().await.is_empty());
-        let (live_tx, _live_rx) = channel(1);
-        transport
-            .send_payload_to_server(&mut writer, request(2, live_tx))
-            .await
-            .unwrap();
-        let message = tokio::time::timeout(
-            Duration::from_secs(1),
-            Transport::recv_server_message(
-                DebugAdapterId::default(),
-                &mut reader,
-                &mut String::new(),
-                &mut Vec::new(),
-            ),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        let Payload::Request(request) = message else {
-            panic!("expected live request");
-        };
-        assert_eq!(
-            request.seq, 2,
-            "canceled request must not reach the adapter"
-        );
-        let mut byte = [0];
-        assert!(
-            tokio::time::timeout(Duration::from_millis(25), reader.read(&mut byte))
-                .await
-                .is_err()
-        );
-    }
-}
+mod tests;

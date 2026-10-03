@@ -22,6 +22,7 @@ pub struct TypableCommand {
     pub name: &'static str,
     pub aliases: &'static [&'static str],
     pub doc: &'static str,
+    pub effect: CommandEffect,
     // params, flags, helper, completer
     pub fun: fn(&mut compositor::Context, Args, PromptEvent) -> anyhow::Result<()>,
     /// What completion methods, if any, does this command have?
@@ -2716,7 +2717,7 @@ fn review_mode(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> 
         .cancel_review_diff(cx.editor.tree.get(cx.editor.tree.focus).doc);
     let (view, doc) = current_ref!(cx.editor);
     let enabled = match args.first() {
-        None => !view.diff_mode.enabled,
+        None => !view.diff_mode.enabled(),
         Some("on") => true,
         Some("off") => false,
         Some(_) => unreachable!("Git revisions are handled above"),
@@ -2765,7 +2766,7 @@ fn reset_diff_change(
     let scrolloff = editor.config().scrolloff;
 
     let (view, doc) = current!(editor);
-    let handle = if view.diff_mode.enabled {
+    let handle = if view.diff_mode.enabled() {
         doc.review_diff_handle()
     } else {
         doc.diff_handle()
@@ -3078,6 +3079,7 @@ const WRITE_NO_CODE_ACTIONS_FLAG: Flag = Flag {
 pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     TypableCommand {
         name: "exit",
+        effect: CommandEffect::Save,
         aliases: &["x", "xit"],
         doc: "Write changes to disk if the buffer is modified and then quit. Accepts an optional path (:exit some/path.txt).",
         fun: exit,
@@ -3090,6 +3092,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "exit!",
+        effect: CommandEffect::Save,
         aliases: &["x!", "xit!"],
         doc: "Force write changes to disk, creating necessary subdirectories, if the buffer is modified and then quit. Accepts an optional path (:exit! some/path.txt).",
         fun: force_exit,
@@ -3102,6 +3105,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "quit",
+        effect: CommandEffect::ReadOnly,
         aliases: &["q"],
         doc: "Close the current view.",
         fun: quit,
@@ -3113,6 +3117,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "quit!",
+        effect: CommandEffect::ReadOnly,
         aliases: &["q!"],
         doc: "Force close the current view, ignoring unsaved changes.",
         fun: force_quit,
@@ -3124,6 +3129,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "open",
+        effect: CommandEffect::ReadOnly,
         aliases: &["o", "edit", "e"],
         doc: "Open a file from disk into the current view.",
         fun: open,
@@ -3135,6 +3141,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "buffer-close",
+        effect: CommandEffect::ReadOnly,
         aliases: &["bc", "bclose"],
         doc: "Close the current buffer.",
         fun: buffer_close,
@@ -3146,6 +3153,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "buffer-close!",
+        effect: CommandEffect::ReadOnly,
         aliases: &["bc!", "bclose!"],
         doc: "Close the current buffer forcefully, ignoring unsaved changes.",
         fun: force_buffer_close,
@@ -3157,6 +3165,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "buffer-close-others",
+        effect: CommandEffect::ReadOnly,
         aliases: &["bco", "bcloseother"],
         doc: "Close all buffers but the currently focused one.",
         fun: buffer_close_others,
@@ -3165,6 +3174,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "buffer-close-others!",
+        effect: CommandEffect::ReadOnly,
         aliases: &["bco!", "bcloseother!"],
         doc: "Force close all buffers but the currently focused one.",
         fun: force_buffer_close_others,
@@ -3173,6 +3183,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "buffer-close-all",
+        effect: CommandEffect::ReadOnly,
         aliases: &["bca", "bcloseall"],
         doc: "Close all buffers without quitting.",
         fun: buffer_close_all,
@@ -3184,6 +3195,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "buffer-close-all!",
+        effect: CommandEffect::ReadOnly,
         aliases: &["bca!", "bcloseall!"],
         doc: "Force close all buffers ignoring unsaved changes without quitting.",
         fun: force_buffer_close_all,
@@ -3195,6 +3207,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "buffer-next",
+        effect: CommandEffect::ReadOnly,
         aliases: &["bn", "bnext"],
         doc: "Goto next buffer.",
         fun: buffer_next,
@@ -3206,6 +3219,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "buffer-previous",
+        effect: CommandEffect::ReadOnly,
         aliases: &["bp", "bprev"],
         doc: "Goto previous buffer.",
         fun: buffer_previous,
@@ -3217,6 +3231,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "write",
+        effect: CommandEffect::Save,
         aliases: &["w"],
         doc: "Write changes to disk. Accepts an optional path (:write some/path.txt)",
         fun: write,
@@ -3229,6 +3244,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "write!",
+        effect: CommandEffect::Save,
         aliases: &["w!"],
         doc: "Force write changes to disk creating necessary subdirectories. Accepts an optional path (:write! some/path.txt)",
         fun: force_write,
@@ -3241,6 +3257,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "write-buffer-close",
+        effect: CommandEffect::Save,
         aliases: &["wbc"],
         doc: "Write changes to disk and closes the buffer. Accepts an optional path (:write-buffer-close some/path.txt)",
         fun: write_buffer_close,
@@ -3253,6 +3270,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "write-buffer-close!",
+        effect: CommandEffect::Save,
         aliases: &["wbc!"],
         doc: "Force write changes to disk creating necessary subdirectories and closes the buffer. Accepts an optional path (:write-buffer-close! some/path.txt)",
         fun: force_write_buffer_close,
@@ -3265,6 +3283,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "new",
+        effect: CommandEffect::ReadOnly,
         aliases: &["n"],
         doc: "Create a new scratch buffer.",
         fun: new_file,
@@ -3276,6 +3295,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "format",
+        effect: CommandEffect::Edit,
         aliases: &["fmt"],
         doc: "Format the file using an external formatter or language server.",
         fun: format,
@@ -3287,6 +3307,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "indent-style",
+        effect: CommandEffect::ReadOnly,
         aliases: &[],
         doc: "Set the indentation style for editing. ('t' for tabs or 1-16 for number of spaces.)",
         fun: set_indent_style,
@@ -3298,6 +3319,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "line-ending",
+        effect: CommandEffect::EditWithArgument,
         aliases: &[],
         #[cfg(not(feature = "unicode-lines"))]
         doc: "Set the document's default line ending. Options: crlf, lf.",
@@ -3312,6 +3334,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "earlier",
+        effect: CommandEffect::Edit,
         aliases: &["ear"],
         doc: "Jump back to an earlier point in edit history. Accepts a number of steps or a time span.",
         fun: earlier,
@@ -3323,6 +3346,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "later",
+        effect: CommandEffect::Edit,
         aliases: &["lat"],
         doc: "Jump to a later point in edit history. Accepts a number of steps or a time span.",
         fun: later,
@@ -3334,6 +3358,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "write-quit",
+        effect: CommandEffect::Save,
         aliases: &["wq"],
         doc: "Write changes to disk and close the current view. Accepts an optional path (:wq some/path.txt)",
         fun: write_quit,
@@ -3346,6 +3371,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "write-quit!",
+        effect: CommandEffect::Save,
         aliases: &["wq!"],
         doc: "Write changes to disk and close the current view forcefully. Accepts an optional path (:wq! some/path.txt)",
         fun: force_write_quit,
@@ -3358,6 +3384,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "write-all",
+        effect: CommandEffect::Save,
         aliases: &["wa"],
         doc: "Write changes from all buffers to disk.",
         fun: write_all,
@@ -3370,6 +3397,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "write-all!",
+        effect: CommandEffect::Save,
         aliases: &["wa!"],
         doc: "Forcefully write changes from all buffers to disk creating necessary subdirectories.",
         fun: force_write_all,
@@ -3382,6 +3410,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "write-quit-all",
+        effect: CommandEffect::Save,
         aliases: &["wqa", "xa"],
         doc: "Write changes from all buffers to disk and close all views.",
         fun: write_all_quit,
@@ -3394,6 +3423,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "write-quit-all!",
+        effect: CommandEffect::Save,
         aliases: &["wqa!", "xa!"],
         doc: "Forcefully write changes from all buffers to disk, creating necessary subdirectories, and close all views (ignoring unsaved changes).",
         fun: force_write_all_quit,
@@ -3406,6 +3436,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "quit-all",
+        effect: CommandEffect::ReadOnly,
         aliases: &["qa"],
         doc: "Close all views.",
         fun: quit_all,
@@ -3417,6 +3448,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "quit-all!",
+        effect: CommandEffect::ReadOnly,
         aliases: &["qa!"],
         doc: "Force close all views ignoring unsaved changes.",
         fun: force_quit_all,
@@ -3428,6 +3460,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "cquit",
+        effect: CommandEffect::ReadOnly,
         aliases: &["cq"],
         doc: "Quit with exit code (default 1). Accepts an optional integer exit code (:cq 2).",
         fun: cquit,
@@ -3439,6 +3472,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "cquit!",
+        effect: CommandEffect::ReadOnly,
         aliases: &["cq!"],
         doc: "Force quit with exit code (default 1) ignoring unsaved changes. Accepts an optional integer exit code (:cq! 2).",
         fun: force_cquit,
@@ -3450,6 +3484,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "theme",
+        effect: CommandEffect::ReadOnly,
         aliases: &[],
         doc: "Change the editor theme (show current theme if no name specified).",
         fun: theme,
@@ -3461,6 +3496,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "yank-join",
+        effect: CommandEffect::ReadOnly,
         aliases: &[],
         doc: "Yank joined selections. A separator can be provided as first argument. Default value is newline.",
         fun: yank_joined,
@@ -3472,6 +3508,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "clipboard-yank",
+        effect: CommandEffect::ReadOnly,
         aliases: &[],
         doc: "Yank main selection into system clipboard.",
         fun: yank_main_selection_to_clipboard,
@@ -3483,6 +3520,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "clipboard-yank-join",
+        effect: CommandEffect::ReadOnly,
         aliases: &[],
         doc: "Yank joined selections into system clipboard. A separator can be provided as first argument. Default value is newline.", // FIXME: current UI can't display long doc.
         fun: yank_joined_to_clipboard,
@@ -3494,6 +3532,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "primary-clipboard-yank",
+        effect: CommandEffect::ReadOnly,
         aliases: &[],
         doc: "Yank main selection into system primary clipboard.",
         fun: yank_main_selection_to_primary_clipboard,
@@ -3505,6 +3544,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "primary-clipboard-yank-join",
+        effect: CommandEffect::ReadOnly,
         aliases: &[],
         doc: "Yank joined selections into system primary clipboard. A separator can be provided as first argument. Default value is newline.", // FIXME: current UI can't display long doc.
         fun: yank_joined_to_primary_clipboard,
@@ -3516,6 +3556,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "clipboard-paste-after",
+        effect: CommandEffect::Edit,
         aliases: &[],
         doc: "Paste system clipboard after selections.",
         fun: paste_clipboard_after,
@@ -3527,6 +3568,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "clipboard-paste-before",
+        effect: CommandEffect::Edit,
         aliases: &[],
         doc: "Paste system clipboard before selections.",
         fun: paste_clipboard_before,
@@ -3538,6 +3580,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "clipboard-paste-replace",
+        effect: CommandEffect::Edit,
         aliases: &[],
         doc: "Replace selections with content of system clipboard.",
         fun: replace_selections_with_clipboard,
@@ -3549,6 +3592,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "primary-clipboard-paste-after",
+        effect: CommandEffect::Edit,
         aliases: &[],
         doc: "Paste primary clipboard after selections.",
         fun: paste_primary_clipboard_after,
@@ -3560,6 +3604,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "primary-clipboard-paste-before",
+        effect: CommandEffect::Edit,
         aliases: &[],
         doc: "Paste primary clipboard before selections.",
         fun: paste_primary_clipboard_before,
@@ -3571,6 +3616,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "primary-clipboard-paste-replace",
+        effect: CommandEffect::Edit,
         aliases: &[],
         doc: "Replace selections with content of system primary clipboard.",
         fun: replace_selections_with_primary_clipboard,
@@ -3582,6 +3628,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "show-clipboard-provider",
+        effect: CommandEffect::ReadOnly,
         aliases: &[],
         doc: "Show clipboard provider name in status bar.",
         fun: show_clipboard_provider,
@@ -3593,6 +3640,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "change-current-directory",
+        effect: CommandEffect::ReadOnly,
         aliases: &["cd"],
         doc: "Change the current working directory.",
         fun: change_current_directory,
@@ -3604,6 +3652,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "show-directory-stack",
+        effect: CommandEffect::ReadOnly,
         aliases: &[],
         doc: "Show the directory stack as a <space> delimited string.",
         fun: show_directory_stack,
@@ -3615,6 +3664,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "push-directory",
+        effect: CommandEffect::ReadOnly,
         aliases: &["pushd"],
         doc: "Save and then change the current directory.",
         fun: push_directory,
@@ -3626,6 +3676,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "pop-directory",
+        effect: CommandEffect::ReadOnly,
         aliases: &["popd"],
         doc: "Remove the top entry from the directory stack, and cd to the new top directory..",
         fun: pop_directory,
@@ -3637,6 +3688,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "show-directory",
+        effect: CommandEffect::ReadOnly,
         aliases: &["pwd"],
         doc: "Show the current working directory.",
         fun: show_current_directory,
@@ -3648,6 +3700,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "encoding",
+        effect: CommandEffect::EditWithArgument,
         aliases: &[],
         doc: "Set encoding. Based on `https://encoding.spec.whatwg.org`.",
         fun: set_encoding,
@@ -3659,6 +3712,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "character-info",
+        effect: CommandEffect::ReadOnly,
         aliases: &["char"],
         doc: "Get info about the character under the primary cursor.",
         fun: get_character_info,
@@ -3670,6 +3724,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "reload",
+        effect: CommandEffect::Edit,
         aliases: &["rl"],
         doc: "Discard changes and reload from the source file.",
         fun: reload,
@@ -3681,6 +3736,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "reload-all",
+        effect: CommandEffect::EditEach,
         aliases: &["rla"],
         doc: "Discard changes and reload all documents from the source files.",
         fun: reload_all,
@@ -3692,6 +3748,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "update",
+        effect: CommandEffect::Save,
         aliases: &["u"],
         doc: "Write changes only if the file has been modified.",
         fun: update,
@@ -3704,6 +3761,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "lsp-workspace-command",
+        effect: CommandEffect::WorkspaceEdit,
         aliases: &[],
         doc: "Open workspace command picker",
         fun: lsp_workspace_command,
@@ -3716,6 +3774,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "lsp-restart",
+        effect: CommandEffect::ReadOnly,
         aliases: &[],
         doc: "Restarts the given language servers, or all language servers that are used by the current file if no arguments are supplied",
         fun: lsp_restart,
@@ -3727,6 +3786,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "lsp-stop",
+        effect: CommandEffect::ReadOnly,
         aliases: &[],
         doc: "Stops the given language servers, or all language servers that are used by the current file if no arguments are supplied",
         fun: lsp_stop,
@@ -3738,6 +3798,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "tree-sitter-scopes",
+        effect: CommandEffect::ReadOnly,
         aliases: &[],
         doc: "Display tree sitter scopes, primarily for theming and development.",
         fun: tree_sitter_scopes,
@@ -3749,6 +3810,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "tree-sitter-highlight-name",
+        effect: CommandEffect::ReadOnly,
         aliases: &[],
         doc: "Display name of tree-sitter highlight scope under the cursor.",
         fun: tree_sitter_highlight_name,
@@ -3760,6 +3822,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "tree-sitter-layers",
+        effect: CommandEffect::ReadOnly,
         aliases: &[],
         doc: "Display language names of tree-sitter injection layers under the cursor.",
         fun: tree_sitter_layers,
@@ -3771,6 +3834,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "debug-start",
+        effect: CommandEffect::ReadOnly,
         aliases: &["dbg"],
         doc: "Start a debug session from a given template with given parameters.",
         fun: debug_start,
@@ -3782,6 +3846,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "debug-remote",
+        effect: CommandEffect::ReadOnly,
         aliases: &["dbg-tcp"],
         doc: "Connect to a debug adapter by TCP address and start a debugging session from a given template with given parameters.",
         fun: debug_remote,
@@ -3793,6 +3858,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "debug-eval",
+        effect: CommandEffect::ReadOnly,
         aliases: &[],
         doc: "Evaluate expression in current debug context.",
         fun: debug_eval,
@@ -3804,6 +3870,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "vsplit",
+        effect: CommandEffect::ReadOnly,
         aliases: &["vs"],
         doc: "Open the file in a vertical split.",
         fun: vsplit,
@@ -3815,6 +3882,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "vsplit-new",
+        effect: CommandEffect::ReadOnly,
         aliases: &["vnew"],
         doc: "Open a scratch buffer in a vertical split.",
         fun: vsplit_new,
@@ -3826,6 +3894,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "hsplit",
+        effect: CommandEffect::ReadOnly,
         aliases: &["hs", "sp"],
         doc: "Open the file in a horizontal split.",
         fun: hsplit,
@@ -3837,6 +3906,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "hsplit-new",
+        effect: CommandEffect::ReadOnly,
         aliases: &["hnew"],
         doc: "Open a scratch buffer in a horizontal split.",
         fun: hsplit_new,
@@ -3848,6 +3918,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "tutor",
+        effect: CommandEffect::ReadOnly,
         aliases: &[],
         doc: "Open the tutorial.",
         fun: tutor,
@@ -3859,6 +3930,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "goto",
+        effect: CommandEffect::ReadOnly,
         aliases: &["g"],
         doc: "Goto line number.",
         fun: goto_line_number,
@@ -3870,6 +3942,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "set-language",
+        effect: CommandEffect::ReadOnly,
         aliases: &["lang"],
         doc: "Set the language of current buffer (show current language if no value specified).",
         fun: language,
@@ -3881,6 +3954,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "set-option",
+        effect: CommandEffect::ReadOnly,
         aliases: &["set"],
         doc: "Set a config option at runtime.\nFor example to disable smart case search, use `:set search.smart-case false`.",
         fun: set_option,
@@ -3894,6 +3968,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "toggle-option",
+        effect: CommandEffect::ReadOnly,
         aliases: &["toggle"],
         doc: "Toggle a config option at runtime.\nFor example to toggle smart case search, use `:toggle search.smart-case`.",
         fun: toggle_option,
@@ -3906,6 +3981,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "get-option",
+        effect: CommandEffect::ReadOnly,
         aliases: &["get"],
         doc: "Get the current value of a config option.",
         fun: get_option,
@@ -3917,6 +3993,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "sort",
+        effect: CommandEffect::Edit,
         aliases: &[],
         doc: "Sort ranges in selection.",
         fun: sort,
@@ -3942,6 +4019,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "reflow",
+        effect: CommandEffect::Edit,
         aliases: &[],
         doc: "Hard-wrap the current selection of lines to a given width.",
         fun: reflow,
@@ -3953,6 +4031,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "tree-sitter-subtree",
+        effect: CommandEffect::ReadOnly,
         aliases: &["ts-subtree"],
         doc: "Display the smallest tree-sitter subtree that spans the primary selection, primarily for debugging queries.",
         fun: tree_sitter_subtree,
@@ -3964,6 +4043,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "config-reload",
+        effect: CommandEffect::ReadOnly,
         aliases: &[],
         doc: "Refresh user config.",
         fun: refresh_config,
@@ -3975,6 +4055,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "config-open",
+        effect: CommandEffect::ReadOnly,
         aliases: &[],
         doc: "Open the user config.toml file.",
         fun: open_config,
@@ -3986,6 +4067,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "config-open-workspace",
+        effect: CommandEffect::ReadOnly,
         aliases: &[],
         doc: "Open the workspace config.toml file.",
         fun: open_workspace_config,
@@ -3997,6 +4079,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "log-open",
+        effect: CommandEffect::ReadOnly,
         aliases: &[],
         doc: "Open the helix log file.",
         fun: open_log,
@@ -4008,6 +4091,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "insert-output",
+        effect: CommandEffect::Edit,
         aliases: &[],
         doc: "Run shell command, inserting output before each selection.",
         fun: insert_output,
@@ -4016,6 +4100,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "append-output",
+        effect: CommandEffect::Edit,
         aliases: &[],
         doc: "Run shell command, appending output after each selection.",
         fun: append_output,
@@ -4024,6 +4109,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "pipe",
+        effect: CommandEffect::Edit,
         aliases: &["|"],
         doc: "Pipe each selection to the shell command.",
         fun: pipe,
@@ -4032,6 +4118,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "pipe-to",
+        effect: CommandEffect::ReadOnly,
         aliases: &[],
         doc: "Pipe each selection to the shell command, ignoring output.",
         fun: pipe_to,
@@ -4040,6 +4127,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "run-shell-command",
+        effect: CommandEffect::ReadOnly,
         aliases: &["sh", "!"],
         doc: "Run a shell command",
         fun: run_shell_command,
@@ -4048,6 +4136,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "reset-diff-change",
+        effect: CommandEffect::Edit,
         aliases: &["diffget", "diffg"],
         doc: "Reset the diff change at the cursor position.",
         fun: reset_diff_change,
@@ -4059,6 +4148,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "review-mode",
+        effect: CommandEffect::ReadOnly,
         aliases: &["diff-mode"],
         doc: "Toggle read-only Git review mode, set on/off, or compare with the merge base of HEAD and a Git revision (e.g. main, origin/main, HEAD).",
         fun: review_mode,
@@ -4067,6 +4157,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "clear-register",
+        effect: CommandEffect::ReadOnly,
         aliases: &[],
         doc: "Clear given register. If no argument is provided, clear all registers.",
         fun: clear_register,
@@ -4078,6 +4169,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "set-register",
+        effect: CommandEffect::ReadOnly,
         aliases: &[],
         doc: "Set contents of the given register.",
         fun: set_register,
@@ -4090,6 +4182,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "redraw",
+        effect: CommandEffect::ReadOnly,
         aliases: &[],
         doc: "Clear and re-render the whole UI",
         fun: redraw,
@@ -4101,6 +4194,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "move",
+        effect: CommandEffect::Edit,
         aliases: &["mv"],
         doc: "Move the current buffer and its corresponding file to a different path",
         fun: move_buffer,
@@ -4112,6 +4206,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "move!",
+        effect: CommandEffect::Edit,
         aliases: &["mv!"],
         doc: "Move the current buffer and its corresponding file to a different path creating necessary subdirectories",
         fun: force_move_buffer,
@@ -4123,6 +4218,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "yank-diagnostic",
+        effect: CommandEffect::ReadOnly,
         aliases: &[],
         doc: "Yank diagnostic(s) under primary cursor to register, or clipboard by default",
         fun: yank_diagnostic,
@@ -4134,6 +4230,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "read",
+        effect: CommandEffect::Edit,
         aliases: &["r"],
         doc: "Load a file into buffer",
         fun: read,
@@ -4145,6 +4242,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "echo",
+        effect: CommandEffect::ReadOnly,
         aliases: &[],
         doc: "Prints the given arguments to the statusline.",
         fun: echo,
@@ -4156,6 +4254,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "noop",
+        effect: CommandEffect::ReadOnly,
         aliases: &[],
         doc: "Does nothing.",
         fun: noop,
@@ -4167,6 +4266,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "workspace-trust",
+        effect: CommandEffect::ReadOnly,
         aliases: &[],
         doc: "Allow language servers and local config for the current workspace.",
         fun: trust_workspace,
@@ -4175,6 +4275,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "workspace-untrust",
+        effect: CommandEffect::ReadOnly,
         aliases: &[],
         doc: "Revoke the current workspace's trust grant or exclusion.",
         fun: untrust_workspace,
@@ -4183,6 +4284,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "workspace-exclude",
+        effect: CommandEffect::ReadOnly,
         aliases: &[],
         doc: "Mark the current workspace as never-prompt. Never prompts for trust again.",
         fun: exclude_workspace,
@@ -4232,24 +4334,7 @@ pub(super) fn execute_command(
     event: PromptEvent,
 ) -> anyhow::Result<()> {
     if event == PromptEvent::Validate
-        && matches!(
-            cmd.name,
-            "sort"
-                | "reflow"
-                | "pipe"
-                | "insert-output"
-                | "append-output"
-                | "format"
-                | "earlier"
-                | "later"
-                | "line-ending"
-                | "read"
-                | "trim-trailing-whitespace"
-                | "trim-final-newlines"
-                | "insert-final-newline"
-                | "diffget"
-                | "reset-diff-change"
-        )
+        && cmd.effect.requires_edit_access(!args.trim().is_empty())
         && review_is_read_only(cx.editor)
     {
         bail!(DIFF_MODE_READ_ONLY);

@@ -55,7 +55,10 @@ use crate::{
 const MAX_DIAGNOSTIC_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_DIAGNOSTIC_MESSAGES: usize = 128;
 
-pub const DIFF_MODE_READ_ONLY: &str = "Review mode is read-only; use :review-mode off to edit";
+mod review;
+
+use review::ReviewBase;
+pub use review::{ReviewKey, DIFF_MODE_READ_ONLY};
 
 #[derive(Default)]
 struct DiagnosticMessageDimensionsCache {
@@ -673,7 +676,7 @@ pub struct Document {
 
     diff_handle: Option<DiffHandle>,
     diff_mode_views: HashSet<ViewId>,
-    review_diff: Option<(String, String, DiffHandle)>,
+    review_diff: Option<ReviewBase>,
     review_diff_generation: u64,
     pub(crate) review_diff_controller: TaskController,
     version_control_head: Option<Arc<ArcSwap<Box<str>>>>,
@@ -2185,8 +2188,8 @@ impl Document {
         if let Some(diff_handle) = &self.diff_handle {
             diff_handle.update_document(self.text.clone(), false);
         }
-        if let Some((_, _, diff_handle)) = &self.review_diff {
-            diff_handle.update_document(self.text.clone(), false);
+        if let Some(review) = &self.review_diff {
+            review.handle.update_document(self.text.clone(), false);
         }
 
         // Edits strictly after every diagnostic cannot change positions, lines or
@@ -2680,54 +2683,6 @@ impl Document {
 
     pub fn diff_handle(&self) -> Option<&DiffHandle> {
         self.diff_handle.as_ref()
-    }
-
-    /// Protect the buffer until its last diff view is disabled or closed.
-    pub fn is_diff_mode_read_only(&self) -> bool {
-        !self.diff_mode_views.is_empty()
-    }
-
-    pub(crate) fn set_view_diff_mode(&mut self, view: ViewId, enabled: bool) {
-        if enabled {
-            self.diff_mode_views.insert(view);
-        } else {
-            self.diff_mode_views.remove(&view);
-        }
-    }
-
-    pub fn review_diff_handle(&self) -> Option<&DiffHandle> {
-        self.review_diff
-            .as_ref()
-            .map(|(_, _, handle)| handle)
-            .or_else(|| self.diff_handle())
-    }
-
-    pub fn review_diff_reference(&self) -> Option<&str> {
-        self.review_diff
-            .as_ref()
-            .map(|(reference, _, _)| reference.as_str())
-    }
-
-    pub fn review_diff_key(&self) -> Option<(u64, bool, u64)> {
-        self.review_diff_handle().map(|handle| {
-            let (revision, inverted) = handle.render_key();
-            (revision, inverted, self.review_diff_generation)
-        })
-    }
-
-    pub(crate) fn review_diff_generation(&self) -> u64 {
-        self.review_diff_generation
-    }
-
-    pub(crate) fn set_review_diff_base(&mut self, reference: String, commit: String, base: Rope) {
-        self.review_diff_generation = self.review_diff_generation.wrapping_add(1);
-        self.review_diff = Some((reference, commit, DiffHandle::new(base, self.text.clone())));
-    }
-
-    pub(crate) fn clear_review_diff_base(&mut self) {
-        self.review_diff_controller.cancel();
-        self.review_diff_generation = self.review_diff_generation.wrapping_add(1);
-        self.review_diff = None;
     }
 
     /// Intialize/updates the differ for this document with a new base.

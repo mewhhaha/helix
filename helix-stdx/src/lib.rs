@@ -1,10 +1,12 @@
 //! Extensions to the standard library. A collection of helper functions
 //! used throughout helix.
 
+pub mod cache;
 pub mod cpu;
 pub mod env;
 pub mod faccess;
 pub mod path;
+pub mod protocol;
 pub mod range;
 pub mod rope;
 pub mod uri;

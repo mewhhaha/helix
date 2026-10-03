@@ -2203,14 +2203,14 @@ impl Editor {
         let view = self.tree.get_mut(current_view);
 
         if let Some(doc) = self.documents.get_mut(&view.doc) {
-            doc.set_view_diff_mode(view.id, false);
+            view.unregister_review(doc);
         }
 
         view.doc = doc_id;
         let doc = doc_mut!(self, &doc_id);
 
         doc.ensure_view_init(view.id);
-        doc.set_view_diff_mode(view.id, view.diff_mode.enabled);
+        view.register_review(doc);
         view.sync_changes(doc);
         doc.mark_as_focused();
 
@@ -2312,7 +2312,7 @@ impl Editor {
                 // initialize selection for view
                 let doc = doc_mut!(self, &id);
                 doc.ensure_view_init(view_id);
-                doc.set_view_diff_mode(view_id, self.tree.get(view_id).diff_mode.enabled);
+                self.tree.get(view_id).register_review(doc);
                 doc.mark_as_focused();
                 focus_lost
             }
@@ -2563,7 +2563,7 @@ impl Editor {
             self.enter_normal_mode();
         }
         let doc = self.documents.get_mut(&prepared.document).unwrap();
-        doc.set_review_diff_base(prepared.reference, commit, base);
+        doc.set_review_diff_base(prepared.reference, base);
         let view = self.tree.get_mut(prepared.view);
         view.set_diff_mode(doc, true);
         view.diff_mode.clear_cursor();
@@ -3413,7 +3413,7 @@ mod vcs_loading_tests {
         assert!(!editor.apply_prepared_review_diff(older));
         assert!(editor.documents[&id].review_diff_reference().is_none());
         assert!(editor.apply_prepared_review_diff(current));
-        assert!(editor.tree.get(editor.tree.focus).diff_mode.enabled);
+        assert!(editor.tree.get(editor.tree.focus).diff_mode.enabled());
         assert_eq!(editor.documents[&id].review_diff_reference(), Some("main"));
 
         let canceled = prepared_review(&mut editor, id);
@@ -3423,7 +3423,7 @@ mod vcs_loading_tests {
             .get_mut(editor.tree.focus)
             .set_diff_mode(editor.documents.get_mut(&id).unwrap(), false);
         assert!(!editor.apply_prepared_review_diff(canceled));
-        assert!(!editor.tree.get(editor.tree.focus).diff_mode.enabled);
+        assert!(!editor.tree.get(editor.tree.focus).diff_mode.enabled());
         assert_eq!(editor.documents[&id].review_diff_reference(), Some("main"));
 
         let old_path = prepared_review(&mut editor, id);
@@ -3488,7 +3488,7 @@ mod vcs_loading_tests {
             .unwrap()
             .0
             .contains("Cannot review against unknown-branch"));
-        assert!(editor.tree.get(view).diff_mode.enabled);
+        assert!(editor.tree.get(view).diff_mode.enabled());
         assert_eq!(editor.documents[&id].review_diff_key(), previous);
         assert_eq!(editor.documents[&id].review_diff_reference(), Some("main"));
         assert_eq!(editor.documents[&id].text().to_string(), "unsaved edit\n");
@@ -3513,7 +3513,7 @@ mod vcs_loading_tests {
         editor.workspace_trust = WorkspaceTrust::new(Default::default());
         assert!(editor.apply_prepared_review_diff(result));
         assert!(editor.documents[&id].review_diff_reference().is_none());
-        assert!(!editor.tree.get(editor.tree.focus).diff_mode.enabled);
+        assert!(!editor.tree.get(editor.tree.focus).diff_mode.enabled());
 
         editor.workspace_trust = WorkspaceTrust::fully_trusted();
         let result = prepared_review(&mut editor, id);
@@ -3525,7 +3525,7 @@ mod vcs_loading_tests {
             .unwrap();
         assert!(editor.apply_prepared_review_diff(result));
         assert!(editor.documents[&id].review_diff_reference().is_none());
-        assert!(!editor.tree.get(editor.tree.focus).diff_mode.enabled);
+        assert!(!editor.tree.get(editor.tree.focus).diff_mode.enabled());
     }
 
     #[tokio::test]

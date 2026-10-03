@@ -1,12 +1,9 @@
 //! Bounded syntax-highlight boundaries for repeated viewport rendering.
-use std::{
-    collections::{HashMap, VecDeque},
-    ops::Range,
-    sync::Arc,
-};
+use std::{collections::HashMap, ops::Range, sync::Arc};
 
 use super::{Highlight, Highlighter, Loader, Syntax};
 use crate::RopeSlice;
+use helix_stdx::cache::BoundedCache;
 
 const MAX_CACHE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ENTRIES: usize = 4;
@@ -30,8 +27,14 @@ struct Entry {
     boundaries: Arc<Boundaries>,
 }
 
-#[derive(Debug, Default)]
-pub(super) struct DisplayCache(VecDeque<Entry>);
+#[derive(Debug)]
+pub(super) struct DisplayCache(BoundedCache<Entry>);
+
+impl Default for DisplayCache {
+    fn default() -> Self {
+        Self(BoundedCache::new(MAX_ENTRIES, MAX_CACHE_BYTES))
+    }
+}
 
 impl DisplayCache {
     pub(super) fn clear(&mut self) {
@@ -39,39 +42,24 @@ impl DisplayCache {
     }
 
     fn get(&mut self, range: &Range<u32>, scopes: &Arc<Vec<String>>) -> Option<Arc<Boundaries>> {
-        let index = self
-            .0
-            .iter()
-            .position(|entry| entry.range == *range && Arc::ptr_eq(&entry.scopes, scopes))?;
-        let entry = self.0.remove(index).unwrap();
-        let result = entry.boundaries.clone();
-        self.0.push_back(entry);
-        Some(result)
+        self.0
+            .get(|entry| entry.range == *range && Arc::ptr_eq(&entry.scopes, scopes))
+            .map(|entry| Arc::clone(&entry.boundaries))
     }
 
     fn insert(&mut self, entry: Entry) {
-        if let Some(index) = self.0.iter().position(|existing| {
-            existing.range == entry.range && Arc::ptr_eq(&existing.scopes, &entry.scopes)
+        if self.0.iter().any(|existing| {
+            existing.range == entry.range
+                && Arc::ptr_eq(&existing.scopes, &entry.scopes)
+                && existing.boundaries.covered_until >= entry.boundaries.covered_until
         }) {
-            if self.0[index].boundaries.covered_until >= entry.boundaries.covered_until {
-                return;
-            }
-            self.0.remove(index);
+            return;
         }
-        while self.0.len() >= MAX_ENTRIES
-            || self
-                .0
-                .iter()
-                .map(|entry| entry.boundaries.bytes)
-                .sum::<usize>()
-                + entry.boundaries.bytes
-                > MAX_CACHE_BYTES
-        {
-            if self.0.pop_front().is_none() {
-                break;
-            }
-        }
-        self.0.push_back(entry);
+        self.0.retain(|existing| {
+            existing.range != entry.range || !Arc::ptr_eq(&existing.scopes, &entry.scopes)
+        });
+        let bytes = entry.boundaries.bytes;
+        self.0.insert(entry, bytes);
     }
 }
 

@@ -155,8 +155,9 @@ just install
 ```
 
 This uses the `opt` profile and `target-cpu=native` for the build machine's CPU.
-The repository selects the nightly Rust toolchain. To build with PGO, also
-install Python 3 and the matching LLVM tools:
+The repository pins a dated nightly in [rust-toolchain.toml](./rust-toolchain.toml).
+CI checks the optimized build alongside the minimum stable Rust version.
+To build with PGO, also install Python 3 and the matching LLVM tools:
 
 ```sh
 rustup component add llvm-tools-preview
@@ -166,6 +167,10 @@ just install-pgo
 PGO runs two builds, and its benefit depends on how closely the training matches
 your editing workload. See [building from source](./book/src/building-from-source.md)
 for runtime setup, requirements, and training with your own projects.
+
+The [terminal smoke tests](./docs/CONTRIBUTING.md#terminal-smoke-tests) check
+cursor graphics, terminal fallback, and review mode through the real terminal
+backend without requiring a display server.
 
 ![Screenshot](./screenshot.png)
 

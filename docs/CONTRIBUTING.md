@@ -16,7 +16,7 @@ Some suggestions to get started:
     it and defining syntax highlight queries for it is straightforward and
     doesn't require much knowledge of the internals.
 - If you don't use the Nix development shell and are getting your rust-analyzer binary from rustup, you may need to run `rustup component add rust-analyzer`.
-  This is because `rust-toolchain.toml` selects our MSRV for the development toolchain but doesn't download the matching rust-analyzer automatically.
+  This is because `rust-toolchain.toml` pins our development toolchain but doesn't download the matching rust-analyzer automatically.
 
 We provide an [architecture.md][architecture.md] that should give you
 a good overview of the internals.
@@ -59,16 +59,38 @@ Contributors using MacOS might encounter `Too many open files (os error 24)`
 failures while running integration tests. This can be resolved by increasing
 the default value (e.g. to `10240` from `256`) by running `ulimit -n 10240`.
 
+## Terminal smoke tests
+
+On Unix, the terminal smoke harness uses Python 3's standard library and a PTY
+to exercise a regular `hx` build. After an optimized build, run from the root:
+
+```shell
+python3 contrib/terminal-smoke.py target/opt/hx
+```
+
+You can pass another binary path, such as `target/release/hx`. Use a binary built
+without the `integration` feature, which replaces the real terminal backend.
+No terminal emulator or display server is needed. The harness decodes Kitty and
+Ghostty cursor images, checks movement, focus and resizing, verifies
+cursor fallback in ordinary terminals and multiplexers, and exercises readonly
+review commands and the `z r` toggle.
+
+CI runs this harness against the optimized native build using the nightly pinned
+in `rust-toolchain.toml`.
+
 ## Minimum Stable Rust Version (MSRV) Policy
 
 Helix keeps an intentionally low MSRV for the sake of easy building and packaging
 downstream. We follow [Firefox's MSRV policy]. Once Firefox's MSRV increases we
 may bump ours as well, but be sure to check that popular distributions like Ubuntu
-package the new MSRV version. When increasing the MSRV, update these three places:
+package the new MSRV version. When increasing the MSRV, update these two places:
 
 * the `workspace.package.rust-version` key in `Cargo.toml` in the repository root
 * the `env.MSRV` key at the top of `.github/workflows/build.yml`
-* the `toolchain.channel` key in `rust-toolchain.toml`
+
+The dated nightly in `rust-toolchain.toml` is an independent development and
+optimized-build toolchain. Update its date deliberately; CI validates both it
+and the MSRV.
 
 [Firefox's MSRV policy]: https://firefox-source-docs.mozilla.org/writing-rust-code/update-policy.html
 [good-first-issue]: https://github.com/helix-editor/helix/labels/E-easy
