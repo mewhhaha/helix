@@ -18,6 +18,11 @@ fn setup_logging(verbosity: u64) -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    let mut argv = std::env::args().skip(1);
+    if argv.next().as_deref() == Some("review") {
+        let exit_code = helix_term::review::run(argv.collect())?;
+        std::process::exit(exit_code);
+    }
     let exit_code = main_impl()?;
     std::process::exit(exit_code);
 }
@@ -39,6 +44,7 @@ async fn main_impl() -> Result<i32> {
 
 USAGE:
     hx [FLAGS] [files]...
+    hx review <COMMAND> <file> [OPTIONS]  Local review threads; see hx review --help
 
 ARGS:
     <files>...    Set the input file to use, position can also be specified via file[:row[:col]]

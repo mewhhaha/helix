@@ -1,10 +1,185 @@
 use super::*;
+use crate::document::review_comments::{CommentAnchor, CommentSide};
+
+#[tokio::test]
+async fn current_comments_and_replies_are_isolated_between_review_targets() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("source.txt");
+    std::fs::write(&source, "current\n").unwrap();
+    let (mut doc, mut view) = fixture("base\n", "current\n").await;
+    doc.set_path(Some(&source));
+    doc.set_review_diff_base("main".into(), Rope::from_str("base\n"));
+    doc.begin_review_session(None).unwrap();
+    let main = doc
+        .add_review_comment(CommentAnchor::new(
+            CommentSide::Current,
+            None,
+            doc.text().slice(..),
+            0..7,
+        ))
+        .unwrap();
+    doc.set_review_comment_text(main, "Main review".into());
+    let reply = doc.reply_review_comment(main).unwrap();
+    doc.set_review_comment_text(reply, "Main reply".into());
+    doc.save_review_comments().unwrap();
+    view.set_diff_mode(&mut doc, true);
+    let display = view.diff_mode.display(&doc).unwrap();
+    assert!(display.comment_block(main).is_some());
+    assert!(display.comment_block(reply).is_some());
+    view.diff_mode
+        .set_comment_cursor(&doc, view.id, main, SelectionRange::point(0));
+
+    doc.set_review_diff_base("HEAD".into(), Rope::from_str("base\n"));
+    doc.begin_review_session(None).unwrap();
+    let local = doc
+        .add_review_comment(CommentAnchor::new(
+            CommentSide::Current,
+            None,
+            doc.text().slice(..),
+            0..7,
+        ))
+        .unwrap();
+    doc.set_review_comment_text(local, "Local review".into());
+    doc.save_review_comments().unwrap();
+    let display = view.diff_mode.display(&doc).unwrap();
+    assert!(display.comment_block(main).is_none());
+    assert!(display.comment_block(reply).is_none());
+    assert!(display.comment_block(local).is_some());
+    assert!(view.diff_mode.comment_cursor(&doc, view.id).is_none());
+    doc.set_review_diff_base("main".into(), Rope::from_str("base\n"));
+    doc.begin_review_session(None).unwrap();
+    let display = view.diff_mode.display(&doc).unwrap();
+    assert!(display.comment_block(main).is_some());
+    assert!(display.comment_block(local).is_none());
+    doc.resolve_review_thread(main, true).unwrap();
+    assert!(view
+        .diff_mode
+        .display(&doc)
+        .unwrap()
+        .comment_block(reply)
+        .is_none());
+    assert_eq!(std::fs::read_to_string(source).unwrap(), "current\n");
+}
 use crate::{editor::Config, graphics::Rect, View};
 use arc_swap::ArcSwap;
 use helix_core::{
     char_idx_at_visual_offset, doc_formatter::DocumentFormatter, syntax, visual_offset_from_anchor,
     Selection, Transaction,
 };
+
+#[tokio::test(flavor = "multi_thread")]
+async fn comment_rows_interleave_with_deletions_and_keep_cursor_and_hit_testing_aligned() {
+    let directory = tempfile::tempdir().unwrap();
+    let (mut doc, mut view) = fixture("one\ntwo\nkeep\n", "keep\n").await;
+    doc.set_path(Some(&directory.path().join("source")));
+    doc.set_diff_base(b"one\ntwo\nkeep\n".to_vec());
+    wait_diff(&doc).await;
+    doc.load_review_comments().unwrap();
+    let base = Rope::from_str("one\ntwo\nkeep\n");
+    let old = doc
+        .add_review_comment(CommentAnchor::new(
+            CommentSide::Base,
+            Some("HEAD".into()),
+            base.slice(..),
+            4..7,
+        ))
+        .unwrap();
+    doc.set_review_comment_text(old, "old note".into());
+    let current = doc
+        .add_review_comment(CommentAnchor::new(
+            CommentSide::Current,
+            None,
+            doc.text().slice(..),
+            0..4,
+        ))
+        .unwrap();
+    doc.set_review_comment_text(current, "current note".into());
+    doc.set_selection(view.id, Selection::point(0));
+    let inner = view.inner_area(&doc);
+    assert!(view.move_diff_cursor(&mut doc, false, 1));
+    assert_eq!(
+        view.diff_mode.comment_cursor(&doc, view.id).unwrap().id,
+        current
+    );
+    assert_eq!(view.diff_cursor_screen_coords(&doc).unwrap().row, 3);
+    assert!(view.move_diff_cursor(&mut doc, false, 1));
+    assert_eq!(view.diff_mode.cursor(&doc, view.id).unwrap().row, 1);
+    assert_eq!(view.diff_cursor_screen_coords(&doc).unwrap().row, 2);
+    assert!(view.move_diff_cursor(&mut doc, false, 1));
+    assert_eq!(
+        view.diff_mode.comment_cursor(&doc, view.id).unwrap().id,
+        old
+    );
+    assert_eq!(view.diff_cursor_screen_coords(&doc).unwrap().row, 1);
+    assert_eq!(
+        view.comment_position_at_screen_coords(&doc, inner.y + 1, inner.x)
+            .unwrap()
+            .0,
+        old
+    );
+    assert_eq!(
+        view.diff_position_at_screen_coords(&doc, inner.y + 2, inner.x)
+            .unwrap()
+            .1,
+        1
+    );
+    assert!(view
+        .diff_position_at_screen_coords(&doc, inner.y + 1, inner.x)
+        .is_none());
+    assert!(view.move_diff_cursor(&mut doc, true, 3));
+    assert!(view.diff_mode.cursor(&doc, view.id).is_none());
+    assert!(view.diff_mode.comment_cursor(&doc, view.id).is_none());
+    assert_eq!(doc.text().to_string(), "keep\n");
+    assert!(!doc.is_modified());
+}
+
+#[tokio::test]
+async fn multiline_comments_work_without_git_and_remain_visible_while_paging() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = Config::default();
+    let mut doc = Document::from(
+        Rope::from_str("source\n"),
+        None,
+        Arc::new(ArcSwap::from_pointee(config.clone())),
+        Arc::new(ArcSwap::from_pointee(syntax::Loader::default())),
+    );
+    doc.set_path(Some(&directory.path().join("source")));
+    let mut view = View::new(doc.id(), config.gutters);
+    let mut ids = slotmap::SlotMap::<ViewId, ()>::with_key();
+    view.id = ids.insert(());
+    view.area = Rect::new(0, 0, 80, 10);
+    doc.ensure_view_init(view.id);
+    view.set_diff_mode(&mut doc, true);
+    let id = doc
+        .add_review_comment(CommentAnchor::new(
+            CommentSide::Current,
+            None,
+            doc.text().slice(..),
+            0..6,
+        ))
+        .unwrap();
+    let text = (0..30)
+        .map(|row| format!("note {row}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    doc.set_review_comment_text(id, text.clone());
+    view.diff_mode.set_comment_cursor(
+        &doc,
+        view.id,
+        id,
+        SelectionRange::point(text.chars().count()),
+    );
+    view.ensure_cursor_in_view(&mut doc, 0);
+    assert!(view.diff_cursor_screen_coords(&doc).is_some());
+    assert!(doc.view_offset(view.id).vertical_offset > 0);
+    let mut offset = doc.view_offset(view.id);
+    offset.vertical_offset = 0;
+    doc.set_view_offset(view.id, offset);
+    assert!(view.clamp_diff_cursor(&mut doc, 0, false));
+    assert!(view.diff_cursor_screen_coords(&doc).is_some());
+    assert!(view.diff_mode.comment_cursor(&doc, view.id).is_some());
+    assert_eq!(doc.text().to_string(), "source\n");
+}
 
 async fn fixture(base: &str, text: &str) -> (Document, View) {
     let config = Config::default();

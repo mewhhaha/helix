@@ -56,6 +56,7 @@ const MAX_DIAGNOSTIC_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_DIAGNOSTIC_MESSAGES: usize = 128;
 
 mod review;
+pub mod review_comments;
 
 use review::ReviewBase;
 pub use review::{ReviewKey, DIFF_MODE_READ_ONLY};
@@ -677,6 +678,9 @@ pub struct Document {
     diff_handle: Option<DiffHandle>,
     diff_mode_views: HashSet<ViewId>,
     review_diff: Option<ReviewBase>,
+    pub(crate) local_review_revision: Option<helix_vcs::ReviewRevision>,
+    review_comments: review_comments::ReviewComments,
+    pub(crate) review_comment_target: Option<review_comments::ReviewCommentTarget>,
     review_diff_generation: u64,
     pub(crate) review_diff_controller: TaskController,
     version_control_head: Option<Arc<ArcSwap<Box<str>>>>,
@@ -1331,7 +1335,10 @@ impl Document {
             language_servers: HashMap::new(),
             diff_handle: None,
             diff_mode_views: HashSet::new(),
+            review_comments: review_comments::ReviewComments::default(),
+            review_comment_target: None,
             review_diff: None,
+            local_review_revision: None,
             review_diff_generation: 0,
             review_diff_controller: TaskController::new(),
             config,
@@ -1964,6 +1971,8 @@ impl Document {
             self.vcs_controller.cancel();
             self.diff_handle = None;
             self.clear_review_diff_base();
+            self.local_review_revision = None;
+            self.review_comments = review_comments::ReviewComments::default();
             self.version_control_head = None;
         }
 
@@ -2138,6 +2147,7 @@ impl Document {
         );
         self.modified_since_accessed = true;
         self.version += 1;
+        self.map_review_comments(changes, old_doc.slice(..));
 
         for selection in self.selections.values_mut() {
             *selection = selection

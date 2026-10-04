@@ -948,6 +948,10 @@ impl Application {
         );
 
         doc.set_last_saved_revision(doc_save_event.revision, doc_save_event.save_time);
+        let review_error = doc
+            .save_review_comments_after_source_write(&doc_save_event.text, &doc_save_event.path)
+            .err()
+            .map(|error| format!("Source saved, but cannot save review anchors: {error:#}"));
 
         let lines = doc_save_event.text.len_lines();
         let size = doc_save_event.text.len_bytes();
@@ -986,6 +990,9 @@ impl Application {
             "'{}' written, {lines}L {size}",
             get_relative_path(&doc_save_event.path).to_string_lossy(),
         ));
+        if let Some(error) = review_error {
+            self.editor.set_error(error);
+        }
     }
 
     #[inline(always)]
@@ -1014,6 +1021,11 @@ impl Application {
             }
             EditorEvent::Redraw => {
                 self.render().await;
+            }
+            EditorEvent::ReviewComments => {
+                if self.editor.reload_review_comments() {
+                    self.render().await;
+                }
             }
             EditorEvent::IdleTimer => {
                 self.editor.clear_idle_timer();

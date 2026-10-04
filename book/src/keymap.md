@@ -44,10 +44,42 @@ highlighting from the original file. `j`/`k` and the arrow keys also visit delet
 rows. Use `v` and character, word, or line movements to select deleted text,
 `x` to select lines, `%` to select the deleted block, and `y` or clipboard yank
 commands to copy it. Mouse dragging selects old text. Selections stay within one
-deleted block. All text in review mode is read-only, including current source rows.
+deleted block. Source text in review mode is read-only, including current source rows.
 Editing, undo/redo, formatting, pasting, saving, and language-server edits stay
 disabled until all review views of that buffer are switched off or closed.
 Use `:review-mode off` to resume editing.
+
+`Space c` creates an editable comment above the current line. Select characters
+or lines with `v` or `x` before pressing it to reference that range. This also
+works on deleted text. Comments have no line numbers. `Esc` saves the comment;
+`Ctrl-c` cancels the edit. Use `j`/`k` or the mouse to enter a comment, `i` to
+edit it, and `Space c` on a comment to reply to its thread. Use `:review-delete`
+to delete the focused message while preserving other replies. The usual Helix
+editing commands, selections, registers, paste, undo/redo and custom keymaps operate
+on comment text. Normal-mode changes save automatically; insert-mode changes
+save when leaving insert mode. `:write` saves the sidecar while a comment has
+focus. When a comment has focus, its referenced text is highlighted.
+Comment rows invert the editor's foreground and background colors by default;
+selections use the normal editor selection style.
+
+Use `:review-reply` to reply to the focused thread, `:review-resolve` to resolve
+it, and `:review-reopen ID` to reopen it. `:review-comments` lists this review's
+threads, including resolved and outdated ones; selecting a thread that cannot
+be displayed inline opens its conversation. `:review-info` shows the target,
+commit references, and focused message's author. An optional `--pr URL` on
+`:review-mode main` associates a PR identity. Threads for other targets stay
+separate, and each keeps its original commit snapshot and anchor.
+
+Comments are saved alongside the file in `filename.review.json`; add
+`*.review.json` and `*.review.json.lock` to `.gitignore` to keep them local.
+Agents can create findings and reply with `hx review`; see `hx review --help`.
+Agent updates reload in review mode without replacing pending drafts. The
+version 2 sidecars record messages with authors and timestamps, resolution,
+the target/base/HEAD commits, and file hashes. Older comments migrate on save.
+They never modify source
+contents or source undo history. Themes can configure `ui.review.comment`,
+`ui.review.comment.active`, and `ui.review.reference`.
+
 Diagnostic navigation (`]d`, `[d`, `]D`, `[D`) also includes diff hunks while
 review mode is on, without requiring an LSP. Each hunk is one stop; deletions focus
 their old text. Counts such as `3]d` skip multiple stops. These commands include

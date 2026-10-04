@@ -27,11 +27,21 @@ pub use status::FileChange;
 pub struct PreparedVcs {
     pub diff_base: Option<Vec<u8>>,
     pub head: Option<Arc<ArcSwap<Box<str>>>>,
+    pub review_revision: Option<ReviewRevision>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReviewRevision {
+    pub target_commit: String,
+    pub base_commit: String,
+    pub head_commit: String,
+    pub branch: Option<String>,
 }
 
 pub struct RevisionDiffBase {
     pub bytes: Vec<u8>,
     pub commit: String,
+    pub revision: ReviewRevision,
 }
 
 /// Contains all active diff providers. Diff providers are compiled in via features. Currently
@@ -43,6 +53,37 @@ pub struct DiffProviderRegistry {
 }
 
 impl DiffProviderRegistry {
+    /// Non-interactive review tools share Git resolution and trust rules with
+    /// the editor. These synchronous calls belong on a worker or CLI thread.
+    pub fn review_base(
+        &self,
+        file: &Path,
+        reference: &str,
+        trust_full: bool,
+        cancel: &helix_event::TaskHandle,
+    ) -> Result<RevisionDiffBase> {
+        self.providers
+            .first()
+            .copied()
+            .unwrap_or(DiffProvider::None)
+            .get_review_base(file, reference, trust_full, cancel)
+    }
+
+    pub fn revision_file(
+        &self,
+        file: &Path,
+        commit: &str,
+        trust_full: bool,
+        cancel: &helix_event::TaskHandle,
+    ) -> Result<Vec<u8>> {
+        #[cfg(feature = "git")]
+        if self.providers.contains(&DiffProvider::Git) {
+            return git::get_revision_file(file, commit, trust_full, cancel);
+        }
+        let _ = (file, commit, trust_full, cancel);
+        bail!("Git support is unavailable")
+    }
+
     /// Resolve a pull-request baseline and decode it on the bounded Git worker.
     pub async fn prepare_review_with<T: Send + 'static>(
         &self,
@@ -520,7 +561,7 @@ mod preparation_tests {
 /// cloning [DiffProviderRegistry] as `Clone` cannot be used in trait objects.
 ///
 /// `Copy` is simply to ensure the `clone()` call is the simplest it can be.
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq, Eq)]
 enum DiffProvider {
     #[cfg(feature = "git")]
     Git,

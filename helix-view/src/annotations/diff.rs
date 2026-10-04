@@ -12,10 +12,11 @@ use helix_core::{
     graphemes::prev_grapheme_boundary,
     syntax::{config::LanguageConfiguration, Loader, Syntax},
     text_annotations::{LineAnnotation, TextAnnotations},
-    visual_offset_from_block, Position, Range as SelectionRange, Rope, RopeSlice,
+    visual_offset_from_block, Position, Range as SelectionRange, Rope, RopeSlice, Selection,
 };
 use helix_vcs::Hunk;
 
+use super::review_comments::{review_blocks, ReviewBlock, ReviewBlockContent};
 use crate::{document::ReviewKey, Document, DocumentId, ViewId};
 
 /// Review display state belongs to a view, independently of the editable text.
@@ -24,6 +25,7 @@ pub struct DiffMode {
     enabled: bool,
     scroll: Option<ReviewScroll>,
     cursor: Option<DiffCursor>,
+    comment_cursor: Option<CommentCursor>,
     cache: RefCell<Option<Arc<DiffDisplay>>>,
     base_syntax: RefCell<Option<BaseSyntax>>,
 }
@@ -67,6 +69,16 @@ pub struct DiffCursor {
     diff_key: ReviewKey,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommentCursor {
+    pub id: u64,
+    pub range: SelectionRange,
+    pub ranges: Selection,
+    document: DocumentId,
+    version: i32,
+    selection: u64,
+}
+
 pub struct Deletion {
     pub before: Range<u32>,
     /// The newline immediately before the changed text, or EOF.
@@ -84,13 +96,29 @@ pub struct DiffDisplay {
     document: DocumentId,
     version: i32,
     diff_key: ReviewKey,
+    comments_generation: u64,
     pub layout_key: u64,
     pub base: Rope,
     pub hunks: Vec<Hunk>,
     pub deletions: Vec<Deletion>,
+    pub blocks: Vec<ReviewBlock>,
 }
 
 impl DiffDisplay {
+    pub fn deleted_row_offset(&self, before: &Range<u32>, row: usize) -> Option<usize> {
+        let line = before.start + row as u32;
+        self.blocks.iter().find_map(|block| match &block.content {
+            ReviewBlockContent::Deleted { before, .. } if before.contains(&line) => {
+                Some(block.offset + (line - before.start) as usize)
+            }
+            _ => None,
+        })
+    }
+
+    pub fn comment_block(&self, id: u64) -> Option<&ReviewBlock> {
+        self.blocks.iter().find(|block| matches!(&block.content, ReviewBlockContent::Comment { id: found, .. } if *found == id))
+    }
+
     pub fn deleted_text(&self, before: &Range<u32>) -> RopeSlice<'_> {
         self.base.slice(
             self.base.line_to_char(before.start as usize)
@@ -112,6 +140,17 @@ impl DiffMode {
     }
 
     pub(crate) fn set_enabled(&mut self, doc: &mut Document, view: ViewId, enabled: bool) {
+        if enabled {
+            let generation = doc.review_comments_generation();
+            if let Err(error) = doc.load_review_comments() {
+                log::warn!("Cannot load review comments: {error:#}");
+            }
+            if doc.review_comments_generation() != generation {
+                self.clear_cursor();
+            }
+        } else {
+            self.clear_cursor();
+        }
         self.enabled = enabled;
         doc.set_view_diff_mode(view, enabled);
     }
@@ -124,6 +163,68 @@ impl DiffMode {
                 && cursor.selection == doc.selection_generation(view)
                 && doc.review_diff_key() == Some(cursor.diff_key)
         })
+    }
+
+    pub fn comment_cursor(&self, doc: &Document, view: ViewId) -> Option<&CommentCursor> {
+        self.comment_cursor.as_ref().filter(|cursor| {
+            self.enabled
+                && cursor.document == doc.id()
+                && cursor.version == doc.version()
+                && cursor.selection == doc.selection_generation(view)
+                && doc.review_comment(cursor.id).is_some()
+                && self.display(doc).is_some_and(|display| display.comment_block(cursor.id).is_some_and(|block|
+                    matches!(&block.content, ReviewBlockContent::Comment { text, .. } if cursor.ranges.iter().all(|range| range.to() <= text.len_chars()))))
+        })
+    }
+
+    pub fn set_comment_cursor(
+        &mut self,
+        doc: &Document,
+        view: ViewId,
+        id: u64,
+        range: SelectionRange,
+    ) {
+        self.set_comment_selection(doc, view, id, Selection::new(vec![range].into(), 0));
+    }
+
+    pub fn set_comment_selection(
+        &mut self,
+        doc: &Document,
+        view: ViewId,
+        id: u64,
+        ranges: Selection,
+    ) {
+        if doc.review_comment(id).is_none() {
+            return;
+        }
+        self.cursor = None;
+        self.comment_cursor = Some(CommentCursor {
+            id,
+            range: ranges.primary(),
+            ranges,
+            document: doc.id(),
+            version: doc.version(),
+            selection: doc.selection_generation(view),
+        });
+        self.release_scroll();
+    }
+
+    pub fn select_comment(
+        &mut self,
+        doc: &Document,
+        view: ViewId,
+        select: impl FnOnce(RopeSlice, SelectionRange) -> SelectionRange,
+    ) -> bool {
+        let Some(cursor) = self.comment_cursor(doc, view).cloned() else {
+            return false;
+        };
+        let text = Rope::from_str(&doc.review_comment(cursor.id).unwrap().text);
+        let mut range = select(text.slice(..), cursor.range);
+        range.anchor = range.anchor.min(text.len_chars());
+        range.head = range.head.min(text.len_chars());
+        range = range.grapheme_aligned(text.slice(..));
+        self.set_comment_cursor(doc, view, cursor.id, range);
+        true
     }
 
     pub fn set_cursor(
@@ -160,6 +261,7 @@ impl DiffMode {
                 .col;
         let mut range = SelectionRange::point(pos);
         range.old_visual_position = Some((0, column as u32));
+        self.comment_cursor = None;
         self.cursor = Some(DiffCursor {
             before,
             row,
@@ -228,6 +330,7 @@ impl DiffMode {
 
     pub fn clear_cursor(&mut self) {
         self.cursor = None;
+        self.comment_cursor = None;
         self.release_scroll();
     }
 
@@ -294,13 +397,16 @@ impl DiffMode {
         if !self.enabled {
             return None;
         }
-        let diff = doc.review_diff_handle()?.load();
+        let diff = doc.review_diff_handle().map(|handle| handle.load());
         // A worker can briefly lag behind edits. Its old line numbers must not
         // be used to insert virtual rows into the newer text.
-        if !diff.doc().is_instance(doc.text()) {
+        let current = diff
+            .as_ref()
+            .is_some_and(|diff| diff.doc().is_instance(doc.text()));
+        if !current && doc.review_comments().is_empty() {
             return None;
         }
-        let (revision, inverted) = diff.render_key();
+        let (revision, inverted) = diff.as_ref().map_or((0, false), |diff| diff.render_key());
         let diff_key = ReviewKey {
             revision,
             inverted,
@@ -311,6 +417,7 @@ impl DiffMode {
             display.document == doc.id()
                 && display.version == doc.version()
                 && display.diff_key == diff_key
+                && display.comments_generation == doc.review_comments_generation()
         }) {
             return Some(display.clone());
         }
@@ -319,11 +426,17 @@ impl DiffMode {
         let source_lines = |text: &Rope| {
             text.len_lines() as u32 - u32::from(text.line(text.len_lines() - 1).len_chars() == 0)
         };
-        let before_lines = source_lines(diff.diff_base());
+        let base = diff
+            .as_ref()
+            .map_or_else(|| doc.text().clone(), |diff| diff.diff_base().clone());
+        let before_lines = source_lines(&base);
         let after_lines = source_lines(doc.text());
-        let hunks: Vec<_> = (0..diff.len())
+        let hunks: Vec<_> = (0..diff
+            .as_ref()
+            .filter(|_| current)
+            .map_or(0, |diff| diff.len()))
             .filter_map(|n| {
-                let mut hunk = diff.nth_hunk(n);
+                let mut hunk = diff.as_ref().unwrap().nth_hunk(n);
                 hunk.before =
                     hunk.before.start.min(before_lines)..hunk.before.end.min(before_lines);
                 hunk.after = hunk.after.start.min(after_lines)..hunk.after.end.min(after_lines);
@@ -352,22 +465,25 @@ impl DiffMode {
                 }
             })
             .collect();
+        let blocks = review_blocks(doc, &base, &deletions);
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         doc.id().hash(&mut hasher);
-        deletions.len().hash(&mut hasher);
-        for deletion in &deletions {
-            deletion.anchor.hash(&mut hasher);
-            deletion.at_start.hash(&mut hasher);
-            deletion.height().hash(&mut hasher);
+        blocks.len().hash(&mut hasher);
+        for block in &blocks {
+            block.anchor.hash(&mut hasher);
+            block.at_start.hash(&mut hasher);
+            block.height().hash(&mut hasher);
         }
         let display = Arc::new(DiffDisplay {
             document: doc.id(),
             version: doc.version(),
             diff_key,
+            comments_generation: doc.review_comments_generation(),
             layout_key: hasher.finish(),
-            base: diff.diff_base().clone(),
+            base,
             hunks,
             deletions,
+            blocks,
         });
         *cache = Some(display.clone());
         Some(display)
@@ -391,7 +507,7 @@ impl DiffAnnotation {
 
     fn next_anchor(&self) -> usize {
         self.display
-            .deletions
+            .blocks
             .get(self.next)
             .map_or(usize::MAX, |d| d.anchor)
     }
@@ -417,23 +533,24 @@ impl LineAnnotation for DiffAnnotation {
 
     fn leading_virtual_lines(&self) -> usize {
         self.display
-            .deletions
-            .first()
-            .filter(|d| d.at_start)
-            .map_or(0, Deletion::height)
+            .blocks
+            .iter()
+            .take_while(|block| block.at_start)
+            .map(ReviewBlock::height)
+            .sum()
     }
 
     fn reset_pos(&mut self, char_idx: usize) -> usize {
         self.next = self
             .display
-            .deletions
+            .blocks
             .partition_point(|d| d.at_start || d.anchor < char_idx);
         self.pending = 0;
         self.next_anchor()
     }
 
     fn process_anchor(&mut self, _grapheme: &FormattedGrapheme) -> usize {
-        self.pending += self.display.deletions[self.next].height();
+        self.pending += self.display.blocks[self.next].height();
         self.next += 1;
         self.next_anchor()
     }

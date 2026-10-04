@@ -11,6 +11,7 @@ import codecs
 from dataclasses import dataclass
 import errno
 import fcntl
+import json
 import os
 from pathlib import Path
 import pty
@@ -225,9 +226,7 @@ class Screen:
 class Editor:
     def __init__(self, binary, fixture, term, program, multiplexed=False):
         self.fixture = fixture
-        self.screen = Screen()
-        self.raw = bytearray()
-        self.status = None
+        self.launch = binary, term, program, multiplexed
         self.source = fixture / "example.rs"
         base = "fn main() {\n    let old_name = 1;\n" + "".join(
             f'    let example_{index} = demo_value("some text");\n' for index in range(17)
@@ -248,6 +247,9 @@ class Editor:
 "ui.diff.deleted" = { bg = "#402020" }
 "ui.selection" = { bg = "#303030" }
 "ui.cursor" = { bg = "#ffeeaa" }
+"ui.review.comment" = { bg = "#202830" }
+"ui.review.comment.active" = { bg = "#304050" }
+"ui.review.reference" = { bg = "#404060" }
 ''')
         config = fixture / "config.toml"
         config.write_text('''theme = "terminal-smoke"
@@ -267,6 +269,15 @@ enabled = true
 duration = 120
 max-distance = 40
 ''')
+        self.start()
+
+    def start(self):
+        binary, term, program, multiplexed = self.launch
+        fixture = self.fixture
+        config = fixture / "config.toml"
+        self.screen = Screen()
+        self.raw = bytearray()
+        self.status = None
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
             fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 800, 480))
@@ -283,6 +294,11 @@ max-distance = 40
             os.execv(str(binary), [str(binary), "--config", str(config),
                                   "--log", str(fixture / "helix.log"), self.source.name])
         self.set_size(24, 80, 10, 20)
+
+    def reopen(self):
+        self.close()
+        self.start()
+        self.wait_for(lambda: "fn main()" in self.screen.text(), "reopened document")
 
     def set_size(self, rows, columns, cell_width, cell_height):
         self.screen.resize(rows, columns, cell_width, cell_height)
@@ -392,6 +408,78 @@ max-distance = 40
         assert "EDITABLE" in self.screen.text(), self.screen.text()
         assert self.source.read_text() == self.current, "review changed the source file"
 
+    def check_comments(self):
+        sidecar = self.source.with_name(self.source.name + ".review.json")
+
+        def comments():
+            data = json.loads(sidecar.read_text())
+            if data["version"] == 1:
+                return data["comments"]
+            return [dict(message, anchor=thread["anchor"]) for thread in data["threads"] for message in thread["messages"]]
+
+        def row_containing(text):
+            return next(row for row in self.screen.cells if text in "".join(cell[0] for cell in row))
+
+        self.keys("ggzr c")
+        assert " INS " in self.screen.text(), self.screen.text()
+        self.keys("Line note\rSecond row\x1b")
+        assert comments()[0]["anchor"]["quote"] == "fn main() {\n"
+        assert comments()[0]["text"] == "Line note\nSecond row"
+        row = row_containing("Line note")
+        assert "".join(cell[0] for cell in row[:7]).strip() == "", "comment has a gutter label"
+        assert row[0][1] == [48, 64, 80] and row[-1][1] == [48, 64, 80]
+        assert self.screen.text().index("Line note") < self.screen.text().index("fn main()")
+        self.reopen()
+        self.keys("ggzr")
+        self.wait_for(lambda: "Line note" in self.screen.text(), "saved review comment")
+        self.keys("k")
+        assert "Second row" in self.screen.lines()[self.screen.y], self.screen.text()
+        assert row_containing("Line note")[0][1] == [48, 64, 80]
+        self.keys("j")
+        assert row_containing("Line note")[0][1] == [32, 40, 48], "comment remained active"
+
+        self.command("goto 2")
+        self.keys("8lv7l c")
+        self.keys("Range note\x1b")
+        assert comments()[1]["anchor"]["quote"] == "new_name", comments()
+        row = row_containing("new_name")
+        start = "".join(cell[0] for cell in row).index("new_name")
+        assert all(cell[1] == [64, 64, 96] for cell in row[start:start + 8]), row
+        assert row[start - 1][1] == [32, 64, 32], "character anchor tinted the whole line"
+        self.command("goto 2")
+        self.keys("8lv7l c")
+        self.keys("Related note\x1b")
+        assert row_containing("Range note")[0][1] == [48, 64, 80], "related comment was not highlighted"
+        self.command("review-delete")
+        assert len(comments()) == 2
+        self.command("goto 2")
+        self.keys("k")
+        self.command("review-delete")
+        assert len(comments()) == 1, comments()
+
+        self.keys("gg[D8lv7l c")
+        self.keys("Old note\x1b")
+        assert comments()[1]["anchor"]["side"] == "base"
+        assert comments()[1]["anchor"]["quote"] == "old_name", comments()
+        assert self.screen.text().index("Old note") < self.screen.text().index("old_name")
+        self.keys("A edited\x1b")
+        assert comments()[1]["text"] == "Old note edited", comments()
+        self.keys("%d")
+        assert comments()[1]["text"] == "", "normal-mode delete did not edit the comment"
+        self.keys("u")
+        assert comments()[1]["text"] == "Old note edited", "comment undo changed its source"
+        self.keys("i unsaved\x03")
+        assert comments()[1]["text"] == "Old note edited", "cancel changed the saved comment"
+        self.command("goto 2")
+        self.keys("kk")
+        self.command("review-delete")
+        assert len(comments()) == 1, comments()
+        self.keys("ggk")
+        self.command("review-delete")
+        assert not sidecar.exists(), "removing the final comment retained the sidecar"
+        self.keys("zr")
+        assert self.source.read_text() == self.current, "comments changed the source file"
+
 
 def graphics_smoke(editor, compressed):
     screen = editor.screen
@@ -451,7 +539,6 @@ def main():
                 editor.wait_for(lambda: "new_name" in editor.screen.text(), "document rendering")
                 if graphics:
                     graphics_smoke(editor, compressed=name == "kitty")
-                    editor.check_review()
                 else:
                     editor.keys("7j28lgg")
                     assert not editor.screen.frames, "unsupported session emitted graphics"
@@ -461,6 +548,9 @@ def main():
                     assert editor.screen.native_cursor, "insert cursor was hidden"
                     editor.keys("\x1b")
                     assert not editor.screen.frames, "insert mode emitted unsupported graphics"
+                editor.check_comments()
+                if graphics:
+                    editor.check_review()
                 editor.close()
                 print(f"{name}: passed", flush=True)
             except BaseException:

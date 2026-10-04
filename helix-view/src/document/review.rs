@@ -18,6 +18,8 @@ pub struct ReviewKey {
 pub(super) struct ReviewBase {
     pub(super) reference: String,
     pub(super) handle: DiffHandle,
+    pub(super) revision: Option<helix_vcs::ReviewRevision>,
+    pub(super) base_hash: String,
 }
 
 impl Document {
@@ -66,8 +68,16 @@ impl Document {
         self.review_diff_generation = self.review_diff_generation.wrapping_add(1);
         self.review_diff = Some(ReviewBase {
             reference,
+            base_hash: super::review_comments::content_hash(base.slice(..)),
             handle: DiffHandle::new(base, self.text.clone()),
+            revision: None,
         });
+    }
+
+    pub(crate) fn set_review_revision(&mut self, revision: helix_vcs::ReviewRevision) {
+        if let Some(base) = self.review_diff.as_mut() {
+            base.revision = Some(revision);
+        }
     }
 
     pub(crate) fn clear_review_diff_base(&mut self) {

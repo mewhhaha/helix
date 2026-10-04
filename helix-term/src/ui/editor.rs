@@ -140,7 +140,8 @@ impl EditorView {
         }
         let mut decorations = DecorationManager::default();
 
-        let diff_cursor = view.diff_mode.cursor(doc, view.id).is_some();
+        let comment_cursor = view.diff_mode.comment_cursor(doc, view.id).cloned();
+        let diff_cursor = view.diff_mode.cursor(doc, view.id).is_some() || comment_cursor.is_some();
         if is_focused && config.cursorline && !diff_cursor {
             decorations.add_decoration(Self::cursorline(doc, view, theme));
         }
@@ -165,19 +166,45 @@ impl EditorView {
 
         let syntax_highlighter =
             Self::doc_syntax_highlighter(doc, view_offset.anchor, inner.height, &loader);
+        let mut comment_reference = None;
         if let Some(display) = diff_display {
+            comment_reference = comment_cursor
+                .as_ref()
+                .and_then(|cursor| display.comment_block(cursor.id))
+                .and_then(|block| match &block.content {
+                    helix_view::annotations::review_comments::ReviewBlockContent::Comment {
+                        side: helix_view::document::review_comments::CommentSide::Current,
+                        range,
+                        ..
+                    } => Some(range.clone()),
+                    _ => None,
+                });
             let base_syntax = view.diff_mode.base_syntax(doc, &display, &loader);
             decorations.add_decoration(text_decorations::diff::DiffDecoration::new(
                 display,
                 theme,
                 view.gutter_offset(doc),
                 doc.tab_width() as u16,
-                view.diff_mode.cursor(doc, view.id).cloned(),
+                text_decorations::diff::ReviewCursors {
+                    deleted: view.diff_mode.cursor(doc, view.id).cloned(),
+                    comment: comment_cursor,
+                    mode: editor.mode(),
+                },
                 base_syntax,
                 &loader,
             ));
         }
         let mut overlays = Vec::new();
+        if is_focused {
+            if let Some(range) = comment_reference {
+                if let Some(highlight) = theme
+                    .find_highlight_exact("ui.review.reference")
+                    .or_else(|| theme.find_highlight("ui.selection.primary"))
+                {
+                    overlays.push(OverlayHighlights::single(highlight, range));
+                }
+            }
+        }
 
         overlays.push(Self::overlay_syntax_highlights(
             doc,
@@ -297,6 +324,7 @@ impl EditorView {
             if self.terminal_focused && !self.graphics_cursor {
                 if let Some(pos) = position {
                     let style = theme.get(match editor.mode {
+                        Mode::Insert => "ui.cursor.primary.insert",
                         Mode::Select => "ui.cursor.primary.select",
                         _ => "ui.cursor.primary.normal",
                     });
@@ -752,7 +780,7 @@ impl EditorView {
             .unwrap_or_else(|| editor.theme.get("ui.statusline.inactive"));
 
         let mut x = viewport.x;
-        let current_doc = view!(editor).doc;
+        let current_doc = view!(editor).review_view().doc;
 
         for doc in editor.documents() {
             let fname = doc
@@ -1024,7 +1052,13 @@ impl EditorView {
                 if current_mode == Mode::Insert {
                     // how we entered insert mode is important, and we should track that so
                     // we can repeat the side effect.
-                    self.last_insert.0 = command.clone();
+                    self.last_insert.0 = if command.name() == "toggle_comments"
+                        && doc!(cxt.editor).review_comment_target().is_some()
+                    {
+                        commands::MappableCommand::insert_mode
+                    } else {
+                        command.clone()
+                    };
                     self.last_insert.1.clear();
                 }
             }
@@ -1314,6 +1348,23 @@ impl EditorView {
             MouseEventKind::Down(MouseButton::Left) => {
                 let editor = &mut cxt.editor;
 
+                let comment = editor.tree.views().find_map(|(view, _)| {
+                    view.comment_position_at_screen_coords(
+                        &editor.documents[&view.doc],
+                        row,
+                        column,
+                    )
+                    .map(|(id, pos)| (view.id, id, pos))
+                });
+                if let Some((view_id, id, pos)) = comment {
+                    editor.focus(view_id);
+                    let (view, doc) = current!(editor);
+                    view.diff_mode
+                        .set_comment_cursor(doc, view.id, id, Range::point(pos));
+                    editor.ensure_cursor_in_view(view_id);
+                    return EventResult::Consumed(None);
+                }
+
                 let deletion = editor.tree.views().find_map(|(view, _)| {
                     view.diff_position_at_screen_coords(&editor.documents[&view.doc], row, column)
                         .map(|(range, old_row, old_column)| (view.id, range, old_row, old_column))
@@ -1404,6 +1455,19 @@ impl EditorView {
 
             MouseEventKind::Drag(MouseButton::Left) => {
                 let (view, doc) = current!(cxt.editor);
+
+                if let Some(cursor) = view.diff_mode.comment_cursor(doc, view.id).cloned() {
+                    if let Some((id, pos)) =
+                        view.comment_position_at_screen_coords(doc, row, column)
+                    {
+                        if id == cursor.id {
+                            view.diff_mode.select_comment(doc, view.id, |text, range| {
+                                range.put_cursor(text, pos, true)
+                            });
+                        }
+                    }
+                    return EventResult::Consumed(None);
+                }
 
                 if let Some(cursor) = view.diff_mode.cursor(doc, view.id).cloned() {
                     if let Some((before, old_row, old_column)) =
@@ -1594,6 +1658,21 @@ impl Component for EditorView {
         event: &Event,
         context: &mut crate::compositor::Context,
     ) -> EventResult {
+        if matches!(event, Event::Key(_) | Event::Paste(_)) {
+            let (view, doc) = current_ref!(context.editor);
+            let id = view
+                .diff_mode
+                .comment_cursor(doc, view.id)
+                .map(|cursor| cursor.id);
+            if let Some(id) = id {
+                if let Err(error) = context.editor.enter_review_comment(id, None) {
+                    context
+                        .editor
+                        .set_error(format!("Cannot edit review comment: {error:#}"));
+                    return EventResult::Consumed(None);
+                }
+            }
+        }
         let mut cx = commands::Context {
             editor: context.editor,
             count: None,
@@ -1620,6 +1699,7 @@ impl Component for EditorView {
                 if mode != Mode::Insert {
                     doc.append_changes_to_history(view);
                 }
+                cx.editor.sync_review_comments();
 
                 EventResult::Consumed(None)
             }
@@ -1629,6 +1709,16 @@ impl Component for EditorView {
                 EventResult::Consumed(None)
             }
             Event::Key(mut key) => {
+                if cx.editor.mode == Mode::Insert
+                    && doc!(cx.editor).review_comment_target().is_some()
+                    && key.code == KeyCode::Char('c')
+                    && key.modifiers.contains(KeyModifiers::CONTROL)
+                {
+                    let view = cx.editor.tree.focus;
+                    cx.editor.cancel_review_comment(view);
+                    self.on_next_key = None;
+                    return EventResult::Consumed(None);
+                }
                 cx.editor.reset_idle_timer();
                 canonicalize_key(&mut key);
 
@@ -1719,6 +1809,7 @@ impl Component for EditorView {
                 if mode != Mode::Insert {
                     doc.append_changes_to_history(view);
                 }
+                cx.editor.sync_review_comments();
                 let callback = if callbacks.is_empty() {
                     None
                 } else {
@@ -1733,7 +1824,14 @@ impl Component for EditorView {
                 EventResult::Consumed(callback)
             }
 
-            Event::Mouse(event) => self.handle_mouse_event(event, &mut cx),
+            Event::Mouse(event) => {
+                if let Err(error) = cx.editor.leave_review_comment(cx.editor.tree.focus) {
+                    cx.editor
+                        .set_error(format!("Cannot save review comment: {error:#}"));
+                    return EventResult::Consumed(None);
+                }
+                self.handle_mouse_event(event, &mut cx)
+            }
             Event::IdleTimeout => self.handle_idle_timeout(&mut cx),
             Event::FocusGained => {
                 self.terminal_focused = true;
@@ -1759,6 +1857,7 @@ impl Component for EditorView {
     }
 
     fn render(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
+        cx.editor.sync_review_comments();
         // clear with background color
         surface.set_style(area, cx.editor.theme.get("ui.background"));
         let config = cx.editor.config();
@@ -1767,7 +1866,7 @@ impl Component for EditorView {
         use helix_view::editor::BufferLine;
         let use_bufferline = match config.bufferline {
             BufferLine::Always => true,
-            BufferLine::Multiple if cx.editor.documents.len() > 1 => true,
+            BufferLine::Multiple if cx.editor.documents().count() > 1 => true,
             _ => false,
         };
 
@@ -1779,6 +1878,7 @@ impl Component for EditorView {
 
         // if the terminal size suddenly changed, we need to trigger a resize
         cx.editor.resize(editor_area);
+        cx.editor.sync_review_comments();
 
         if use_bufferline {
             Self::render_bufferline(cx.editor, area.with_height(1), surface);
@@ -1788,6 +1888,7 @@ impl Component for EditorView {
             .borrow_mut()
             .retain(|id| cx.editor.tree.try_get(id).is_some());
         for (view, is_focused) in cx.editor.tree.views() {
+            let view = view.review_view();
             let doc = cx.editor.document(view.doc).unwrap();
             self.render_view(cx.editor, doc, view, area, surface, is_focused);
         }

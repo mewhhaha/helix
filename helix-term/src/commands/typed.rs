@@ -383,6 +383,16 @@ fn write_impl(
     path: Option<&str>,
     options: WriteOptions,
 ) -> anyhow::Result<()> {
+    if doc!(cx.editor).review_comment_target().is_some() {
+        ensure!(
+            path.is_none(),
+            "Review comments are saved in the source file's sidecar"
+        );
+        let view = cx.editor.tree.focus;
+        cx.editor.sync_review_comment(view, true)?;
+        cx.editor.set_status("Review comments saved");
+        return Ok(());
+    }
     ensure!(
         !doc!(cx.editor).is_diff_mode_read_only(),
         DIFF_MODE_READ_ONLY
@@ -2698,38 +2708,73 @@ pub(super) fn toggle_review_mode(cx: &mut Context) {
         jobs: cx.jobs,
         scroll: None,
     };
-    if let Err(err) = review_mode(&mut context, Args::default(), PromptEvent::Validate) {
+    let args = Args::parse("", REVIEW_MODE_SIGNATURE, true, |token| Ok(token.content))
+        .expect("empty review-mode arguments are valid");
+    if let Err(err) = review_mode(&mut context, args, PromptEvent::Validate) {
         context.editor.set_error(err.to_string());
     }
 }
+
+const REVIEW_MODE_SIGNATURE: Signature = Signature {
+    positionals: (0, Some(1)),
+    flags: &[Flag {
+        name: "pr",
+        doc: "associate this review with a pull request URL",
+        completions: Some(&[]),
+        ..Flag::DEFAULT
+    }],
+    ..Signature::DEFAULT
+};
 
 fn review_mode(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
     if event != PromptEvent::Validate {
         return Ok(());
     }
     if let Some(reference) = args.first().filter(|arg| !matches!(*arg, "on" | "off")) {
-        return cx
-            .editor
-            .request_review_diff(cx.editor.tree.focus, reference.to_owned());
+        return cx.editor.request_review_with(
+            cx.editor.tree.focus,
+            reference.to_owned(),
+            args.get_flag("pr").map(str::to_owned),
+        );
     }
     let scrolloff = cx.editor.config().scrolloff;
     cx.editor
         .cancel_review_diff(cx.editor.tree.get(cx.editor.tree.focus).doc);
-    let (view, doc) = current_ref!(cx.editor);
+    let (view, doc) = current!(cx.editor);
     let enabled = match args.first() {
         None => !view.diff_mode.enabled(),
         Some("on") => true,
         Some("off") => false,
         Some(_) => unreachable!("Git revisions are handled above"),
     };
+    if enabled {
+        doc.load_review_comments()?;
+        if !view.diff_mode.enabled() && doc.review_diff_reference().is_none() {
+            if let Some(review) = doc.review_session().filter(|review| {
+                (review.target != "HEAD" || review.snapshot.head_commit.is_some())
+                    && (review.branch.is_none()
+                        || doc.local_review_branch().is_none()
+                        || review.branch.as_deref() == doc.local_review_branch())
+            }) {
+                let reference = review.target.clone();
+                let pr = args.get_flag("pr").map(str::to_owned);
+                return cx
+                    .editor
+                    .request_review_with(cx.editor.tree.focus, reference, pr);
+            }
+        }
+    }
     ensure!(
-        !enabled || doc.review_diff_handle().is_some(),
+        !enabled || doc.review_diff_handle().is_some() || !doc.review_comments().is_empty(),
         "Diff is not available in the current buffer"
     );
     if enabled && cx.editor.mode == Mode::Insert {
         cx.editor.enter_normal_mode();
     }
     let (view, doc) = current!(cx.editor);
+    if enabled {
+        doc.begin_review_session(args.get_flag("pr").map(str::to_owned))?;
+    }
     view.set_diff_mode(doc, enabled);
     view.diff_mode.clear_cursor();
     let mut offset = doc.view_offset(view.id);
@@ -2749,6 +2794,191 @@ fn review_mode(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> 
     } else {
         "Review mode disabled".to_owned()
     };
+    cx.editor.set_status(status);
+    cx.editor.reset_review_comments_timer();
+    Ok(())
+}
+
+fn review_reply(
+    cx: &mut compositor::Context,
+    args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event == PromptEvent::Validate {
+        cx.editor
+            .begin_review_reply(args.first().map(str::parse).transpose()?)?;
+        cx.editor.mode = Mode::Insert;
+    }
+    Ok(())
+}
+
+fn review_resolve(
+    cx: &mut compositor::Context,
+    args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event == PromptEvent::Validate {
+        cx.editor
+            .set_review_thread_resolved(args.first().map(str::parse).transpose()?, true)?;
+    }
+    Ok(())
+}
+
+fn review_delete(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event == PromptEvent::Validate {
+        cx.editor.remove_focused_review_comment()?;
+    }
+    Ok(())
+}
+
+fn review_reopen(
+    cx: &mut compositor::Context,
+    args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event == PromptEvent::Validate {
+        cx.editor
+            .set_review_thread_resolved(args.first().map(str::parse).transpose()?, false)?;
+    }
+    Ok(())
+}
+
+fn review_comments(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    cx.editor.leave_review_comment(cx.editor.tree.focus)?;
+    let (view, doc) = current!(cx.editor);
+    ensure!(view.diff_mode.enabled(), "Enable review mode first");
+    doc.load_review_comments()?;
+    let document = doc.id();
+    let selected = doc.review_session().context("No active review")?.id.clone();
+    let display = view.diff_mode.display(doc);
+    #[derive(Clone)]
+    struct Entry {
+        message: u64,
+        label: String,
+        details: String,
+    }
+    let entries: Vec<_> = doc
+        .review_store()
+        .data()
+        .threads
+        .iter()
+        .filter(|thread| thread.review_id == selected)
+        .map(|thread| {
+            let message = &thread.messages[0];
+            let visible = display
+                .as_ref()
+                .is_some_and(|display| display.comment_block(message.id).is_some());
+            let status = if thread.resolved {
+                "resolved"
+            } else if visible {
+                "open"
+            } else {
+                "outdated / outside diff"
+            };
+            Entry {
+                message: message.id,
+                details: format!(
+                    "**Thread #{} · {status}**\n\n{}\n\nOriginal reference:\n\n```text\n{}\n```",
+                    thread.id,
+                    thread
+                        .messages
+                        .iter()
+                        .map(|message| format!("**{}**\n\n{}", message.author, message.text))
+                        .collect::<Vec<_>>()
+                        .join("\n\n---\n\n"),
+                    thread.original_anchor.quote
+                ),
+                label: format!(
+                    "#{} {status} · {} · {}",
+                    thread.id,
+                    message.author,
+                    message.text.lines().next().unwrap_or("")
+                ),
+            }
+        })
+        .collect();
+    ensure!(!entries.is_empty(), "No threads for this review target");
+    cx.jobs.callback(async move {
+        let callback = Callback::EditorCompositor(Box::new(move |_editor, compositor| {
+            let columns = [ui::PickerColumn::new("thread", |entry: &Entry, _| {
+                entry.label.as_str().into()
+            })];
+            let picker = ui::Picker::new(columns, 0, entries, (), move |cx, entry, _action| {
+                cx.editor.switch(document, Action::Replace);
+                if let Err(error) = cx.editor.focus_review_message(entry.message) {
+                    cx.editor.set_status(format!(
+                        "{}; {error}. Use :review-reopen ID for resolved threads",
+                        entry.label
+                    ));
+                    let details = entry.details.clone();
+                    let loader = cx.editor.syn_loader.clone();
+                    cx.jobs.callback(async move {
+                        Ok(Callback::EditorCompositor(Box::new(
+                            move |_editor, compositor| {
+                                let contents = ui::Markdown::new(details, loader);
+                                compositor.push(Box::new(
+                                    ui::Popup::new("review-thread", contents).auto_close(true),
+                                ));
+                            },
+                        )))
+                    });
+                }
+            });
+            compositor.push(Box::new(overlaid(picker)));
+        }));
+        Ok(callback)
+    });
+    Ok(())
+}
+
+fn review_info(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    let view = cx.editor.tree.get(cx.editor.tree.focus).review_view();
+    let doc = cx.editor.document(view.doc).unwrap();
+    let review = doc.review_session().context("No active review")?;
+    let short = |commit: &Option<String>| {
+        commit
+            .as_deref()
+            .map_or("unknown", |commit| &commit[..commit.len().min(8)])
+            .to_owned()
+    };
+    let mut status = format!(
+        "Review {} ({}) · base {} · HEAD {}",
+        review.target,
+        short(&review.snapshot.target_commit),
+        short(&review.snapshot.base_commit),
+        short(&review.snapshot.head_commit)
+    );
+    if let Some(pr) = &review.pr {
+        write!(status, " · {pr}")?;
+    }
+    if let Some(cursor) = view.diff_mode.comment_cursor(doc, view.id) {
+        if let Some(thread) = doc.review_comment_thread(cursor.id) {
+            let message = thread
+                .messages
+                .iter()
+                .find(|message| message.id == cursor.id)
+                .unwrap();
+            write!(status, " · thread #{} · {}", thread.id, message.author)?;
+        }
+    }
     cx.editor.set_status(status);
     Ok(())
 }
@@ -4153,7 +4383,43 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         doc: "Toggle read-only Git review mode, set on/off, or compare with the merge base of HEAD and a Git revision (e.g. main, origin/main, HEAD).",
         fun: review_mode,
         completer: CommandCompleter::none(),
+        signature: REVIEW_MODE_SIGNATURE,
+    },
+    TypableCommand {
+        name: "review-reply", effect: CommandEffect::ReadOnly, aliases: &[],
+        doc: "Reply to the focused review thread, or a thread ID, using ordinary comment editing.",
+        fun: review_reply, completer: CommandCompleter::none(),
         signature: Signature { positionals: (0, Some(1)), ..Signature::DEFAULT },
+    },
+    TypableCommand {
+        name: "review-resolve", effect: CommandEffect::ReadOnly, aliases: &[],
+        doc: "Resolve the focused review thread, or a thread ID, and hide its inline comments.",
+        fun: review_resolve, completer: CommandCompleter::none(),
+        signature: Signature { positionals: (0, Some(1)), ..Signature::DEFAULT },
+    },
+    TypableCommand {
+        name: "review-delete", effect: CommandEffect::ReadOnly, aliases: &[],
+        doc: "Delete the focused review message, preserving any remaining replies in its thread.",
+        fun: review_delete, completer: CommandCompleter::none(),
+        signature: Signature { positionals: (0, Some(0)), ..Signature::DEFAULT },
+    },
+    TypableCommand {
+        name: "review-reopen", effect: CommandEffect::ReadOnly, aliases: &[],
+        doc: "Reopen a resolved review thread by ID.",
+        fun: review_reopen, completer: CommandCompleter::none(),
+        signature: Signature { positionals: (1, Some(1)), ..Signature::DEFAULT },
+    },
+    TypableCommand {
+        name: "review-comments", effect: CommandEffect::ReadOnly, aliases: &[],
+        doc: "List threads for the active review, including resolved and outdated comments.",
+        fun: review_comments, completer: CommandCompleter::none(),
+        signature: Signature { positionals: (0, Some(0)), ..Signature::DEFAULT },
+    },
+    TypableCommand {
+        name: "review-info", effect: CommandEffect::ReadOnly, aliases: &[],
+        doc: "Show the review target, commit IDs, PR identity, and focused comment author.",
+        fun: review_info, completer: CommandCompleter::none(),
+        signature: Signature { positionals: (0, Some(0)), ..Signature::DEFAULT },
     },
     TypableCommand {
         name: "clear-register",
@@ -4333,6 +4599,17 @@ pub(super) fn execute_command(
     args: &str,
     event: PromptEvent,
 ) -> anyhow::Result<()> {
+    if event == PromptEvent::Validate
+        && doc!(cx.editor).review_comment_target().is_some()
+        && (matches!(
+            cmd.name,
+            "review-mode" | "goto" | "open" | "quit" | "quit!" | "quit-all" | "quit-all!"
+        ) || cmd.name.starts_with("buffer-")
+            || cmd.name.starts_with("hsplit")
+            || cmd.name.starts_with("vsplit"))
+    {
+        cx.editor.leave_review_comment(cx.editor.tree.focus)?;
+    }
     if event == PromptEvent::Validate
         && cmd.effect.requires_edit_access(!args.trim().is_empty())
         && review_is_read_only(cx.editor)

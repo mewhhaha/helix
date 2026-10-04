@@ -1,6 +1,7 @@
 pub(crate) mod dap;
 mod diff;
 pub(crate) mod lsp;
+mod review_comments;
 pub(crate) mod syntax;
 pub(crate) mod typed;
 
@@ -213,11 +214,13 @@ pub enum CommandEffect {
     Save,
     /// Multi-buffer edits likewise check each document at the mutation boundary.
     EditEach,
+    /// Source comment syntax outside review; a sidecar note inside review.
+    ReviewComment,
 }
 
 impl CommandEffect {
     fn requires_edit_access(self, has_arguments: bool) -> bool {
-        matches!(self, Self::Edit | Self::WorkspaceEdit)
+        matches!(self, Self::Edit | Self::WorkspaceEdit | Self::ReviewComment)
             || self == Self::EditWithArgument && has_arguments
     }
 }
@@ -271,6 +274,22 @@ macro_rules! static_commands {
 
 impl MappableCommand {
     pub fn execute(&self, cx: &mut Context) {
+        if matches!(
+            self,
+            Self::Static {
+                effect: CommandEffect::ReviewComment,
+                ..
+            }
+        ) && view!(cx.editor).diff_mode.enabled()
+        {
+            if let Err(error) = review_comments::create(cx) {
+                cx.editor.set_error(format!("{error:#}"));
+            }
+            return;
+        }
+        if review_comments::execute(self, cx) {
+            return;
+        }
         if matches!(self, Self::Static { effect, .. } if effect.requires_edit_access(false))
             && review_is_read_only(cx.editor)
         {
@@ -601,7 +620,7 @@ impl MappableCommand {
         remove_primary_selection, ReadOnly, "Remove primary selection",
         completion, Edit, "Invoke completion popup",
         hover, ReadOnly, "Show docs for item under cursor",
-        toggle_comments, Edit, "Comment/uncomment selections",
+        toggle_comments, ReviewComment, "Comment/uncomment selections, or create a comment or reply in review mode",
         toggle_line_comments, Edit, "Line comment/uncomment selections",
         toggle_block_comments, Edit, "Block comment/uncomment selections",
         rotate_selections_forward, ReadOnly, "Rotate selections forward",

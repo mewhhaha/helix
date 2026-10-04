@@ -53,6 +53,8 @@ pub(super) struct RenderKey {
     review_diff: Option<ReviewKey>,
     diff_mode: bool,
     diff_cursor: Option<helix_view::annotations::diff::DiffCursor>,
+    comment_cursor: Option<helix_view::annotations::diff::CommentCursor>,
+    comments_generation: u64,
     gutters: GutterConfig,
     tab_width: usize,
     indent_width: usize,
@@ -125,6 +127,8 @@ impl RenderKey {
             diff: doc.diff_handle().map(|diff| diff.render_key()),
             diff_mode: view.diff_mode.enabled(),
             diff_cursor: view.diff_mode.cursor(doc, view.id).cloned(),
+            comment_cursor: view.diff_mode.comment_cursor(doc, view.id).cloned(),
+            comments_generation: doc.review_comments_generation(),
             review_diff: view
                 .diff_mode
                 .enabled()

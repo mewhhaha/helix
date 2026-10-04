@@ -8,7 +8,11 @@ use helix_core::{
     Position,
 };
 use helix_view::{
-    annotations::diff::{Deletion, DiffCursor, DiffDisplay},
+    annotations::{
+        diff::{CommentCursor, DiffCursor, DiffDisplay},
+        review_comments::{ReviewBlock, ReviewBlockContent},
+    },
+    document::{review_comments::CommentSide, Mode},
     graphics::{Color, Rect},
     theme::Style,
     Theme,
@@ -16,6 +20,20 @@ use helix_view::{
 
 use super::Decoration;
 use crate::ui::document::{LinePos, SyntaxHighlighter, TextRenderer};
+
+pub struct ReviewCursors {
+    pub deleted: Option<DiffCursor>,
+    pub comment: Option<CommentCursor>,
+    pub mode: Mode,
+}
+
+struct RowPaint<'a> {
+    selection: &'a [helix_core::Range],
+    cursors: &'a [usize],
+    background: Style,
+    deleted: bool,
+    side: CommentSide,
+}
 
 pub struct DiffDecoration<'a> {
     display: Arc<DiffDisplay>,
@@ -27,11 +45,18 @@ pub struct DiffDecoration<'a> {
     added_gutter: Style,
     deleted_gutter: Style,
     selection_style: Style,
+    comment_selection_style: Style,
+    secondary_cursor_style: Style,
     cursor: Option<DiffCursor>,
+    comment_cursor: Option<CommentCursor>,
+    comment: Style,
+    active_comment: Style,
+    reference: Option<(CommentSide, std::ops::Range<usize>)>,
+    reference_style: Style,
     gutter_width: u16,
     tab_width: u16,
     next: usize,
-    pending: Option<usize>,
+    pending: Option<std::ops::Range<usize>>,
 }
 
 impl<'a> DiffDecoration<'a> {
@@ -40,7 +65,7 @@ impl<'a> DiffDecoration<'a> {
         theme: &'a Theme,
         gutter_width: u16,
         tab_width: u16,
-        cursor: Option<DiffCursor>,
+        cursors: ReviewCursors,
         syntax: Option<Arc<Syntax>>,
         loader: &'a Loader,
     ) -> Self {
@@ -48,6 +73,28 @@ impl<'a> DiffDecoration<'a> {
             Some(Color::Rgb(r, g, b)) => (r as u32 + g as u32 + b as u32) > 384,
             _ => false,
         };
+        let reference = cursors
+            .comment
+            .as_ref()
+            .and_then(|cursor| display.comment_block(cursor.id))
+            .and_then(|block| match &block.content {
+                ReviewBlockContent::Comment { side, range, .. } => Some((*side, range.clone())),
+                _ => None,
+            });
+        let comment = theme.try_get_exact("ui.review.comment").unwrap_or_else(|| {
+            let text = theme.get("ui.background").patch(theme.get("ui.text"));
+            Style {
+                fg: text.bg,
+                bg: text.fg,
+                ..Style::default()
+            }
+        });
+        let reference_style = theme
+            .try_get_exact("ui.review.reference")
+            .unwrap_or_else(|| theme.get("ui.selection.primary"));
+        let active_comment = theme
+            .try_get_exact("ui.review.comment.active")
+            .unwrap_or(comment);
         Self {
             display,
             syntax,
@@ -70,7 +117,21 @@ impl<'a> DiffDecoration<'a> {
             added_gutter: theme.get("diff.plus.gutter"),
             deleted_gutter: theme.get("diff.minus.gutter"),
             selection_style: theme.get("ui.selection.primary"),
-            cursor,
+            comment_selection_style: Style::reset()
+                .patch(theme.get("ui.background"))
+                .patch(theme.get("ui.text"))
+                .patch(theme.get("ui.selection.primary")),
+            secondary_cursor_style: theme.get(match cursors.mode {
+                Mode::Insert => "ui.cursor.insert",
+                Mode::Select => "ui.cursor.select",
+                Mode::Normal => "ui.cursor.normal",
+            }),
+            cursor: cursors.deleted,
+            comment_cursor: cursors.comment,
+            comment,
+            active_comment,
+            reference,
+            reference_style,
             gutter_width,
             tab_width,
             next: 0,
@@ -80,19 +141,19 @@ impl<'a> DiffDecoration<'a> {
 
     fn next_anchor(&self) -> usize {
         self.display
-            .deletions
+            .blocks
             .get(self.next)
             .map_or(usize::MAX, |d| d.anchor)
     }
 
-    fn deleted_row(
+    fn virtual_row(
         &self,
         renderer: &mut TextRenderer,
         row: usize,
         text: &str,
         mut char_idx: usize,
-        selection: Option<helix_core::Range>,
         highlighter: &mut SyntaxHighlighter<'_, '_, '_>,
+        paint: RowPaint<'_>,
     ) {
         if row < renderer.offset.row
             || row >= renderer.offset.row + renderer.viewport.height as usize
@@ -101,12 +162,12 @@ impl<'a> DiffDecoration<'a> {
         }
         let y = renderer.viewport.y + (row - renderer.offset.row) as u16;
         let x = renderer.viewport.x - self.gutter_width;
-        let style = renderer.text_style.patch(self.deleted);
+        let style = renderer.text_style.patch(paint.background);
         renderer.surface.set_style(
             Rect::new(x, y, renderer.viewport.width + self.gutter_width, 1),
             style,
         );
-        if self.gutter_width != 0 {
+        if self.gutter_width != 0 && paint.deleted {
             renderer
                 .surface
                 .set_string(x, y, "-", style.patch(self.deleted_gutter));
@@ -116,15 +177,34 @@ impl<'a> DiffDecoration<'a> {
         let mut col = 0;
         for raw in text.graphemes(true) {
             let grapheme = Grapheme::new(raw.into(), col, self.tab_width);
-            let selected = selection.is_some_and(|range| range.contains(char_idx));
-            let style = highlighter.style_at(char_idx).patch(self.deleted);
-            let grapheme_style = if selected {
-                style.patch(self.selection_style)
+            let selected = paint.selection.iter().any(|range| range.contains(char_idx));
+            let mut style = highlighter.style_at(char_idx).patch(paint.background);
+            if paint.deleted
+                && self
+                    .reference
+                    .as_ref()
+                    .is_some_and(|(reference_side, range)| {
+                        *reference_side == paint.side && range.contains(&char_idx)
+                    })
+            {
+                style = style.patch(self.reference_style);
+            }
+            let mut grapheme_style = if selected {
+                style.patch(if paint.deleted {
+                    self.selection_style
+                } else {
+                    self.comment_selection_style
+                })
             } else {
                 style
             };
+            if paint.cursors.contains(&char_idx) {
+                grapheme_style = grapheme_style.patch(self.secondary_cursor_style);
+            }
             if grapheme == Grapheme::Newline {
-                if selected && renderer.column_in_bounds(col, 1) {
+                if (selected || paint.cursors.contains(&char_idx))
+                    && renderer.column_in_bounds(col, 1)
+                {
                     renderer.surface.set_string(
                         renderer.viewport.x + (col - renderer.offset.col) as u16,
                         y,
@@ -168,10 +248,28 @@ impl<'a> DiffDecoration<'a> {
             col += width;
             char_idx += raw.chars().count();
         }
+        if paint.cursors.contains(&char_idx) && renderer.column_in_bounds(col, 1) {
+            renderer.surface.set_style(
+                Rect::new(
+                    renderer.viewport.x + (col - renderer.offset.col) as u16,
+                    y,
+                    1,
+                    1,
+                ),
+                self.secondary_cursor_style,
+            );
+        }
     }
 
-    fn deletion(&self, renderer: &mut TextRenderer, deletion: &Deletion, row: usize) -> usize {
-        let height = deletion.height();
+    fn deletion(
+        &self,
+        renderer: &mut TextRenderer,
+        index: usize,
+        before: &std::ops::Range<u32>,
+        row: usize,
+    ) -> usize {
+        let deletion = &self.display.deletions[index];
+        let height = before.len();
         let start = self
             .display
             .base
@@ -195,11 +293,8 @@ impl<'a> DiffDecoration<'a> {
         let range = self
             .display
             .base
-            .line_to_byte(deletion.before.start as usize + first) as u32
-            ..self
-                .display
-                .base
-                .line_to_byte(deletion.before.start as usize + end) as u32;
+            .line_to_byte(before.start as usize + first) as u32
+            ..self.display.base.line_to_byte(before.start as usize + end) as u32;
         let highlighter = self
             .syntax
             .as_ref()
@@ -207,34 +302,117 @@ impl<'a> DiffDecoration<'a> {
         let mut highlighter =
             SyntaxHighlighter::new(highlighter, base, self.theme, renderer.text_style);
         for i in first..end {
-            let line = deletion.before.start as usize + i;
+            let line = before.start as usize + i;
             let text = self.display.base.line(line).to_string();
-            self.deleted_row(
+            self.virtual_row(
                 renderer,
                 row + i,
                 &text,
                 self.display.base.line_to_char(line),
-                selection,
                 &mut highlighter,
+                RowPaint {
+                    selection: selection.as_slice(),
+                    cursors: &[],
+                    background: self.deleted,
+                    deleted: true,
+                    side: CommentSide::Base,
+                },
             );
         }
-        deletion.height()
+        height
+    }
+
+    fn block(&self, renderer: &mut TextRenderer, block: &ReviewBlock, row: usize) -> usize {
+        match &block.content {
+            ReviewBlockContent::Deleted { deletion, before } => {
+                self.deletion(renderer, *deletion, before, row)
+            }
+            ReviewBlockContent::Comment {
+                id,
+                text,
+                side,
+                range,
+            } => {
+                let active =
+                    self.reference
+                        .as_ref()
+                        .is_some_and(|(reference_side, reference_range)| {
+                            side == reference_side
+                                && (range == reference_range
+                                    || range.start < reference_range.end
+                                        && reference_range.start < range.end)
+                        });
+                let style = if active {
+                    self.active_comment
+                } else {
+                    self.comment
+                };
+                let selection = self
+                    .comment_cursor
+                    .as_ref()
+                    .filter(|cursor| cursor.id == *id)
+                    .map_or(&[][..], |cursor| cursor.ranges.ranges());
+                let cursors: Vec<_> = self
+                    .comment_cursor
+                    .as_ref()
+                    .filter(|cursor| cursor.id == *id)
+                    .into_iter()
+                    .flat_map(|cursor| {
+                        cursor
+                            .ranges
+                            .iter()
+                            .enumerate()
+                            .filter(|(index, _)| *index != cursor.ranges.primary_index())
+                            .map(|(_, range)| range.cursor(text.slice(..)))
+                    })
+                    .collect();
+                let mut highlighter =
+                    SyntaxHighlighter::new(None, text.slice(..), self.theme, renderer.text_style);
+                let first = renderer
+                    .offset
+                    .row
+                    .saturating_sub(row)
+                    .min(text.len_lines());
+                let end = (renderer.offset.row + renderer.viewport.height as usize)
+                    .saturating_sub(row)
+                    .min(text.len_lines());
+                for line in first..end {
+                    self.virtual_row(
+                        renderer,
+                        row + line,
+                        &text.line(line).to_string(),
+                        text.line_to_char(line),
+                        &mut highlighter,
+                        RowPaint {
+                            selection,
+                            cursors: &cursors,
+                            background: style,
+                            deleted: false,
+                            side: *side,
+                        },
+                    );
+                }
+                text.len_lines()
+            }
+        }
     }
 }
 
 impl Decoration for DiffDecoration<'_> {
     fn render_leading_lines(&mut self, renderer: &mut TextRenderer, row: usize) -> usize {
         self.display
-            .deletions
-            .first()
-            .filter(|d| d.at_start)
-            .map_or(0, |d| self.deletion(renderer, d, row))
+            .blocks
+            .iter()
+            .take_while(|block| block.at_start)
+            .fold(0, |offset, block| {
+                offset + self.block(renderer, block, row + offset)
+            })
     }
 
     fn reset_pos(&mut self, pos: usize) -> usize {
         self.next = self
             .display
-            .deletions
+            .blocks
             .partition_point(|d| d.at_start || d.anchor < pos);
         self.pending = None;
         self.next_anchor()
@@ -245,7 +423,8 @@ impl Decoration for DiffDecoration<'_> {
         _renderer: &mut TextRenderer,
         _grapheme: &FormattedGrapheme,
     ) -> usize {
-        self.pending = Some(self.next);
+        let pending = self.pending.get_or_insert(self.next..self.next);
+        pending.end += 1;
         self.next += 1;
         self.next_anchor()
     }
@@ -289,16 +468,14 @@ impl Decoration for DiffDecoration<'_> {
         pos: LinePos,
         virt_off: Position,
     ) -> Position {
-        let Some(idx) = self.pending.take() else {
+        let Some(pending) = self.pending.take() else {
             return Position::default();
         };
-        Position::new(
-            self.deletion(
-                renderer,
-                &self.display.deletions[idx],
-                pos.visual_line + virt_off.row,
-            ),
-            0,
-        )
+        let height = self.display.blocks[pending]
+            .iter()
+            .fold(0, |offset, block| {
+                offset + self.block(renderer, block, pos.visual_line + virt_off.row + offset)
+            });
+        Position::new(height, 0)
     }
 }

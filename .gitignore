@@ -4,3 +4,7 @@ helix-term/rustfmt.toml
 result
 runtime/grammars
 .DS_Store
+
+# Local review comments beside source files.
+*.review.json
+*.review.json.lock

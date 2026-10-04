@@ -63,6 +63,8 @@ use arc_swap::{
     ArcSwap,
 };
 
+mod review_comments;
+
 pub const DIR_STACK_CAP: usize = 10;
 pub const DEFAULT_AUTO_SAVE_DELAY: u64 = 3000;
 
@@ -1478,6 +1480,7 @@ pub struct Editor {
     pub tree: Tree,
     pub next_document_id: DocumentId,
     pub documents: BTreeMap<DocumentId, Document>,
+    review_comment_buffers: HashMap<(DocumentId, u64), DocumentId>,
 
     // We Flatten<> to resolve the inner DocumentSavedEventFuture. For that we need a stream of streams, hence the Once<>.
     // https://stackoverflow.com/a/66875668
@@ -1523,6 +1526,7 @@ pub struct Editor {
 
     pub idle_timer: Pin<Box<Sleep>>,
     redraw_timer: Pin<Box<Sleep>>,
+    pub(crate) review_comments_timer: Pin<Box<Sleep>>,
     last_motion: Option<Motion>,
     pub last_completion: Option<CompleteAction>,
     pub last_cwd: Option<PathBuf>,
@@ -1561,6 +1565,7 @@ struct PreparedDocumentVcs {
     cancel: helix_event::TaskHandle,
     diff_base: Option<helix_core::Rope>,
     head: Option<Arc<ArcSwap<Box<str>>>>,
+    review_revision: Option<helix_vcs::ReviewRevision>,
 }
 
 struct PreparedReviewDiff {
@@ -1570,11 +1575,13 @@ struct PreparedReviewDiff {
     reference: String,
     encoding: &'static helix_core::encoding::Encoding,
     cancel: helix_event::TaskHandle,
-    result: anyhow::Result<Option<(helix_core::Rope, String, bool)>>,
+    pr: Option<String>,
+    result: anyhow::Result<Option<(helix_core::Rope, helix_vcs::ReviewRevision, bool)>>,
 }
 
 #[derive(Debug)]
 pub enum EditorEvent {
+    ReviewComments,
     DocumentSaved(DocumentSavedEventResult),
     ConfigEvent(ConfigEvent),
     LanguageServerMessage((LanguageServerId, Call)),
@@ -1656,6 +1663,7 @@ impl Editor {
             tree: Tree::new(area),
             next_document_id: DocumentId::default(),
             documents: BTreeMap::new(),
+            review_comment_buffers: HashMap::new(),
             saves: HashMap::new(),
             save_queue: SelectAll::new(),
             write_count: 0,
@@ -1684,6 +1692,7 @@ impl Editor {
             autoinfo: None,
             idle_timer: Box::pin(sleep(conf.idle_timeout)),
             redraw_timer: Box::pin(sleep(Duration::MAX)),
+            review_comments_timer: Box::pin(sleep(Duration::MAX)),
             last_motion: None,
             last_completion: None,
             last_cwd: None,
@@ -2194,7 +2203,13 @@ impl Editor {
             let doc = doc_mut!(self, &view.doc);
             view.sync_changes(doc);
             view.gutters = config.gutters.clone();
-            view.ensure_cursor_in_view(doc, config.scrolloff)
+            view.ensure_cursor_in_view(doc, config.scrolloff);
+            if let Some(source) = view.review_source.as_mut() {
+                source.area = view.area;
+                let doc = doc_mut!(self, &source.doc);
+                source.gutters = config.gutters.clone();
+                source.ensure_cursor_in_view(doc, config.scrolloff);
+            }
         }
     }
 
@@ -2219,6 +2234,14 @@ impl Editor {
 
     pub fn switch(&mut self, id: DocumentId, action: Action) {
         use crate::tree::Layout;
+
+        if !matches!(action, Action::Load) {
+            let view = self.tree.focus;
+            if let Err(error) = self.leave_review_comment(view) {
+                self.set_error(format!("Cannot save review comment: {error:#}"));
+                return;
+            }
+        }
 
         if !self.documents.contains_key(&id) {
             log::error!("cannot switch to document that does not exist (anymore)");
@@ -2441,7 +2464,7 @@ impl Editor {
             if cancel.is_canceled() {
                 return None;
             }
-            let (diff_base, head, trust_full) = providers
+            let (diff_base, head, review_revision, trust_full) = providers
                 .prepare_vcs_with(
                     path.clone(),
                     move || {
@@ -2454,7 +2477,12 @@ impl Editor {
                         let diff_base = prepared
                             .diff_base
                             .and_then(|bytes| Document::decode_diff_base(bytes, encoding, cancel));
-                        (diff_base, prepared.head, trust_full)
+                        (
+                            diff_base,
+                            prepared.head,
+                            prepared.review_revision,
+                            trust_full,
+                        )
                     },
                 )
                 .await?;
@@ -2466,6 +2494,7 @@ impl Editor {
                 cancel,
                 diff_base,
                 head,
+                review_revision,
             })
         }));
     }
@@ -2474,6 +2503,15 @@ impl Editor {
         &mut self,
         view_id: ViewId,
         reference: String,
+    ) -> anyhow::Result<()> {
+        self.request_review_with(view_id, reference, None)
+    }
+
+    pub fn request_review_with(
+        &mut self,
+        view_id: ViewId,
+        reference: String,
+        pr: Option<String>,
     ) -> anyhow::Result<()> {
         let view = self.tree.get(view_id);
         let document = view.doc;
@@ -2502,7 +2540,7 @@ impl Editor {
                     move |prepared, cancel, trust_full| {
                         let base = Document::decode_diff_base(prepared.bytes, encoding, cancel)
                             .context("Cannot decode Git review baseline")?;
-                        Ok((base, prepared.commit, trust_full))
+                        Ok((base, prepared.revision, trust_full))
                     },
                 )
                 .await
@@ -2514,6 +2552,7 @@ impl Editor {
                 reference,
                 encoding,
                 cancel,
+                pr,
                 result,
             }
         }));
@@ -2533,7 +2572,7 @@ impl Editor {
         {
             return false;
         }
-        let (base, commit, trust_full) = match prepared.result {
+        let (base, revision, trust_full) = match prepared.result {
             Ok(Some(result)) => result,
             Ok(None) => return false,
             Err(err) => {
@@ -2549,7 +2588,9 @@ impl Editor {
             .query(doc.workspace_root(), TrustQuery::Git)
             .is_trusted();
         if trust_full != current_trust || !std::ptr::eq(prepared.encoding, doc.encoding()) {
-            if let Err(err) = self.request_review_diff(prepared.view, prepared.reference) {
+            if let Err(err) =
+                self.request_review_with(prepared.view, prepared.reference, prepared.pr)
+            {
                 self.set_error(err.to_string());
             }
             return true;
@@ -2557,13 +2598,18 @@ impl Editor {
         let status = format!(
             "Review mode enabled against {} ({})",
             prepared.reference,
-            &commit[..commit.len().min(8)]
+            &revision.base_commit[..revision.base_commit.len().min(8)]
         );
         if self.tree.focus == prepared.view && self.mode == Mode::Insert {
             self.enter_normal_mode();
         }
         let doc = self.documents.get_mut(&prepared.document).unwrap();
         doc.set_review_diff_base(prepared.reference, base);
+        doc.set_review_revision(revision);
+        if let Err(error) = doc.begin_review_session(prepared.pr) {
+            self.set_error(format!("Cannot select review: {error:#}"));
+            return true;
+        }
         let view = self.tree.get_mut(prepared.view);
         view.set_diff_mode(doc, true);
         view.diff_mode.clear_cursor();
@@ -2571,6 +2617,7 @@ impl Editor {
         offset.vertical_offset = 0;
         doc.set_view_offset(view.id, offset);
         view.diff_mode.hold_scroll(doc, view.id);
+        self.reset_review_comments_timer();
         self.set_status(status);
         true
     }
@@ -2598,14 +2645,19 @@ impl Editor {
         }
         // Only the Git baseline was captured by the worker. The differ compares
         // it against the current text, including edits made while loading.
+        doc.local_review_revision = prepared.review_revision;
         doc.set_diff_base_rope(prepared.diff_base);
         doc.set_version_control_head(prepared.head);
         true
     }
 
     pub fn close(&mut self, id: ViewId) {
+        if let Err(error) = self.leave_review_comment(id) {
+            self.set_error(format!("Cannot save review comment: {error:#}"));
+            return;
+        }
         // Remove selections for the closed view on all documents.
-        for doc in self.documents_mut() {
+        for doc in self.documents.values_mut() {
             doc.remove_view(id);
         }
         self.tree.remove(id);
@@ -2613,6 +2665,37 @@ impl Editor {
     }
 
     pub fn close_document(&mut self, doc_id: DocumentId, force: bool) -> Result<(), CloseError> {
+        if let Some((source, _)) = self
+            .documents
+            .get(&doc_id)
+            .and_then(Document::review_comment_target)
+        {
+            let views: Vec<_> = self
+                .tree
+                .views()
+                .filter(|(view, _)| view.doc == doc_id)
+                .map(|(view, _)| view.id)
+                .collect();
+            for view in views {
+                self.leave_review_comment(view)
+                    .map_err(CloseError::SaveError)?;
+            }
+            return self.close_document(source, force);
+        }
+        let views: Vec<_> = self
+            .tree
+            .views()
+            .filter(|(view, _)| {
+                view.review_source
+                    .as_ref()
+                    .is_some_and(|source| source.doc == doc_id)
+            })
+            .map(|(view, _)| view.id)
+            .collect();
+        for view in views {
+            self.leave_review_comment(view)
+                .map_err(CloseError::SaveError)?;
+        }
         let doc = match self.documents.get(&doc_id) {
             Some(doc) => doc,
             None => return Err(CloseError::DoesNotExist),
@@ -2620,6 +2703,8 @@ impl Editor {
         if !force && doc.is_modified() {
             return Err(CloseError::BufferModified(doc.display_name().into_owned()));
         }
+
+        self.remove_review_comment_buffers(doc_id, None);
 
         // This will also disallow any follow-up writes
         self.saves.remove(&doc_id);
@@ -2806,12 +2891,16 @@ impl Editor {
 
     #[inline]
     pub fn documents(&self) -> impl Iterator<Item = &Document> {
-        self.documents.values()
+        self.documents
+            .values()
+            .filter(|doc| doc.review_comment_target().is_none())
     }
 
     #[inline]
     pub fn documents_mut(&mut self) -> impl Iterator<Item = &mut Document> {
-        self.documents.values_mut()
+        self.documents
+            .values_mut()
+            .filter(|doc| doc.review_comment_target().is_none())
     }
 
     pub fn document_by_path<P: AsRef<Path>>(&self, path: P) -> Option<&Document> {
@@ -2881,7 +2970,8 @@ impl Editor {
     /// or `None` if the primary cursor is not visible on screen.
     pub fn cursor(&self) -> (Option<Position>, CursorKind) {
         let config = self.config();
-        let (view, doc) = current_ref!(self);
+        let view = view!(self).review_view();
+        let doc = &self.documents[&view.doc];
         if let Some(mut pos) = self.cursor_cache.get(view, doc) {
             let inner = view.inner_area(doc);
             pos.col += inner.x as usize;
@@ -2993,6 +3083,10 @@ impl Editor {
                 _ = &mut self.redraw_timer  => {
                     self.redraw_timer.as_mut().reset(Instant::now() + Duration::from_secs(86400 * 365 * 30));
                     return EditorEvent::Redraw
+                }
+                _ = &mut self.review_comments_timer => {
+                    self.reset_review_comments_timer();
+                    return EditorEvent::ReviewComments
                 }
                 _ = &mut self.idle_timer  => {
                     return EditorEvent::IdleTimer
@@ -3251,6 +3345,7 @@ mod vcs_loading_tests {
             cancel: doc.vcs_controller.restart(),
             diff_base: Some(Rope::from_str("committed\n")),
             head: Some(Arc::new(ArcSwap::from_pointee("main".into()))),
+            review_revision: None,
         }
     }
 
@@ -3261,11 +3356,15 @@ mod vcs_loading_tests {
             document,
             path: doc.path().unwrap().to_owned(),
             reference: "main".into(),
+            pr: None,
             encoding: UTF_8,
             cancel: doc.review_diff_controller.restart(),
             result: Ok(Some((
                 Rope::from_str("shared baseline\n"),
-                "0123456789abcdef".into(),
+                helix_vcs::ReviewRevision {
+                    base_commit: "0123456789abcdef".into(),
+                    ..helix_vcs::ReviewRevision::default()
+                },
                 true,
             ))),
         }

@@ -7,6 +7,7 @@ mod movement;
 mod queued_save_paths;
 mod reverse_search;
 mod reverse_selection_contents;
+mod review_comments;
 mod rotate_selection_contents;
 mod workspace_edit;
 mod write;

@@ -3,6 +3,7 @@ use crate::{
     annotations::{
         diagnostics::InlineDiagnostics,
         diff::{Deletion, DiffAnnotation, DiffCursor, DiffMode},
+        review_comments::{ReviewBlock, ReviewBlockContent},
     },
     document::{DocumentColorSwatches, DocumentInlayHints},
     editor::{GutterConfig, GutterType},
@@ -26,6 +27,13 @@ use std::{
 };
 
 const JUMP_LIST_CAPACITY: usize = 30;
+
+struct ReviewPosition {
+    anchor: usize,
+    at_start: bool,
+    row: usize,
+    column: usize,
+}
 
 #[cfg(test)]
 #[path = "view/checkpoint_tests.rs"]
@@ -167,6 +175,8 @@ pub struct View {
     /// all gutter-related configuration settings, used primarily for gutter rendering
     pub gutters: GutterConfig,
     pub diff_mode: DiffMode,
+    /// Source view retained while an inline review comment is the editable buffer.
+    pub review_source: Option<Box<View>>,
     /// A mapping between documents and the last history revision the view was updated at.
     /// Changes between documents and views are synced lazily when switching windows. This
     /// mapping keeps track of the last applied history revision so that only new changes
@@ -204,6 +214,7 @@ impl View {
             object_selections: Vec::new(),
             gutters,
             diff_mode: DiffMode::default(),
+            review_source: None,
             doc_revisions: HashMap::new(),
             diagnostics_handler: DiagnosticsHandler::new(),
         }
@@ -214,6 +225,10 @@ impl View {
             self.docs_access_history.remove(pos);
         }
         self.docs_access_history.push(id);
+    }
+
+    pub fn review_view(&self) -> &View {
+        self.review_source.as_deref().unwrap_or(self)
     }
 
     pub fn set_diff_mode(&mut self, doc: &mut Document, enabled: bool) {
@@ -411,6 +426,10 @@ impl View {
         if self.diff_mode.preserves_scroll(doc, self.id) {
             return;
         }
+        if let Some(position) = self.comment_position(doc) {
+            self.ensure_review_position_in_view(doc, position, scrolloff);
+            return;
+        }
         if let Some(cursor) = self.diff_mode.cursor(doc, self.id) {
             self.ensure_diff_cursor_in_view(doc, cursor, scrolloff);
             return;
@@ -526,8 +545,45 @@ impl View {
         format: &TextFormat,
         annotations: &TextAnnotations,
     ) -> Option<isize> {
+        Self::review_anchor_row(
+            doc,
+            deletion.anchor,
+            deletion.at_start,
+            anchor,
+            format,
+            annotations,
+        )
+    }
+
+    fn review_block_row(
+        doc: &Document,
+        block: &ReviewBlock,
+        anchor: usize,
+        format: &TextFormat,
+        annotations: &TextAnnotations,
+    ) -> Option<isize> {
+        Some(
+            Self::review_anchor_row(
+                doc,
+                block.anchor,
+                block.at_start,
+                anchor,
+                format,
+                annotations,
+            )? + block.offset as isize,
+        )
+    }
+
+    fn review_anchor_row(
+        doc: &Document,
+        source_anchor: usize,
+        at_start: bool,
+        anchor: usize,
+        format: &TextFormat,
+        annotations: &TextAnnotations,
+    ) -> Option<isize> {
         let text = doc.text().slice(..);
-        if deletion.at_start {
+        if at_start {
             if anchor == 0 {
                 Some(0)
             } else {
@@ -538,12 +594,12 @@ impl View {
                         .row as isize),
                 )
             }
-        } else if deletion.anchor >= anchor {
+        } else if source_anchor >= anchor {
             Some(
                 visual_offset_from_anchor(
                     text,
                     anchor,
-                    deletion.anchor,
+                    source_anchor,
                     format,
                     annotations,
                     usize::MAX,
@@ -557,7 +613,7 @@ impl View {
             Some(
                 1 - visual_offset_from_anchor(
                     text,
-                    deletion.anchor,
+                    source_anchor,
                     anchor,
                     format,
                     annotations,
@@ -579,49 +635,80 @@ impl View {
         let Some(display) = self.diff_mode.display(doc) else {
             return false;
         };
-        if display.deletions.is_empty() {
+        if display.blocks.is_empty() {
             return false;
         }
-        let cursor = self.diff_mode.cursor(doc, self.id);
         let text = doc.text().slice(..);
         let format = doc.text_format(self.inner_width(doc), None);
         let annotations = self.text_annotations_with_diff(doc, None, Some(display.clone()));
         let range = doc.selection(self.id).primary();
-        let (anchor, row, column) = if let Some((cursor, deletion)) = cursor.and_then(|cursor| {
-            display
-                .deletions
-                .iter()
-                .find(|d| d.before == cursor.before)
-                .map(|d| (cursor, d))
-        }) {
-            (
-                deletion.anchor,
-                cursor.row + usize::from(!deletion.at_start),
-                cursor
-                    .range
-                    .old_visual_position
-                    .map_or(cursor.column, |(_, col)| col as usize),
-            )
-        } else {
-            let anchor = range.cursor(text);
-            let column = range.old_visual_position.map_or_else(
-                || {
-                    visual_offset_from_block(text, anchor, anchor, &format, &annotations)
+        let (anchor, row, column) =
+            if let Some(cursor) = self.diff_mode.comment_cursor(doc, self.id) {
+                let Some(block) = display.comment_block(cursor.id) else {
+                    return false;
+                };
+                let ReviewBlockContent::Comment { text, .. } = &block.content else {
+                    return false;
+                };
+                let pos = cursor.range.cursor(text.slice(..));
+                let column = cursor.range.old_visual_position.map_or_else(
+                    || {
+                        visual_offset_from_block(
+                            text.slice(..),
+                            pos,
+                            pos,
+                            &TextFormat {
+                                tab_width: doc.tab_width() as u16,
+                                ..TextFormat::default()
+                            },
+                            &TextAnnotations::default(),
+                        )
                         .0
                         .col
-                },
-                |(_, col)| col as usize,
-            );
-            (
-                anchor,
-                if anchor == 0 {
-                    annotations.leading_virtual_lines()
-                } else {
-                    0
-                },
-                column,
-            )
-        };
+                    },
+                    |(_, column)| column as usize,
+                );
+                (
+                    block.anchor,
+                    block.offset + text.char_to_line(pos) + usize::from(!block.at_start),
+                    column,
+                )
+            } else if let Some(cursor) = self.diff_mode.cursor(doc, self.id) {
+                let Some(deletion) = display.deletions.iter().find(|d| d.before == cursor.before)
+                else {
+                    return false;
+                };
+                let Some(row) = display.deleted_row_offset(&cursor.before, cursor.row) else {
+                    return false;
+                };
+                (
+                    deletion.anchor,
+                    row + usize::from(!deletion.at_start),
+                    cursor
+                        .range
+                        .old_visual_position
+                        .map_or(cursor.column, |(_, col)| col as usize),
+                )
+            } else {
+                let anchor = range.cursor(text);
+                let column = range.old_visual_position.map_or_else(
+                    || {
+                        visual_offset_from_block(text, anchor, anchor, &format, &annotations)
+                            .0
+                            .col
+                    },
+                    |(_, col)| col as usize,
+                );
+                (
+                    anchor,
+                    if anchor == 0 {
+                        annotations.leading_virtual_lines()
+                    } else {
+                        0
+                    },
+                    column,
+                )
+            };
         let target_row = row as isize
             + if down {
                 count as isize
@@ -630,30 +717,68 @@ impl View {
             };
         let (pos, virtual_rows) =
             char_idx_at_visual_offset(text, anchor, target_row, column, &format, &annotations);
-        let target_row = if pos == 0 {
-            display
-                .deletions
-                .first()
-                .filter(|d| d.at_start)
-                .and_then(|d| Self::diff_deletion_row(doc, d, anchor, &format, &annotations))
-                .map_or(target_row, |first| target_row.max(first))
+        let target_row = if pos == 0 && display.blocks.first().is_some_and(|block| block.at_start) {
+            target_row.max(
+                Self::review_block_row(doc, &display.blocks[0], anchor, &format, &annotations)
+                    .unwrap_or(target_row),
+            )
         } else {
             target_row
         };
-        let next = display.deletions.partition_point(|d| d.anchor < pos);
-        let deletion = display.deletions
-            [next.saturating_sub(1)..(next + 1).min(display.deletions.len())]
-            .iter()
-            .find_map(|d| {
-                let first = Self::diff_deletion_row(doc, d, anchor, &format, &annotations)?;
-                let row = target_row.checked_sub(first)?;
-                (row >= 0 && (row as usize) < d.height()).then_some((d, row as usize))
-            });
-        let target = deletion.map(|(d, row)| (d.anchor, d.before.clone(), row));
+        // Only the neighboring anchor groups can contain this virtual position.
+        let next = display.blocks.partition_point(|block| block.anchor < pos);
+        let start = if next == 0 {
+            0
+        } else {
+            display
+                .blocks
+                .partition_point(|block| block.anchor < display.blocks[next - 1].anchor)
+        };
+        let end = if next == display.blocks.len() {
+            next
+        } else {
+            display
+                .blocks
+                .partition_point(|block| block.anchor <= display.blocks[next].anchor)
+        };
+        let target = display.blocks[start..end].iter().find_map(|block| {
+            let first = Self::review_block_row(doc, block, anchor, &format, &annotations)?;
+            let row = target_row.checked_sub(first)?;
+            (row >= 0 && (row as usize) < block.height()).then_some((block, row as usize))
+        });
+        let target = target.map(|(block, row)| (block.anchor, block.content.clone(), row));
         drop(annotations);
-        if let Some((anchor, before, row)) = target {
+        if let Some((anchor, content, row)) = target {
             doc.set_selection(self.id, Selection::point(anchor));
-            self.diff_mode.set_cursor(doc, self.id, before, row, column);
+            match content {
+                ReviewBlockContent::Deleted { deletion, before } => {
+                    let original = &display.deletions[deletion].before;
+                    self.diff_mode.set_cursor(
+                        doc,
+                        self.id,
+                        original.clone(),
+                        row + (before.start - original.start) as usize,
+                        column,
+                    );
+                }
+                ReviewBlockContent::Comment { id, text, .. } => {
+                    let pos = char_idx_at_visual_offset(
+                        text.slice(..),
+                        text.line_to_char(row),
+                        0,
+                        column,
+                        &TextFormat {
+                            tab_width: doc.tab_width() as u16,
+                            ..TextFormat::default()
+                        },
+                        &TextAnnotations::default(),
+                    )
+                    .0;
+                    let mut range = helix_core::Range::point(pos);
+                    range.old_visual_position = Some((0, column as u32));
+                    self.diff_mode.set_comment_cursor(doc, self.id, id, range);
+                }
+            }
         } else {
             self.diff_mode.clear_cursor();
             let pos = if down && virtual_rows != 0 {
@@ -715,23 +840,35 @@ impl View {
         let Some(display) = self.diff_mode.display(doc) else {
             return false;
         };
-        if display.deletions.is_empty() {
+        if display.blocks.is_empty() {
             return false;
         }
         let inner = self.inner_area(doc);
         let offset = doc.view_offset(self.id);
         let format = doc.text_format(inner.width, None);
         let annotations = self.text_annotations_with_diff(doc, None, Some(display.clone()));
-        let row = if let Some((cursor, deletion)) =
+        let row = if let Some(position) = self.comment_position(doc) {
+            Self::review_anchor_row(
+                doc,
+                position.anchor,
+                position.at_start,
+                offset.anchor,
+                &format,
+                &annotations,
+            )
+            .map(|row| row + position.row as isize)
+        } else if let Some((cursor, deletion)) =
             self.diff_mode.cursor(doc, self.id).and_then(|cursor| {
                 display
                     .deletions
                     .iter()
                     .find(|d| d.before == cursor.before)
                     .map(|d| (cursor, d))
-            }) {
-            Self::diff_deletion_row(doc, deletion, offset.anchor, &format, &annotations)
-                .map(|row| row + cursor.row as isize)
+            })
+        {
+            Self::diff_deletion_row(doc, deletion, offset.anchor, &format, &annotations).and_then(
+                |row| Some(row + display.deleted_row_offset(&cursor.before, cursor.row)? as isize),
+            )
         } else {
             let text = doc.text().slice(..);
             let cursor = doc.selection(self.id).primary().cursor(text);
@@ -781,6 +918,34 @@ impl View {
         true
     }
 
+    fn comment_position(&self, doc: &Document) -> Option<ReviewPosition> {
+        let cursor = self.diff_mode.comment_cursor(doc, self.id)?;
+        let display = self.diff_mode.display(doc)?;
+        let block = display.comment_block(cursor.id)?;
+        let ReviewBlockContent::Comment { text, .. } = &block.content else {
+            return None;
+        };
+        let pos = cursor.range.cursor(text.slice(..));
+        let format = TextFormat {
+            tab_width: doc.tab_width() as u16,
+            ..TextFormat::default()
+        };
+        Some(ReviewPosition {
+            anchor: block.anchor,
+            at_start: block.at_start,
+            row: block.offset + text.char_to_line(pos),
+            column: visual_offset_from_block(
+                text.slice(..),
+                pos,
+                pos,
+                &format,
+                &TextAnnotations::default(),
+            )
+            .0
+            .col,
+        })
+    }
+
     fn ensure_diff_cursor_in_view(
         &self,
         doc: &mut Document,
@@ -793,11 +958,29 @@ impl View {
         let Some(deletion) = display.deletions.iter().find(|d| d.before == cursor.before) else {
             return;
         };
+        let Some(row) = display.deleted_row_offset(&cursor.before, cursor.row) else {
+            return;
+        };
+        let position = ReviewPosition {
+            anchor: deletion.anchor,
+            at_start: deletion.at_start,
+            row,
+            column: cursor.column,
+        };
+        self.ensure_review_position_in_view(doc, position, scrolloff);
+    }
+
+    fn ensure_review_position_in_view(
+        &self,
+        doc: &mut Document,
+        position: ReviewPosition,
+        scrolloff: usize,
+    ) {
         let inner = self.inner_area(doc);
         let format = doc.text_format(inner.width, None);
         let mut offset = doc.view_offset(self.id);
         let old_offset = offset;
-        let column = cursor.column;
+        let column = position.column;
         let width = inner.width as usize;
         let margin = scrolloff.min(width.saturating_sub(1) / 2);
         if column < offset.horizontal_offset + margin {
@@ -808,15 +991,20 @@ impl View {
         let annotations = self.text_annotations_for_offset(
             doc,
             None,
-            Some(display.clone()),
+            self.diff_mode.display(doc),
             offset.horizontal_offset,
         );
-        let Some(first) =
-            Self::diff_deletion_row(doc, deletion, offset.anchor, &format, &annotations)
-        else {
+        let Some(first) = Self::review_anchor_row(
+            doc,
+            position.anchor,
+            position.at_start,
+            offset.anchor,
+            &format,
+            &annotations,
+        ) else {
             return;
         };
-        let row = first + cursor.row as isize;
+        let row = first + position.row as isize;
         let margin = scrolloff.min(inner.height.saturating_sub(1) as usize / 2);
         let top = offset.vertical_offset + margin;
         let bottom = offset.vertical_offset + inner.height.saturating_sub(1) as usize - margin;
@@ -828,8 +1016,8 @@ impl View {
             };
             (offset.anchor, offset.vertical_offset) = char_idx_at_visual_offset(
                 doc.text().slice(..),
-                deletion.anchor,
-                (cursor.row + usize::from(!deletion.at_start)) as isize - screen_row as isize,
+                position.anchor,
+                (position.row + usize::from(!position.at_start)) as isize - screen_row as isize,
                 0,
                 &format,
                 &annotations,
@@ -842,21 +1030,36 @@ impl View {
     }
 
     pub fn diff_cursor_screen_coords(&self, doc: &Document) -> Option<Position> {
-        let cursor = self.diff_mode.cursor(doc, self.id)?;
         let display = self.diff_mode.display(doc)?;
-        let deletion = display
-            .deletions
-            .iter()
-            .find(|d| d.before == cursor.before)?;
+        let position = if let Some(position) = self.comment_position(doc) {
+            position
+        } else {
+            let cursor = self.diff_mode.cursor(doc, self.id)?;
+            let deletion = display
+                .deletions
+                .iter()
+                .find(|d| d.before == cursor.before)?;
+            ReviewPosition {
+                anchor: deletion.anchor,
+                at_start: deletion.at_start,
+                row: display.deleted_row_offset(&cursor.before, cursor.row)?,
+                column: cursor.column,
+            }
+        };
         let inner = self.inner_area(doc);
         let offset = doc.view_offset(self.id);
         let format = doc.text_format(inner.width, None);
-        let annotations = self.text_annotations_with_diff(doc, None, Some(display.clone()));
-        let row = Self::diff_deletion_row(doc, deletion, offset.anchor, &format, &annotations)?
-            + cursor.row as isize
+        let annotations = self.text_annotations_with_diff(doc, None, Some(display));
+        let row = Self::review_anchor_row(
+            doc,
+            position.anchor,
+            position.at_start,
+            offset.anchor,
+            &format,
+            &annotations,
+        )? + position.row as isize
             - offset.vertical_offset as isize;
-        let column = cursor.column;
-        let column = column.checked_sub(offset.horizontal_offset)?;
+        let column = position.column.checked_sub(offset.horizontal_offset)?;
         (row >= 0 && row < inner.height as isize && column < inner.width as usize)
             .then_some(Position::new(row as usize, column))
     }
@@ -872,12 +1075,17 @@ impl View {
             .map(|(before, _, _)| before)
     }
 
-    pub fn diff_position_at_screen_coords(
+    fn review_block_at_screen_coords(
         &self,
         doc: &Document,
         row: u16,
         column: u16,
-    ) -> Option<(std::ops::Range<u32>, usize, usize)> {
+    ) -> Option<(
+        std::sync::Arc<crate::annotations::diff::DiffDisplay>,
+        usize,
+        usize,
+        usize,
+    )> {
         let inner = self.inner_area(doc);
         if row < inner.y || row >= inner.bottom() || column < self.area.x || column >= inner.right()
         {
@@ -886,41 +1094,71 @@ impl View {
         let display = self.diff_mode.display(doc)?;
         let offset = doc.view_offset(self.id);
         let format = doc.text_format(inner.width, None);
-        let annotations = self.text_annotations(doc, None);
+        let annotations = self.text_annotations_with_diff(doc, None, Some(display.clone()));
         let target_row = (row - inner.y) as usize + offset.vertical_offset;
-        display.deletions.iter().find_map(|deletion| {
-            let marker_row = if deletion.at_start {
-                if offset.anchor != 0 {
-                    return None;
-                }
-                0
-            } else {
-                visual_offset_from_anchor(
-                    doc.text().slice(..),
-                    offset.anchor,
-                    deletion.anchor,
-                    &format,
-                    &annotations,
-                    target_row + 1,
-                )
-                .ok()?
-                .0
-                .row + 1
-            };
-            (marker_row..marker_row + deletion.height())
-                .contains(&target_row)
-                .then(|| {
-                    (
-                        deletion.before.clone(),
-                        target_row - marker_row,
-                        if column < inner.x {
-                            0
-                        } else {
-                            (column - inner.x) as usize + offset.horizontal_offset
-                        },
-                    )
-                })
-        })
+        let found = display
+            .blocks
+            .iter()
+            .enumerate()
+            .find_map(|(index, block)| {
+                let first =
+                    Self::review_block_row(doc, block, offset.anchor, &format, &annotations)?;
+                let row = target_row as isize - first;
+                (row >= 0 && (row as usize) < block.height()).then_some((index, row as usize))
+            });
+        drop(annotations);
+        let (index, row) = found?;
+        Some((
+            display,
+            index,
+            row,
+            column.saturating_sub(inner.x) as usize + offset.horizontal_offset,
+        ))
+    }
+
+    pub fn comment_position_at_screen_coords(
+        &self,
+        doc: &Document,
+        row: u16,
+        column: u16,
+    ) -> Option<(u64, usize)> {
+        let (display, index, row, column) = self.review_block_at_screen_coords(doc, row, column)?;
+        let ReviewBlockContent::Comment { id, text, .. } = &display.blocks[index].content else {
+            return None;
+        };
+        let format = TextFormat {
+            tab_width: doc.tab_width() as u16,
+            ..TextFormat::default()
+        };
+        let pos = char_idx_at_visual_offset(
+            text.slice(..),
+            text.line_to_char(row),
+            0,
+            column,
+            &format,
+            &TextAnnotations::default(),
+        )
+        .0;
+        Some((*id, pos))
+    }
+
+    pub fn diff_position_at_screen_coords(
+        &self,
+        doc: &Document,
+        row: u16,
+        column: u16,
+    ) -> Option<(std::ops::Range<u32>, usize, usize)> {
+        let (display, index, row, column) = self.review_block_at_screen_coords(doc, row, column)?;
+        let ReviewBlockContent::Deleted { deletion, before } = &display.blocks[index].content
+        else {
+            return None;
+        };
+        let original = &display.deletions[*deletion].before;
+        Some((
+            original.clone(),
+            row + (before.start - original.start) as usize,
+            column,
+        ))
     }
 
     /// Get the text annotations to display in the current view for the given document and theme.

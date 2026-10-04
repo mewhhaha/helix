@@ -215,7 +215,7 @@
 | `remove_primary_selection` | Remove primary selection | normal: `` <A-,> ``, select: `` <A-,> `` |
 | `completion` | Invoke completion popup | insert: `` <C-x> `` |
 | `hover` | Show docs for item under cursor | normal: `` <space>k ``, select: `` <space>k `` |
-| `toggle_comments` | Comment/uncomment selections | normal: `` <C-c> ``, `` <space>c ``, select: `` <C-c> ``, `` <space>c `` |
+| `toggle_comments` | Comment/uncomment selections, or create a comment or reply in review mode | normal: `` <C-c> ``, `` <space>c ``, select: `` <C-c> ``, `` <space>c `` |
 | `toggle_line_comments` | Line comment/uncomment selections | normal: `` <space><A-c> ``, select: `` <space><A-c> `` |
 | `toggle_block_comments` | Block comment/uncomment selections | normal: `` <space>C ``, select: `` <space>C `` |
 | `rotate_selections_forward` | Rotate selections forward | normal: `` ) ``, select: `` ) `` |

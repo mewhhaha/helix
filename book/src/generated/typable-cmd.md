@@ -89,6 +89,12 @@
 | `:run-shell-command`, `:sh`, `:!` | Run a shell command |
 | `:reset-diff-change`, `:diffget`, `:diffg` | Reset the diff change at the cursor position. |
 | `:review-mode`, `:diff-mode` | Toggle read-only Git review mode, set on/off, or compare with the merge base of HEAD and a Git revision (e.g. main, origin/main, HEAD). |
+| `:review-reply` | Reply to the focused review thread, or a thread ID, using ordinary comment editing. |
+| `:review-resolve` | Resolve the focused review thread, or a thread ID, and hide its inline comments. |
+| `:review-delete` | Delete the focused review message, preserving any remaining replies in its thread. |
+| `:review-reopen` | Reopen a resolved review thread by ID. |
+| `:review-comments` | List threads for the active review, including resolved and outdated comments. |
+| `:review-info` | Show the review target, commit IDs, PR identity, and focused comment author. |
 | `:clear-register` | Clear given register. If no argument is provided, clear all registers. |
 | `:set-register` | Set contents of the given register. |
 | `:redraw` | Clear and re-render the whole UI |

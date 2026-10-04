@@ -93,6 +93,76 @@ together; `[D`/`]D` go to the first/last stop. Each hunk is one stop, with delet
 focused on their old text. Counts such as `3]d` skip multiple stops.
 Themes can customize the backgrounds with `ui.diff.added` and `ui.diff.deleted`.
 
+Use `Space c` in review mode to write an inline comment above the current line.
+Select characters or lines with `v` or `x` first to attach the comment to that
+range, including deleted text. Comments have no line numbers. Press `Esc` to
+save an insert-mode edit, or `Ctrl-c` to cancel it. Navigate onto a comment with
+`j`/`k` or the mouse and use normal Helix editing commands: selections,
+delete/change/replace, registers, paste, undo/redo and custom keymaps work within
+the comment. Normal-mode edits save automatically; `:write` also saves comments.
+`Space c` on a comment starts a reply. Use `:review-delete` to delete the focused
+message. Focusing a comment
+highlights its referenced text. Comment rows invert the editor's foreground and
+background colors by default; selections within them use the normal editor
+selection style.
+
+Comments are grouped into threads for a specific review target. Use
+`:review-reply` on a comment to add a reply, `:review-resolve` to resolve the
+thread, and `:review-reopen ID` to reopen it. Resolving hides all of a thread's
+inline messages. `:review-comments` lists the current review's open, resolved,
+and outdated threads; selecting a thread that cannot be displayed inline opens
+its full conversation. `:review-info` shows the target, commit references, PR
+identity, and focused message's author. These commands also accept thread IDs
+where applicable; reply bodies use the same normal editing commands as other
+comments. `:review-delete` removes one message; its remaining replies stay in
+the thread.
+
+Comments are stored beside the source in `filename.review.json`. Add
+`*.review.json` and `*.review.json.lock` to a project's `.gitignore` to keep them
+local; this fork already ignores both. The lock file serializes agent writes
+with editor saves. Source contents and undo history are unchanged. Themes can set
+`ui.review.comment`, `ui.review.comment.active`, and `ui.review.reference`.
+
+The version 2 JSON records the selected target, its resolved commit, the merge
+base, the reviewed HEAD, and SHA-256 hashes of the actual current and base text.
+Each thread keeps its original snapshot and anchor even when its current
+position moves. Messages have stable IDs, authors, and Unix timestamps in
+seconds. Switching targets isolates their threads; updating a review on the
+same branch keeps its IDs. PR reviews use the PR identity across local branch
+renames. Version 1 comments load automatically and migrate on the next save;
+their unavailable original commits and authors remain unknown.
+
+For an agent review, check out the PR branch and start a local review for each
+file being reviewed. Supply a PR URL to associate its identity with the review:
+
+```sh
+hx review start src/widget.rs --target origin/main \
+  --pr https://github.com/owner/repo/pull/42
+hx review add src/widget.rs --review REVIEW_ID --line 12 --end-line 15 \
+  --author codex --quote 'input.is_empty()' --body 'Check the empty-input case.'
+hx review reply src/widget.rs --thread 1 --author developer \
+  --body 'Fixed; please check the new test.'
+hx review resolve src/widget.rs --thread 1
+hx review list src/widget.rs --all
+```
+
+Replace `REVIEW_ID` with the `review.id` returned by `start`. Every command
+returns JSON. Agents should pass that ID explicitly so another review cannot
+change their selected target. `add` requires the captured HEAD and file hash to
+still match, validates optional quoted code, and supports character columns or
+`--side base` for deleted code. `--body-file FILE` or `--body-file -` accepts
+multiline input. Repeat `start` after code changes to refresh the snapshot;
+existing threads keep their originals, and missing or ambiguous anchors are
+reported as outdated. `hx review --help` documents all options, including
+message editing, reopening, and removal. A fully deleted file can still receive
+base-side comments through its original path.
+
+Open the source in Helix and use `:review-mode origin/main --pr URL` with the
+same target and PR URL, or `z r` to resume the saved review. Agent updates reload
+while review mode is visible; active drafts retain conflict checks instead of
+being overwritten. Sidecars and CLI findings stay local; GitHub publication is
+a separate step.
+
 ## Performance improvements
 
 - **Editor rendering:** reuse unchanged view contents and cache visible syntax

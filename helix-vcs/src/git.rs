@@ -71,7 +71,30 @@ pub fn get_review_base(
     Ok(RevisionDiffBase {
         bytes: get_diff_base_from_repo(&repo, &base, &file, Some(cancel), true)?,
         commit: base.id.to_string(),
+        revision: crate::ReviewRevision {
+            target_commit: target.id.to_string(),
+            base_commit: base.id.to_string(),
+            head_commit: head.id.to_string(),
+            branch: repo
+                .head_ref()?
+                .map(|reference| reference.name().shorten().to_string()),
+        },
     })
+}
+
+pub fn get_revision_file(
+    file: &Path,
+    commit: &str,
+    trust_full: bool,
+    cancel: &helix_event::TaskHandle,
+) -> Result<Vec<u8>> {
+    let file = gix::path::realpath(file).context("resolve symlinks")?;
+    let repo = open_repo(get_repo_dir(&file)?, trust_full)?.to_thread_local();
+    let commit = repo
+        .rev_parse_single(commit.as_bytes().as_bstr())?
+        .object()?
+        .peel_to_commit()?;
+    get_diff_base_from_repo(&repo, &commit, &file, Some(cancel), true)
 }
 
 fn get_diff_base_from_repo(
@@ -177,6 +200,14 @@ pub fn prepare_vcs(
     Ok(PreparedVcs {
         diff_base,
         head: Some(head_name),
+        review_revision: Some(crate::ReviewRevision {
+            target_commit: head.id.to_string(),
+            base_commit: head.id.to_string(),
+            head_commit: head.id.to_string(),
+            branch: repo
+                .head_ref()?
+                .map(|reference| reference.name().shorten().to_string()),
+        }),
     })
 }
 

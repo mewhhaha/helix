@@ -301,7 +301,14 @@ fn render_selections<'a, F>(context: &mut RenderContext<'a>, write: F)
 where
     F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
 {
-    let selection = context.doc.selection(context.view.id);
+    let selection = context
+        .view
+        .diff_mode
+        .comment_cursor(context.doc, context.view.id)
+        .map_or_else(
+            || context.doc.selection(context.view.id),
+            |cursor| &cursor.ranges,
+        );
     let count = selection.len();
     write(
         context,
@@ -317,7 +324,14 @@ fn render_primary_selection_length<'a, F>(context: &mut RenderContext<'a>, write
 where
     F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
 {
-    let tot_sel = context.doc.selection(context.view.id).primary().len();
+    let tot_sel = context
+        .view
+        .diff_mode
+        .comment_cursor(context.doc, context.view.id)
+        .map_or_else(
+            || context.doc.selection(context.view.id).primary().len(),
+            |cursor| cursor.range.len(),
+        );
     write(
         context,
         format!(" {} char{} ", tot_sel, if tot_sel == 1 { "" } else { "s" }).into(),
