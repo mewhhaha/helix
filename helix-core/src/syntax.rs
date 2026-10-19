@@ -1369,6 +1369,90 @@ mod test {
     static LOADER: Lazy<Loader> = Lazy::new(crate::config::default_lang_loader);
 
     #[test]
+    fn markdown_haskell_code_fence_edits() {
+        let loader = crate::config::default_lang_loader();
+        loader.set_scopes(vec!["keyword".into(), "type".into(), "variable".into()]);
+        let markdown = loader.language_for_name("markdown").unwrap();
+        let haskell = loader.language_for_name("haskell").unwrap();
+        assert!(loader.get_config(haskell).is_some());
+
+        let render = |syntax: &Syntax, source: &Rope| {
+            let mut highlighter = syntax.highlighter(source.slice(..), &loader, ..);
+            while highlighter.next_event_offset() != u32::MAX {
+                highlighter.advance();
+            }
+        };
+
+        // The old Haskell scanner corrupted the heap while incrementally parsing
+        // these class contexts inside a Markdown injection.
+        for language in ["haskell", "hs"] {
+            for prefix in ["", "  ", "> ", "  > "] {
+                let content = format!(
+                    "# Example\n\n{prefix}```{language}\n\
+                     {prefix}class A a => Read a\n\
+                     {prefix}class (A a, A a) => A a\n\
+                     {prefix}```\n"
+                );
+                let mut source = Rope::from_str(&content);
+                let mut syntax = Syntax::new(source.slice(..), markdown, &loader).unwrap();
+                let code_start = content.find("class").unwrap() as u32;
+                let check_injection = |syntax: &Syntax, source: &Rope| {
+                    let layer = syntax.layer_for_byte_range(code_start, code_start + 5);
+                    assert_eq!(syntax.layer(layer).language, haskell);
+                    let root = syntax
+                        .tree_for_byte_range(code_start, code_start + 5)
+                        .root_node();
+                    assert_eq!(root.kind(), "haskell");
+                    let mut highlighter =
+                        syntax.highlighter(source.slice(..), &loader, code_start..code_start + 5);
+                    let mut keyword_highlighted = false;
+                    while highlighter.next_event_offset() != u32::MAX {
+                        keyword_highlighted |=
+                            highlighter.advance().1.any(|h| h == Highlight::new(0));
+                    }
+                    assert!(
+                        keyword_highlighted,
+                        "{language} fence with prefix {prefix:?}"
+                    );
+                };
+                check_injection(&syntax, &source);
+                render(&syntax, &source);
+
+                // Edit both the fence and its contents, then undo each edit.
+                for pos in (0..source.len_chars()).step_by(7) {
+                    let transaction =
+                        Transaction::change(&source, iter::once((pos, pos, Some("\n".into()))));
+                    let old_source = source.clone();
+                    assert!(transaction.apply(&mut source));
+                    syntax
+                        .update(
+                            old_source.slice(..),
+                            source.slice(..),
+                            transaction.changes(),
+                            &loader,
+                        )
+                        .unwrap();
+                    render(&syntax, &source);
+
+                    let undo = transaction.invert(&old_source);
+                    let old_source = source.clone();
+                    assert!(undo.apply(&mut source));
+                    syntax
+                        .update(
+                            old_source.slice(..),
+                            source.slice(..),
+                            undo.changes(),
+                            &loader,
+                        )
+                        .unwrap();
+                    assert_eq!(source, content);
+                    check_injection(&syntax, &source);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn shared_overlay_windows_seek_and_preserve_overlapping_boundaries() {
         let highlights = Arc::new(vec![
             (Highlight::new(1), 0..5),
