@@ -23,7 +23,7 @@ use helix_view::{
     Align, DocumentId, Editor, ViewId,
 };
 use serde_json::json;
-use tui::backend::{Backend, CellSize, WindowMetrics};
+use tui::backend::{Backend, CellSize, CursorGraphicsUpdate, WindowMetrics};
 use tui::buffer::Cell;
 
 use crate::{
@@ -108,6 +108,7 @@ pub struct Application {
     cursor_smear: ui::cursor_graphics::CursorGraphics<CursorSmearEditorIdentity>,
     cursor_smear_last_position: Option<(CursorSmearIdentity, usize)>,
     cursor_smear_frame: Option<CursorSmearFrame>,
+    cursor_smear_terminal_color: Option<Color>,
     pending_lsp_messages: std::collections::VecDeque<diagnostic_batch::PreparedMessage>,
     lsp_preparation: Option<tokio::task::JoinHandle<Vec<diagnostic_batch::PreparedMessage>>>,
 }
@@ -287,6 +288,7 @@ impl Application {
             cursor_smear: Default::default(),
             cursor_smear_last_position: None,
             cursor_smear_frame: None,
+            cursor_smear_terminal_color: None,
             pending_lsp_messages: Default::default(),
             lsp_preparation: None,
         };
@@ -378,7 +380,7 @@ impl Application {
                 self.cursor_smear_last_position = None;
             }
             self.cursor_smear_last_position = Some((identity, document_cursor));
-            self.cursor_smear.update(
+            let changed = self.cursor_smear.update(
                 pos,
                 bounds,
                 (identity.0, identity.1, identity.3),
@@ -420,7 +422,37 @@ impl Application {
                         }
                     }
                 }
-                if let Some(image) = self.cursor_smear.frame(color, now.into_std()) {
+                let terminal_playback = self.terminal.backend().supports_cursor_animation();
+                if terminal_playback
+                    && !changed
+                    && self.cursor_smear_terminal_color == Some(color)
+                    && !self.terminal.cursor_graphics_invalidated()
+                {
+                    self.terminal
+                        .draw_with_cursor_update_and_metrics(
+                            cursor,
+                            CursorKind::Hidden,
+                            CursorGraphicsUpdate::Unchanged,
+                            metrics,
+                        )
+                        .unwrap();
+                    graphics_drawn = true;
+                } else if let Some(clip) = terminal_playback
+                    .then(|| self.cursor_smear.animation_clip(color, now.into_std()))
+                    .flatten()
+                {
+                    self.terminal
+                        .draw_with_cursor_update_and_metrics(
+                            cursor,
+                            CursorKind::Hidden,
+                            CursorGraphicsUpdate::Animation(&clip),
+                            metrics,
+                        )
+                        .unwrap();
+                    self.cursor_smear
+                        .start_terminal_playback(tokio::time::Instant::now().into_std());
+                    graphics_drawn = true;
+                } else if let Some(image) = self.cursor_smear.frame(color, now.into_std()) {
                     self.terminal
                         .draw_with_cursor_graphics_and_metrics(
                             cursor,
@@ -431,17 +463,18 @@ impl Application {
                         .unwrap();
                     graphics_drawn = true;
                 }
-                self.cursor_smear_frame =
-                    self.cursor_smear
-                        .is_active(now.into_std())
-                        .then_some(CursorSmearFrame {
-                            area,
-                            cell_size,
-                            identity,
-                            bounds,
-                            color,
-                            next_frame: now + CURSOR_SMEAR_FRAME_INTERVAL,
-                        });
+                self.cursor_smear_terminal_color =
+                    (terminal_playback && graphics_drawn).then_some(color);
+                self.cursor_smear_frame = (!terminal_playback
+                    && self.cursor_smear.is_active(now.into_std()))
+                .then_some(CursorSmearFrame {
+                    area,
+                    cell_size,
+                    identity,
+                    bounds,
+                    color,
+                    next_frame: now + CURSOR_SMEAR_FRAME_INTERVAL,
+                });
             } else {
                 // Prefix help temporarily owns the screen. Keep the current
                 // logical cursor as the origin for the completed movement.
@@ -449,6 +482,7 @@ impl Application {
             }
         }
         if !graphics_drawn {
+            self.cursor_smear_terminal_color = None;
             if graphics_context.is_none() || graphics_enabled {
                 self.cursor_smear.clear();
                 self.cursor_smear_last_position = None;

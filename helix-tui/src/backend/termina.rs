@@ -24,7 +24,7 @@ use termina::{
 
 use crate::{buffer::Cell, terminal::Config};
 
-use super::{kitty, Backend, CellSize, CursorImage, WindowMetrics};
+use super::{kitty, Backend, CellSize, CursorAnimation, CursorImage, WindowMetrics};
 
 fn supports_cursor_graphics(term: Option<&str>, program: Option<&str>, multiplexed: bool) -> bool {
     !multiplexed
@@ -32,14 +32,55 @@ fn supports_cursor_graphics(term: Option<&str>, program: Option<&str>, multiplex
             || matches!(program, Some("kitty" | "ghostty")))
 }
 
-fn cursor_graphics_compression(term: Option<&str>, program: Option<&str>) -> kitty::Compression {
-    if term == Some("xterm-ghostty") || program == Some("ghostty") {
+fn cursor_graphics_compression(
+    term: Option<&str>,
+    program: Option<&str>,
+    terminal_animation: bool,
+) -> kitty::Compression {
+    if !terminal_animation && (term == Some("xterm-ghostty") || program == Some("ghostty")) {
         // Ghostty 1.3.1 can segfault when inflating valid cursor frames. Raw RGBA
-        // avoids its zlib decoder while retaining the same image and animation.
+        // avoids its zlib decoder. Identified 1.4+ builds use its replacement
+        // Wuffs decoder, allowing compressed clips and static cursor uploads.
         kitty::Compression::None
     } else {
         kitty::Compression::Zlib
     }
+}
+
+fn supports_cursor_animation(
+    term: Option<&str>,
+    program: Option<&str>,
+    version: Option<&str>,
+) -> bool {
+    if program != Some("ghostty") && !(program.is_none() && term == Some("xterm-ghostty")) {
+        return false;
+    }
+    // APC feature replies cannot yet be parsed by Termina. Use the advertised
+    // version conservatively; unknown and development builds retain frame ticks.
+    let Some(version) = version else { return false };
+    let version = version.split('+').next().unwrap_or_default();
+    let version = if let Some((release, suffix)) = version.split_once('-') {
+        // Arch appends its package revision to the released upstream version.
+        // This is also present in TERM_PROGRAM_VERSION on the packaged build.
+        let Some(revision) = suffix.strip_prefix("arch") else {
+            return false;
+        };
+        if revision
+            .split('.')
+            .any(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()))
+        {
+            return false;
+        }
+        release
+    } else {
+        version
+    };
+    let mut parts = version.split('.');
+    let mut number = || parts.next().and_then(|part| part.parse::<u32>().ok());
+    let (Some(major), Some(minor), Some(patch)) = (number(), number(), number()) else {
+        return false;
+    };
+    parts.next().is_none() && (major, minor, patch) >= (1, 4, 0)
 }
 
 fn cell_size(size: WindowSize) -> Option<CellSize> {
@@ -87,6 +128,7 @@ struct Capabilities {
     theme_mode: Option<theme::Mode>,
     /// Conservative advertised support: Termina cannot currently parse APC query replies.
     cursor_graphics: bool,
+    cursor_animation: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -115,7 +157,8 @@ pub struct TerminaBackend {
     /// The terminal emulator's background color. This is queried when claiming the terminal so
     /// that custom colors set outside of Helix with OSC11 are restored when Helix exits.
     original_background_color: Option<RgbColor>,
-    cursor_image_id: u32,
+    cursor_image_ids: [u32; 2],
+    cursor_image_index: usize,
     cursor_image_active: Arc<AtomicBool>,
     cursor_encoder: kitty::Encoder,
 }
@@ -142,6 +185,12 @@ impl TerminaBackend {
                 .iter()
                 .any(|name| std::env::var_os(name).is_some()),
         );
+        capabilities.cursor_animation = capabilities.cursor_graphics
+            && supports_cursor_animation(
+                term.as_deref(),
+                program.as_deref(),
+                std::env::var("TERM_PROGRAM_VERSION").ok().as_deref(),
+            );
         let start = Instant::now();
 
         // HACK: emitting OSC11 / OSC111 seems to break SGR and cause flickering in tmux.
@@ -274,14 +323,17 @@ impl TerminaBackend {
         static NEXT_IMAGE: AtomicU32 = AtomicU32::new(1);
         let cursor_image_id = std::process::id()
             .wrapping_mul(0x9e37_79b9)
-            .wrapping_add(NEXT_IMAGE.fetch_add(1, Ordering::Relaxed))
+            .wrapping_add(NEXT_IMAGE.fetch_add(2, Ordering::Relaxed))
             .max(1);
+        let cursor_image_ids = [cursor_image_id, cursor_image_id.wrapping_add(1).max(1)];
         let cursor_image_active = Arc::new(AtomicBool::new(false));
         let hook_image_active = cursor_image_active.clone();
         terminal.set_panic_hook(move |term| {
             let _ = write!(term, "{}", decreset!(SynchronizedOutput));
             if hook_image_active.swap(false, Ordering::Relaxed) {
-                let _ = kitty::delete_image(term, cursor_image_id);
+                for id in cursor_image_ids {
+                    let _ = kitty::delete_image(term, id);
+                }
             }
             let _ = write!(
                 term,
@@ -309,11 +361,13 @@ impl TerminaBackend {
             is_synchronized_output_set: false,
             background_color: None,
             original_background_color,
-            cursor_image_id,
+            cursor_image_ids,
+            cursor_image_index: 0,
             cursor_image_active,
             cursor_encoder: kitty::Encoder::new(cursor_graphics_compression(
                 term.as_deref(),
                 program.as_deref(),
+                capabilities.cursor_animation,
             )),
         })
     }
@@ -711,7 +765,9 @@ impl Backend for TerminaBackend {
     ) -> io::Result<()> {
         let Some(image) = image else {
             if self.cursor_image_active.load(Ordering::Relaxed) {
-                kitty::delete_image(&mut self.terminal, self.cursor_image_id)?;
+                for id in self.cursor_image_ids {
+                    kitty::delete_image(&mut self.terminal, id)?;
+                }
                 self.cursor_image_active.store(false, Ordering::Relaxed);
             }
             return Ok(());
@@ -732,8 +788,54 @@ impl Backend for TerminaBackend {
         }
         // Mark before writing so a partial transfer is also deleted during cleanup.
         self.cursor_image_active.store(true, Ordering::Relaxed);
+        self.cursor_encoder.draw_image(
+            &mut self.terminal,
+            self.cursor_image_ids[self.cursor_image_index],
+            image,
+        )
+    }
+
+    fn supports_cursor_animation(&self) -> bool {
+        self.config.cursor_graphics && self.capabilities.cursor_animation
+    }
+
+    fn prepare_cursor_animation(&mut self, animation: &CursorAnimation) -> io::Result<()> {
+        animation.validate()?;
+        let id = self.cursor_image_ids[1 - self.cursor_image_index];
+        self.cursor_image_active.store(true, Ordering::Relaxed);
+        // Delete a previous partial preparation before reusing the spare slot.
+        kitty::delete_image(&mut self.terminal, id)?;
         self.cursor_encoder
-            .draw_image(&mut self.terminal, self.cursor_image_id, image)
+            .upload_animation(&mut self.terminal, id, animation)
+    }
+
+    fn show_cursor_animation(
+        &mut self,
+        animation: &CursorAnimation,
+        metrics: WindowMetrics,
+    ) -> io::Result<()> {
+        let Some(size) = metrics.cell_size else {
+            return self.draw_cursor_graphics(None);
+        };
+        if animation.position.row >= usize::from(metrics.area.height)
+            || animation.position.col >= usize::from(metrics.area.width)
+            || animation.offset_x >= size.width
+            || animation.offset_y >= size.height
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cursor animation outside terminal",
+            ));
+        }
+        let old = self.cursor_image_index;
+        kitty::Encoder::show_animation(
+            &mut self.terminal,
+            self.cursor_image_ids[1 - old],
+            animation,
+        )?;
+        kitty::delete_image(&mut self.terminal, self.cursor_image_ids[old])?;
+        self.cursor_image_index = 1 - old;
+        Ok(())
     }
 
     fn get_theme_mode(&self) -> Option<theme::Mode> {
@@ -852,6 +954,49 @@ mod cursor_graphics_tests {
     use super::*;
 
     #[test]
+    fn terminal_playback_requires_an_identified_ghostty_release() {
+        for version in [
+            "1.4.0",
+            "1.4.1",
+            "1.5.0",
+            "2.0.0",
+            "1.4.0+build",
+            "1.4.0-arch1.1",
+        ] {
+            assert!(supports_cursor_animation(
+                Some("xterm-ghostty"),
+                Some("ghostty"),
+                Some(version)
+            ));
+        }
+        for version in [
+            None,
+            Some(""),
+            Some("1.3.1"),
+            Some("1.4.0-dev"),
+            Some("1.4"),
+            Some("1.4.0.1"),
+            Some("garbage"),
+        ] {
+            assert!(!supports_cursor_animation(
+                Some("xterm-ghostty"),
+                Some("ghostty"),
+                version
+            ));
+        }
+        assert!(!supports_cursor_animation(
+            Some("xterm-kitty"),
+            Some("kitty"),
+            Some("1.4.0")
+        ));
+        assert!(!supports_cursor_animation(
+            Some("xterm-ghostty"),
+            Some("another-terminal"),
+            Some("1.4.0")
+        ));
+    }
+
+    #[test]
     fn ghostty_uses_raw_rgba_and_kitty_keeps_zlib() {
         for (term, program) in [
             (Some("xterm-ghostty"), None),
@@ -860,7 +1005,7 @@ mod cursor_graphics_tests {
             (None, Some("ghostty")),
         ] {
             assert_eq!(
-                cursor_graphics_compression(term, program),
+                cursor_graphics_compression(term, program, false),
                 kitty::Compression::None
             );
         }
@@ -870,10 +1015,14 @@ mod cursor_graphics_tests {
             (Some("xterm-256color"), Some("kitty")),
         ] {
             assert_eq!(
-                cursor_graphics_compression(term, program),
+                cursor_graphics_compression(term, program, false),
                 kitty::Compression::Zlib
             );
         }
+        assert_eq!(
+            cursor_graphics_compression(Some("xterm-ghostty"), Some("ghostty"), true),
+            kitty::Compression::Zlib
+        );
     }
 
     #[test]

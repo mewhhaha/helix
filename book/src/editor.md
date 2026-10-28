@@ -221,6 +221,13 @@ the animation. Automatic key-prefix help pauses graphics and retains the cursor
 position for the completed command. Frames update about 60 times per second
 during movement and stop when the cursor settles.
 
+Ghostty 1.4.0 and newer play prepared clips using terminal animation support,
+without Helix frame timers. Kitty and older or unidentified Ghostty versions
+use editor-driven frames. Detection uses `TERM_PROGRAM_VERSION`; development
+versions retain the fallback. Decoded clip storage is limited to 4 MiB per clip,
+with at most two clips during replacement. Large jumps or long animations can
+shorten the stretch to stay within that limit.
+
 | Key | Description | Default |
 | --- | --- | --- |
 | `enabled` | Enable the graphics cursor and movement animation. | `false` |

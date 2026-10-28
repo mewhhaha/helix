@@ -2,7 +2,7 @@
 
 use std::io::{self, Write};
 
-use super::CursorImage;
+use super::{CursorAnimation, CursorImage};
 
 const RAW_CHUNK_SIZE: usize = 3072;
 const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -50,35 +50,7 @@ impl Encoder {
     ) -> io::Result<()> {
         image.validate()?;
 
-        // Positioning the placement must not move the real cursor (including on timer-only frames).
-        let (data, compression) = match self.compression {
-            Compression::None => (image.rgba, ""),
-            Compression::Zlib => {
-                let capacity = zlib_rs::compress_bound(image.rgba.len());
-                if self.compressed.len() < capacity {
-                    self.compressed.resize(capacity, 0);
-                }
-                let compressor = self
-                    .compressor
-                    .get_or_insert_with(|| zlib_rs::Deflate::new(1, true, 15));
-                compressor.reset();
-                let status = compressor
-                    .compress(
-                        image.rgba,
-                        &mut self.compressed,
-                        zlib_rs::DeflateFlush::Finish,
-                    )
-                    .map_err(|error| {
-                        io::Error::other(format!("cursor compression failed: {error:?}"))
-                    })?;
-                if status != zlib_rs::Status::StreamEnd
-                    || compressor.total_in() as usize != image.rgba.len()
-                {
-                    return Err(io::Error::other("incomplete cursor image compression"));
-                }
-                (&self.compressed[..compressor.total_out() as usize], ",o=z")
-            }
-        };
+        // Positioning the placement must not move the real cursor.
         writer.write_all(b"\x1b7")?;
         let result = (|| {
             write!(
@@ -87,29 +59,127 @@ impl Encoder {
                 image.position.row + 1,
                 image.position.col + 1
             )?;
-            let mut encoded = [0; 4096];
-            let mut chunks = data.chunks(RAW_CHUNK_SIZE).peekable();
-            let mut first = true;
-            while let Some(chunk) = chunks.next() {
-                let more = u8::from(chunks.peek().is_some());
-                if first {
-                    write!(
-                    writer,
+            self.write_rgba(writer, image.rgba, false, |writer, compression, more| {
+                write!(writer,
                     "\x1b_Ga=T,t=d,f=32{compression},i={image_id},p=1,s={},v={},X={},Y={},z=-1,C=1,q=2,m={more};",
-                    image.width, image.height, image.offset_x, image.offset_y,
-                )?;
-                    first = false;
-                } else {
-                    write!(writer, "\x1b_Gm={more};")?;
-                }
-                let len = encode_base64(chunk, &mut encoded);
-                writer.write_all(&encoded[..len])?;
-                writer.write_all(b"\x1b\\")?;
-            }
-            Ok(())
+                    image.width, image.height, image.offset_x, image.offset_y)
+            })
         })();
         let restore = writer.write_all(b"\x1b8");
         result.and(restore)
+    }
+
+    pub(super) fn upload_animation(
+        &mut self,
+        writer: &mut impl Write,
+        image_id: u32,
+        animation: &CursorAnimation,
+    ) -> io::Result<()> {
+        animation.validate()?;
+        // Only the root needs padding to the full canvas. Other frames use a
+        // fresh transparent canvas with a small replacement rectangle.
+        let first = &animation.frames[0];
+        let mut root = vec![0; animation.width as usize * animation.height as usize * 4];
+        for (y, row) in first
+            .rgba
+            .chunks_exact(first.width as usize * 4)
+            .enumerate()
+        {
+            let offset = ((first.y as usize + y) * animation.width as usize + first.x as usize) * 4;
+            root[offset..offset + row.len()].copy_from_slice(row);
+        }
+        self.write_rgba(writer, &root, false, |writer, compression, more| {
+            write!(
+                writer,
+                "\x1b_Ga=t,t=d,f=32{compression},i={image_id},s={},v={},N=1,q=2,m={more};",
+                animation.width, animation.height
+            )
+        })?;
+        // Root frames are gapless until explicitly assigned a duration.
+        write!(
+            writer,
+            "\x1b_Ga=a,i={image_id},r=1,z={},q=2;\x1b\\",
+            first.gap_ms
+        )?;
+        for frame in animation.frames.iter().skip(1) {
+            self.write_rgba(writer, &frame.rgba, true, |writer, compression, more| {
+                write!(writer, "\x1b_Ga=f,t=d,f=32{compression},i={image_id},s={},v={},x={},y={},X=1,Y=0,z={},N=1,q=2,m={more};",
+                    frame.width, frame.height, frame.x, frame.y, frame.gap_ms)
+            })?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn show_animation(
+        writer: &mut impl Write,
+        image_id: u32,
+        animation: &CursorAnimation,
+    ) -> io::Result<()> {
+        writer.write_all(b"\x1b7")?;
+        let result = (|| {
+            write!(
+                writer,
+                "\x1b[{};{}H\x1b_Ga=p,i={image_id},p=1,X={},Y={},z=-1,C=1,q=2;\x1b\\",
+                animation.position.row + 1,
+                animation.position.col + 1,
+                animation.offset_x,
+                animation.offset_y
+            )?;
+            // Loading mode parks on the final opaque cursor; it never loops.
+            write!(writer, "\x1b_Ga=a,i={image_id},c=1,s=2,q=2;\x1b\\")
+        })();
+        let restore = writer.write_all(b"\x1b8");
+        result.and(restore)
+    }
+
+    fn write_rgba<W: Write>(
+        &mut self,
+        writer: &mut W,
+        rgba: &[u8],
+        animation_frame: bool,
+        header: impl FnOnce(&mut W, &str, u8) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let (data, compression) = match self.compression {
+            Compression::None => (rgba, ""),
+            Compression::Zlib => {
+                let capacity = zlib_rs::compress_bound(rgba.len());
+                if self.compressed.len() < capacity {
+                    self.compressed.resize(capacity, 0);
+                }
+                let compressor = self
+                    .compressor
+                    .get_or_insert_with(|| zlib_rs::Deflate::new(1, true, 15));
+                compressor.reset();
+                let status = compressor
+                    .compress(rgba, &mut self.compressed, zlib_rs::DeflateFlush::Finish)
+                    .map_err(|error| {
+                        io::Error::other(format!("cursor compression failed: {error:?}"))
+                    })?;
+                if status != zlib_rs::Status::StreamEnd
+                    || compressor.total_in() as usize != rgba.len()
+                {
+                    return Err(io::Error::other("incomplete cursor image compression"));
+                }
+                (&self.compressed[..compressor.total_out() as usize], ",o=z")
+            }
+        };
+        let mut encoded = [0; 4096];
+        let mut chunks = data.chunks(RAW_CHUNK_SIZE).peekable();
+        let mut header = Some(header);
+        while let Some(chunk) = chunks.next() {
+            let more = u8::from(chunks.peek().is_some());
+            if let Some(header) = header.take() {
+                header(writer, compression, more)?;
+            } else if animation_frame {
+                write!(writer, "\x1b_Ga=f,m={more};")?;
+            } else {
+                write!(writer, "\x1b_Gm={more};")?;
+            }
+            let len = encode_base64(chunk, &mut encoded);
+            writer.write_all(&encoded[..len])?;
+            writer.write_all(b"\x1b\\")?;
+        }
+        Ok(())
     }
 }
 
@@ -139,11 +209,95 @@ fn encode_base64(input: &[u8], output: &mut [u8; 4096]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::CursorAnimationFrame;
     use helix_core::Position;
+
+    #[test]
+    fn animation_uploads_independent_frames_offscreen_and_parks_on_the_last() {
+        let mut state = 42u32;
+        let pixels: Vec<u8> = (0..8192)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect();
+        let animation = CursorAnimation {
+            position: Position::new(2, 3),
+            offset_x: 1,
+            offset_y: 2,
+            width: 64,
+            height: 32,
+            frames: vec![
+                CursorAnimationFrame {
+                    x: 1,
+                    y: 1,
+                    width: 1,
+                    height: 1,
+                    gap_ms: 17,
+                    rgba: vec![1, 2, 3, 255],
+                },
+                CursorAnimationFrame {
+                    x: 0,
+                    y: 0,
+                    width: 64,
+                    height: 32,
+                    gap_ms: 1,
+                    rgba: pixels.clone(),
+                },
+            ],
+        };
+        for compression in [Compression::None, Compression::Zlib] {
+            let mut encoder = Encoder::new(compression);
+            let mut output = Vec::new();
+            encoder
+                .upload_animation(&mut output, 123, &animation)
+                .unwrap();
+            let output = String::from_utf8(output).unwrap();
+            assert!(!output.contains("a=p") && !output.contains("a=T"));
+            let (root, frames) = output
+                .split_once("\x1b_Ga=a,i=123,r=1,z=17,q=2;\x1b\\")
+                .unwrap();
+            let decode = |encoded: &str| {
+                let bytes = transmitted_bytes(encoded);
+                if compression == Compression::Zlib {
+                    miniz_oxide::inflate::decompress_to_vec_zlib(&bytes).unwrap()
+                } else {
+                    bytes
+                }
+            };
+            let root = decode(root);
+            let pixel = (64 + 1) * 4;
+            assert_eq!(&root[pixel..pixel + 4], &[1, 2, 3, 255]);
+            assert!(root[..pixel].iter().all(|&byte| byte == 0));
+            assert!(root[pixel + 4..].iter().all(|&byte| byte == 0));
+            assert_eq!(decode(frames), pixels);
+            assert!(frames.contains("x=0,y=0,X=1,Y=0,z=1"));
+            assert!(frames.contains("\x1b_Ga=f,m=0;"));
+            assert!(!frames.contains(",c="));
+            let mut placement = Vec::new();
+            Encoder::show_animation(&mut placement, 123, &animation).unwrap();
+            let placement = String::from_utf8(placement).unwrap();
+            assert!(placement.starts_with("\x1b7\x1b[3;4H"));
+            assert!(placement.ends_with("\x1b_Ga=a,i=123,c=1,s=2,q=2;\x1b\\\x1b8"));
+        }
+        let mut invalid = animation;
+        invalid.frames[1].x = 1;
+        let mut output = Vec::new();
+        assert!(Encoder::default()
+            .upload_animation(&mut output, 1, &invalid)
+            .is_err());
+        assert!(output.is_empty());
+    }
 
     fn transmitted_bytes(output: &str) -> Vec<u8> {
         let uploads: Vec<_> = output.split("\x1b_G").skip(1).collect();
-        assert!(uploads.last().unwrap().starts_with("m=0;") || uploads.len() == 1);
+        assert!(
+            uploads.last().unwrap().starts_with("m=0;")
+                || uploads.last().unwrap().starts_with("a=f,m=0;")
+                || uploads.len() == 1
+        );
         let mut bytes = Vec::new();
         for (index, upload) in uploads.iter().enumerate() {
             let (control, payload) = upload.split_once(';').unwrap();

@@ -82,6 +82,117 @@ async fn moving_cursor(duration: u64) -> anyhow::Result<Application> {
 }
 
 #[tokio::test]
+async fn terminal_playback_has_no_frame_timer_and_unrelated_redraws_preserve_the_clip(
+) -> anyhow::Result<()> {
+    let mut app = application(1000, true).await?;
+    app.terminal
+        .backend_mut()
+        .set_cursor_animation_enabled(true);
+    set_selection(&mut app, Selection::point(12));
+    app.render().await;
+    assert!(app.cursor_smear_frame.is_none());
+    assert_eq!(app.terminal.backend().animation_count(), 1);
+    let clip = app.terminal.backend().cursor_animation().unwrap();
+    assert!(clip.frames.len() > 2);
+    let baseline = app.terminal.backend().buffer().clone();
+    app.render().await;
+    assert_eq!(
+        app.terminal.backend().animation_count(),
+        1,
+        "text redraw restarted playback"
+    );
+    assert!(app.terminal.backend().cursor_animation().is_some());
+    assert_eq!(app.terminal.backend().buffer().content, baseline.content);
+    app.compositor.full_redraw = true;
+    app.render().await;
+    assert_eq!(
+        app.terminal.backend().animation_count(),
+        2,
+        "full erase must replace the removed placement"
+    );
+    assert!(app.terminal.backend().cursor_animation().is_some());
+    let frames = app.terminal.backend().graphics_frame_count();
+    app.editor.reset_idle_timer();
+    let mut input = futures_util::stream::pending();
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            app.event_loop_until_idle(&mut input)
+        )
+        .await?
+    );
+    assert_eq!(
+        app.terminal.backend().graphics_frame_count(),
+        frames,
+        "Helix generated timer frames during terminal playback"
+    );
+    assert!(app.terminal.backend().graphics_frames_synchronized());
+    assert!(app.close().await.is_empty());
+    app.restore_term()?;
+    assert!(app.terminal.backend().cursor_animation().is_none());
+    assert!(app.terminal.backend().cursor_image().is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn terminal_playback_retargets_and_resets_on_focus_resize_and_disable() -> anyhow::Result<()>
+{
+    let mut app = application(120, true).await?;
+    app.terminal
+        .backend_mut()
+        .set_cursor_animation_enabled(true);
+    for (index, position) in [12, 3, 20, 2].into_iter().enumerate() {
+        set_selection(&mut app, Selection::point(position));
+        app.render().await;
+        assert_eq!(app.terminal.backend().animation_count(), index + 1);
+        assert!(app.cursor_smear_frame.is_none());
+        let image = app.terminal.backend().cursor_image().unwrap();
+        assert_eq!(
+            (image.position.col as u16, image.position.row as u16),
+            app.terminal.backend().cursor_position()
+        );
+    }
+    app.compositor.handle_event(
+        &Event::FocusLost,
+        &mut crate::compositor::Context {
+            editor: &mut app.editor,
+            jobs: &mut app.jobs,
+            scroll: None,
+        },
+    );
+    app.render().await;
+    assert!(app.terminal.backend().cursor_animation().is_none());
+    assert!(app.terminal.backend().cursor_image().is_none());
+    app.compositor.handle_event(
+        &Event::FocusGained,
+        &mut crate::compositor::Context {
+            editor: &mut app.editor,
+            jobs: &mut app.jobs,
+            scroll: None,
+        },
+    );
+    app.render().await;
+    assert!(app.terminal.backend().cursor_image().is_some());
+    app.terminal
+        .backend_mut()
+        .set_cursor_graphics_cell_size(Some(CellSize {
+            width: 10,
+            height: 20,
+        }));
+    app.render().await;
+    let image = app.terminal.backend().cursor_image().unwrap();
+    assert_eq!((image.width, image.height), (10, 20));
+    assert!(app.terminal.backend().cursor_animation().is_none());
+    let mut config = (*app.editor.config()).clone();
+    config.cursor_smear.enabled = false;
+    app.handle_config_events(ConfigEvent::Update(Box::new(config)));
+    app.render().await;
+    assert!(app.terminal.backend().cursor_image().is_none());
+    assert!(app.close().await.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
 async fn pixel_frames_preserve_text_redraw_requests_and_settle_without_a_timer(
 ) -> anyhow::Result<()> {
     let mut app = moving_cursor(120).await?;

@@ -71,7 +71,8 @@ python3 contrib/terminal-smoke.py target/opt/hx
 You can pass another binary path, such as `target/release/hx`. Use a binary built
 without the `integration` feature, which replaces the real terminal backend.
 No terminal emulator or display server is needed. The harness decodes Kitty and
-Ghostty cursor images, checks movement, focus and resizing, verifies
+Ghostty cursor images and Ghostty 1.4 animation clips, checks offscreen uploads,
+playback controls, decoded storage limits, movement, focus and resizing, verifies
 cursor fallback in ordinary terminals and multiplexers, and exercises readonly
 review commands and the `z r` toggle.
 

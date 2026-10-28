@@ -228,12 +228,46 @@ where
         image: Option<&CursorImage<'_>>,
         metrics: WindowMetrics,
     ) -> io::Result<()> {
+        self.draw_with_cursor_update_and_metrics(
+            cursor_position,
+            cursor_kind,
+            crate::backend::CursorGraphicsUpdate::Image(image),
+            metrics,
+        )
+    }
+
+    pub fn draw_with_cursor_update_and_metrics(
+        &mut self,
+        cursor_position: Option<(u16, u16)>,
+        cursor_kind: CursorKind,
+        update: crate::backend::CursorGraphicsUpdate<'_>,
+        metrics: WindowMetrics,
+    ) -> io::Result<()> {
+        use crate::backend::CursorGraphicsUpdate;
+        // Ghostty's full erase also reclaims unplaced images. Normally prepare
+        // outside synchronized output; on a full repaint upload after the erase
+        // so the prepared image survives until placement.
+        let prepare_after_clear = self.force_clear;
+        if !prepare_after_clear {
+            if let CursorGraphicsUpdate::Animation(animation) = &update {
+                self.backend.prepare_cursor_animation(animation)?;
+            }
+        }
         // One synchronized frame for the whole draw
         self.synchronized(|terminal| {
             terminal.flush()?;
-            terminal
-                .backend
-                .draw_cursor_graphics_with_metrics(image, metrics)?;
+            match update {
+                CursorGraphicsUpdate::Image(image) => terminal
+                    .backend
+                    .draw_cursor_graphics_with_metrics(image, metrics)?,
+                CursorGraphicsUpdate::Animation(animation) => {
+                    if prepare_after_clear {
+                        terminal.backend.prepare_cursor_animation(animation)?;
+                    }
+                    terminal.backend.show_cursor_animation(animation, metrics)?
+                }
+                CursorGraphicsUpdate::Unchanged => (),
+            }
             if let Some((x, y)) = cursor_position {
                 terminal.set_cursor(x, y)?;
             }
@@ -314,6 +348,11 @@ where
         // Reset the back buffer to make sure the next update will redraw everything.
         self.buffers[1 - self.current].reset();
         Ok(())
+    }
+
+    /// A full erase removes image placements as well as text.
+    pub fn cursor_graphics_invalidated(&self) -> bool {
+        self.force_clear
     }
 
     /// Queries the real size of the backend.

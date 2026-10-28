@@ -53,8 +53,13 @@ class Screen:
         self.saved_cursor = (0, 0)
         self.native_cursor = True
         self.synchronized = False
+        self.cleared_during_sync = False
         self.frames = []
         self.deletions = 0
+        self.images = {}
+        self.animation_starts = 0
+        self.animation_uploads = 0
+        self.peak_animation_bytes = 0
         self.upload = None
         self.pending = ""
         self.decoder = codecs.getincrementaldecoder("utf-8")("replace")
@@ -78,32 +83,88 @@ class Screen:
     def graphics(self, command):
         control, _, payload = command.partition(";")
         fields = dict(part.split("=", 1) for part in control.split(","))
-        if fields.get("a") == "d":
+        action = fields.get("a")
+        image_id = int(fields.get("i", 0))
+        if action == "d":
             self.deletions += 1
+            assert self.upload is None, "deleting during a chunked upload"
+            self.images.pop(image_id, None)
             return
-        if fields.get("a") == "T":
+        if action == "a":
+            image = self.images[image_id]
+            if "r" in fields:
+                assert fields["r"] == "1" and int(fields["z"]) > 0
+                image["root_gap"] = int(fields["z"])
+            if fields.get("s") == "2":
+                assert self.synchronized and fields.get("c") == "1"
+                assert image.get("root_gap", 0) > 0, "root frame is gapless"
+                assert image["frames"][-1][-1] == 255, "clip lacks an opaque final cursor"
+                row, column, offset_x, offset_y = image["placement"]
+                for width, height, x, y, alpha in image["frames"]:
+                    x += column * self.cell_width + offset_x
+                    y += row * self.cell_height + offset_y
+                    self.frames.append(Frame(width, height, y // self.cell_height,
+                                             x // self.cell_width, self.cell_width,
+                                             self.cell_height, alpha, image["compressed"]))
+                self.animation_starts += 1
+            return
+        if action == "p":
+            assert self.synchronized
+            image = self.images[image_id]
+            offset_x, offset_y = int(fields["X"]), int(fields["Y"])
+            assert 0 <= offset_x < self.cell_width and 0 <= offset_y < self.cell_height
+            assert self.x * self.cell_width + offset_x + image["width"] <= self.columns * self.cell_width
+            assert self.y * self.cell_height + offset_y + image["height"] <= self.rows * self.cell_height
+            image["placement"] = self.y, self.x, offset_x, offset_y
+            return
+        if action in ("T", "t", "f") and "s" in fields:
             assert self.upload is None, "interleaved graphics uploads"
             assert fields.get("f") == "32" and fields.get("t") == "d"
             self.upload = (fields, (self.y, self.x), bytearray())
         assert self.upload is not None, "graphics continuation without an upload"
         metadata, (row, column), content = self.upload
+        if metadata["a"] == "f":
+            assert action == "f", "animation continuation missing a=f"
         content.extend(base64.b64decode(payload, validate=True))
         assert len(content) <= 4 * 1024 * 1024, "unbounded cursor image"
         if fields.get("m") == "1":
             return
-        assert self.synchronized, "cursor image outside synchronized output"
         compressed = metadata.get("o") == "z"
         rgba = zlib.decompress(content) if compressed else content
         width, height = int(metadata["s"]), int(metadata["v"])
         assert len(rgba) == width * height * 4, "invalid RGBA frame length"
-        offset_x, offset_y = int(metadata["X"]), int(metadata["Y"])
-        assert 0 <= offset_x < self.cell_width and 0 <= offset_y < self.cell_height
-        assert column * self.cell_width + offset_x + width <= self.columns * self.cell_width
-        assert row * self.cell_height + offset_y + height <= self.rows * self.cell_height
         alpha = max(rgba[3::4])
         assert alpha > 0, "invisible graphics cursor"
-        self.frames.append(Frame(width, height, row, column, self.cell_width,
-                                 self.cell_height, alpha, compressed))
+        image_id = int(metadata["i"])
+        if metadata["a"] == "T":
+            assert self.synchronized, "cursor image outside synchronized output"
+            offset_x, offset_y = int(metadata["X"]), int(metadata["Y"])
+            assert 0 <= offset_x < self.cell_width and 0 <= offset_y < self.cell_height
+            assert column * self.cell_width + offset_x + width <= self.columns * self.cell_width
+            assert row * self.cell_height + offset_y + height <= self.rows * self.cell_height
+            self.frames.append(Frame(width, height, row, column, self.cell_width,
+                                     self.cell_height, alpha, compressed))
+            self.images[image_id] = dict(width=width, height=height, frames=[])
+        elif metadata["a"] == "t":
+            assert not self.synchronized or self.cleared_during_sync, "clip preparation held synchronized output"
+            self.images[image_id] = dict(width=width, height=height,
+                                        frames=[(width, height, 0, 0, alpha)], compressed=compressed)
+        else:
+            assert not self.synchronized or self.cleared_during_sync, "clip preparation held synchronized output"
+            image = self.images[image_id]
+            x, y = int(metadata["x"]), int(metadata["y"])
+            assert metadata["X"] == "1" and metadata["Y"] == "0" and "c" not in metadata
+            assert int(metadata["z"]) > 0
+            assert x + width <= image["width"] and y + height <= image["height"]
+            image["frames"].append((width, height, x, y, alpha))
+            assert len(image["frames"]) <= 64
+            assert image["width"] * image["height"] * 4 * len(image["frames"]) <= 4 * 1024 * 1024
+            self.animation_uploads += 1
+        assert len(self.images) <= 2, "obsolete cursor images accumulated"
+        storage = sum(image["width"] * image["height"] * 4 * max(1, len(image["frames"]))
+                      for image in self.images.values())
+        self.peak_animation_bytes = max(self.peak_animation_bytes, storage)
+        assert storage <= 8 * 1024 * 1024
         self.upload = None
 
     def csi(self, arguments, intermediate, command, fd):
@@ -129,6 +190,10 @@ class Screen:
             else:
                 self.x = max(0, self.x - distance)
         elif command in ("J", "K"):
+            if command == "J" and first in (2, 3):
+                # Ghostty reclaims unplaced images on a full erase as well.
+                self.images.clear()
+                self.cleared_during_sync = self.synchronized
             for y in range(self.rows):
                 for x in range(self.columns):
                     if command == "K" and y != self.y:
@@ -152,6 +217,7 @@ class Screen:
         elif command in ("h", "l") and private:
             if first == 2026:
                 self.synchronized = command == "h"
+                self.cleared_during_sync = False
             elif first == 25:
                 self.native_cursor = command == "h"
         elif command == "p" and intermediate == "$" and first == 2026:
@@ -224,9 +290,9 @@ class Screen:
 
 
 class Editor:
-    def __init__(self, binary, fixture, term, program, multiplexed=False):
+    def __init__(self, binary, fixture, term, program, multiplexed=False, version=None):
         self.fixture = fixture
-        self.launch = binary, term, program, multiplexed
+        self.launch = binary, term, program, multiplexed, version
         self.source = fixture / "example.rs"
         base = "fn main() {\n    let old_name = 1;\n" + "".join(
             f'    let example_{index} = demo_value("some text");\n' for index in range(17)
@@ -268,11 +334,13 @@ enable = false
 enabled = true
 duration = 120
 max-distance = 40
+[keys.normal]
+"C-l" = ":redraw"
 ''')
         self.start()
 
     def start(self):
-        binary, term, program, multiplexed = self.launch
+        binary, term, program, multiplexed, version = self.launch
         fixture = self.fixture
         config = fixture / "config.toml"
         self.screen = Screen()
@@ -282,13 +350,15 @@ max-distance = 40
         if self.pid == 0:
             fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 800, 480))
             os.chdir(fixture)
-            for name in ("TMUX", "STY", "ZELLIJ", "HELIX_DEFAULT_RUNTIME"):
+            for name in ("TMUX", "STY", "ZELLIJ", "HELIX_DEFAULT_RUNTIME", "TERM_PROGRAM_VERSION"):
                 os.environ.pop(name, None)
             os.environ.update(TERM=term, TERM_PROGRAM=program, COLORTERM="truecolor",
                               HELIX_RUNTIME=str(ROOT / "runtime"),
                               XDG_CONFIG_HOME=str(fixture / "config"),
                               XDG_DATA_HOME=str(fixture / "data"),
                               XDG_CACHE_HOME=str(fixture / "cache"))
+            if version is not None:
+                os.environ["TERM_PROGRAM_VERSION"] = version
             if multiplexed:
                 os.environ["TMUX"] = "/tmp/terminal-smoke,0,0"
             os.execv(str(binary), [str(binary), "--config", str(config),
@@ -349,6 +419,7 @@ max-distance = 40
                 self.command("quit-all!")
                 self.wait_for_exit()
             assert os.waitstatus_to_exitcode(self.status) == 0, self.status
+            assert not self.screen.images, "cursor images survived terminal restoration"
         finally:
             self.abort()
 
@@ -503,6 +574,8 @@ def graphics_smoke(editor, compressed):
                (frame.cell_width, frame.cell_height) for frame in screen.frames[settled:]), \
         "animation continued after the cursor settled"
     assert screen.frames[-1].alpha == 255 and not screen.native_cursor
+    editor.keys("\x0c", settle=0.2)
+    assert len(screen.images) == 1, "full repaint failed to restore the settled cursor"
     deleted = screen.deletions
     editor.keys("\x1b[O")
     assert screen.deletions > deleted, "focus loss retained the graphics cursor"
@@ -527,18 +600,33 @@ def main():
     args = parser.parse_args()
     binary = args.binary.resolve()
     assert binary.is_file(), f"binary not found: {binary}"
-    for name, term, program, multiplexed, graphics in [
-        ("kitty", "xterm-kitty", "kitty", False, True),
-        ("ghostty", "xterm-ghostty", "ghostty", False, True),
-        ("ordinary", "xterm-256color", "terminal-smoke", False, False),
-        ("multiplexed", "xterm-kitty", "kitty", True, False),
+    for name, term, program, multiplexed, graphics, version in [
+        ("kitty", "xterm-kitty", "kitty", False, True, None),
+        ("ghostty-1.3", "xterm-ghostty", "ghostty", False, True, "1.3.1"),
+        ("ghostty-1.4", "xterm-ghostty", "ghostty", False, True, "1.4.0"),
+        ("ghostty-unknown", "xterm-ghostty", "ghostty", False, True, None),
+        ("ordinary", "xterm-256color", "terminal-smoke", False, False, None),
+        ("multiplexed", "xterm-ghostty", "ghostty", True, False, "1.4.0"),
     ]:
         with tempfile.TemporaryDirectory(prefix=f"helix-terminal-{name}-") as directory:
-            editor = Editor(binary, Path(directory), term, program, multiplexed)
+            editor = Editor(binary, Path(directory), term, program, multiplexed, version)
             try:
                 editor.wait_for(lambda: "new_name" in editor.screen.text(), "document rendering")
                 if graphics:
-                    graphics_smoke(editor, compressed=name == "kitty")
+                    graphics_smoke(editor, compressed=name in ("kitty", "ghostty-1.4"))
+                    if name == "ghostty-1.4":
+                        assert editor.screen.animation_starts >= 3
+                        starts = editor.screen.animation_starts
+                        for keys in ("8j", "14l", "\x0c", "5k", "10h"):
+                            editor.keys(keys, settle=0.025)
+                        assert editor.screen.animation_starts > starts
+                        editor.pump(0.2)
+                        assert len(editor.screen.images) == 1, "full repaint lost the graphics cursor"
+                        uploads = editor.screen.animation_uploads
+                        editor.pump(0.2)
+                        assert editor.screen.animation_uploads == uploads, "editor kept sending playback frames"
+                    else:
+                        assert editor.screen.animation_starts == 0, "fallback used terminal playback"
                 else:
                     editor.keys("7j28lgg")
                     assert not editor.screen.frames, "unsupported session emitted graphics"

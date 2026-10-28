@@ -52,6 +52,12 @@ help pauses graphics and retains the cursor position for the completed command.
 Frames update about 60 times per second during movement and stop when the cursor
 settles.
 
+Ghostty 1.4.0 and newer play prepared clips using the terminal's animation
+support, without Helix frame timers. Kitty and older or unidentified Ghostty
+versions retain editor-driven frames. Detection uses `TERM_PROGRAM_VERSION`;
+development versions use the fallback. Clips have bounded decoded storage, so
+large jumps or long animations may use a shorter stretch.
+
 This requires terminal graphics support and available cell pixel dimensions.
 It is disabled inside tmux, GNU Screen, and Zellij, and in other terminals, where
 Helix uses its ordinary cursor. Terminal image rendering must also be enabled;

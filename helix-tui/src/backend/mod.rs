@@ -51,6 +51,85 @@ pub struct CursorImage<'a> {
     pub rgba: &'a [u8],
 }
 
+/// Ghostty expands even partial animation frames to full RGBA canvases. Bound
+/// the decoded storage of one clip; replacement temporarily needs two clips.
+pub const MAX_CURSOR_ANIMATION_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_CURSOR_ANIMATION_FRAMES: usize = 64;
+
+#[derive(Debug, Clone)]
+pub struct CursorAnimationFrame {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+    pub gap_ms: u32,
+    pub rgba: Vec<u8>,
+}
+
+/// Frames contain small rectangles on independent, transparent canvases.
+#[derive(Debug, Clone)]
+pub struct CursorAnimation {
+    pub position: Position,
+    pub offset_x: u16,
+    pub offset_y: u16,
+    pub width: u32,
+    pub height: u32,
+    pub frames: Vec<CursorAnimationFrame>,
+}
+
+impl CursorAnimation {
+    pub(crate) fn validate(&self) -> io::Result<()> {
+        let bytes = (self.width as usize)
+            .checked_mul(self.height as usize)
+            .and_then(|pixels| pixels.checked_mul(4))
+            .and_then(|bytes| bytes.checked_mul(self.frames.len()));
+        if self.width == 0
+            || self.height == 0
+            || self.frames.is_empty()
+            || self.frames.len() > MAX_CURSOR_ANIMATION_FRAMES
+            || bytes.is_none_or(|bytes| bytes > MAX_CURSOR_ANIMATION_BYTES)
+            || self.position.row.checked_add(1).is_none()
+            || self.position.col.checked_add(1).is_none()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid cursor animation canvas",
+            ));
+        }
+        for frame in &self.frames {
+            let bytes = (frame.width as usize)
+                .checked_mul(frame.height as usize)
+                .and_then(|pixels| pixels.checked_mul(4));
+            if frame.width == 0
+                || frame.height == 0
+                || frame.gap_ms == 0
+                || bytes != Some(frame.rgba.len())
+                || frame
+                    .x
+                    .checked_add(frame.width)
+                    .is_none_or(|x| x > self.width)
+                || frame
+                    .y
+                    .checked_add(frame.height)
+                    .is_none_or(|y| y > self.height)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid cursor animation frame",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+pub enum CursorGraphicsUpdate<'a> {
+    Image(Option<&'a CursorImage<'a>>),
+    Animation(&'a CursorAnimation),
+    /// Preserve terminal playback across unrelated text redraws.
+    Unchanged,
+}
+
 impl CursorImage<'_> {
     pub(crate) fn validate(&self) -> io::Result<()> {
         let len = usize::try_from(self.width)
@@ -111,6 +190,31 @@ pub trait Backend {
     /// Backends without graphics support never emit image commands.
     fn cursor_graphics_cell_size(&self) -> Option<CellSize> {
         None
+    }
+
+    fn supports_cursor_animation(&self) -> bool {
+        false
+    }
+
+    /// Upload offscreen, normally before beginning synchronized output. A full
+    /// erase reclaims unplaced images, so prepare after the erase on that path.
+    fn prepare_cursor_animation(&mut self, _animation: &CursorAnimation) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "cursor animations unsupported",
+        ))
+    }
+
+    /// Swap the prepared clip into view inside synchronized output.
+    fn show_cursor_animation(
+        &mut self,
+        _animation: &CursorAnimation,
+        _metrics: WindowMetrics,
+    ) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "cursor animations unsupported",
+        ))
     }
 
     fn window_metrics(&self) -> io::Result<WindowMetrics> {

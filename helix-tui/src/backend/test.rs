@@ -1,5 +1,5 @@
 use crate::{
-    backend::{Backend, CellSize, CursorImage, WindowMetrics},
+    backend::{Backend, CellSize, CursorAnimation, CursorImage, WindowMetrics},
     buffer::{Buffer, Cell},
     terminal::Config,
 };
@@ -18,9 +18,13 @@ pub struct TestBackend {
     pos: (u16, u16),
     cursor_graphics_cell_size: Option<CellSize>,
     cursor_image: Option<RecordedCursorImage>,
+    cursor_animation: Option<CursorAnimation>,
+    cursor_animation_enabled: bool,
+    animation_count: usize,
     graphics_frame_count: usize,
     graphics_delete_count: usize,
     synchronized: bool,
+    cleared_during_sync: bool,
     graphics_frames_synchronized: bool,
     draw_calls: usize,
     metrics_queries: std::cell::Cell<usize>,
@@ -76,9 +80,13 @@ impl TestBackend {
             pos: (0, 0),
             cursor_graphics_cell_size: None,
             cursor_image: None,
+            cursor_animation: None,
+            cursor_animation_enabled: false,
+            animation_count: 0,
             graphics_frame_count: 0,
             graphics_delete_count: 0,
             synchronized: false,
+            cleared_during_sync: false,
             graphics_frames_synchronized: true,
             draw_calls: 0,
             metrics_queries: std::cell::Cell::new(0),
@@ -102,6 +110,18 @@ impl TestBackend {
 
     pub fn cursor_image(&self) -> Option<&RecordedCursorImage> {
         self.cursor_image.as_ref()
+    }
+
+    pub fn set_cursor_animation_enabled(&mut self, enabled: bool) {
+        self.cursor_animation_enabled = enabled;
+    }
+
+    pub fn cursor_animation(&self) -> Option<&CursorAnimation> {
+        self.cursor_animation.as_ref()
+    }
+
+    pub fn animation_count(&self) -> usize {
+        self.animation_count
     }
 
     pub fn graphics_frame_count(&self) -> usize {
@@ -216,6 +236,7 @@ impl Backend for TestBackend {
     }
 
     fn clear(&mut self) -> Result<(), io::Error> {
+        self.cleared_during_sync = self.synchronized;
         self.draw_cursor_graphics(None)?;
         self.buffer.reset();
         Ok(())
@@ -223,6 +244,7 @@ impl Backend for TestBackend {
 
     fn start_sync(&mut self) -> Result<(), io::Error> {
         self.synchronized = true;
+        self.cleared_during_sync = false;
         Ok(())
     }
 
@@ -256,6 +278,7 @@ impl Backend for TestBackend {
     }
 
     fn draw_cursor_graphics(&mut self, image: Option<&CursorImage<'_>>) -> io::Result<()> {
+        self.cursor_animation = None;
         if let Some(image) = image.filter(|_| self.cursor_graphics_cell_size.is_some()) {
             image.validate()?;
             self.cursor_image = Some(RecordedCursorImage {
@@ -271,6 +294,45 @@ impl Backend for TestBackend {
         } else if self.cursor_image.take().is_some() {
             self.graphics_delete_count += 1;
         }
+        Ok(())
+    }
+
+    fn supports_cursor_animation(&self) -> bool {
+        self.cursor_animation_enabled && self.cursor_graphics_cell_size.is_some()
+    }
+
+    fn prepare_cursor_animation(&mut self, animation: &CursorAnimation) -> io::Result<()> {
+        assert!(
+            !self.synchronized || self.cleared_during_sync,
+            "only a full repaint may prepare inside synchronized output"
+        );
+        animation.validate()
+    }
+
+    fn show_cursor_animation(
+        &mut self,
+        animation: &CursorAnimation,
+        _metrics: WindowMetrics,
+    ) -> io::Result<()> {
+        // Record the final cursor separately from the clip, without simulating
+        // a second clock in integration tests.
+        let size = self.cursor_graphics_cell_size.unwrap();
+        let frame = animation.frames.last().unwrap();
+        let x = u32::from(animation.offset_x) + frame.x;
+        let y = u32::from(animation.offset_y) + frame.y;
+        self.draw_cursor_graphics(Some(&CursorImage {
+            position: Position::new(
+                animation.position.row + (y / u32::from(size.height)) as usize,
+                animation.position.col + (x / u32::from(size.width)) as usize,
+            ),
+            offset_x: (x % u32::from(size.width)) as u16,
+            offset_y: (y % u32::from(size.height)) as u16,
+            width: frame.width,
+            height: frame.height,
+            rgba: &frame.rgba,
+        }))?;
+        self.cursor_animation = Some(animation.clone());
+        self.animation_count += 1;
         Ok(())
     }
 

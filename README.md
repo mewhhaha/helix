@@ -27,7 +27,9 @@ performance improvements throughout editing, rendering, and background work.
   and settle as it moves, using the Kitty graphics protocol in direct Kitty and
   Ghostty sessions. It follows the configured block, bar, or underline shape and
   animates long jumps, including `gw` jumps that scroll the destination into view.
-  Animation frames run independently of full editor redraws and stop when the
+  Ghostty 1.4.0 and newer play prepared animation clips without editor frame
+  timers; Kitty and older or unidentified Ghostty versions use editor-driven
+  frames. Playback runs independently of full editor redraws and stops when the
   cursor settles. The feature is opt-in; other terminals and sessions inside
   tmux, GNU Screen, or Zellij use the ordinary cursor.
 - **Tailwind CSS and LSP colors:** inline color swatches in both hover popups and
@@ -201,8 +203,8 @@ a separate step.
   allocating a separate diff vector.
 - **Cursor graphics:** fill solid image regions in bulk, reserve antialiasing
   work for edges, and reuse a SIMD-capable zlib compressor and output buffers
-  between frames in Kitty. Ghostty uses uncompressed RGBA transfers to avoid
-  crashes in its zlib decoder.
+  in Kitty and identified Ghostty 1.4+ releases. Older or unidentified Ghostty
+  versions use uncompressed RGBA transfers to avoid crashes in the old decoder.
 - **Search and multiple selections:** cache repeated reverse-search scans and
   reuse grapheme traversal when mapping many selection endpoints through edits.
 - **Diffs and Git integration:** skip equal text edges, bound expensive character

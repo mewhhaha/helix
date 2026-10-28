@@ -10,7 +10,9 @@ use helix_view::{
     editor::CursorSmearConfig,
     graphics::{Color, CursorKind, Rect},
 };
-use tui::backend::{CellSize, CursorImage};
+use tui::backend::{
+    CellSize, CursorAnimation, CursorAnimationFrame, CursorImage, MAX_CURSOR_ANIMATION_BYTES,
+};
 
 const MAX_FRAME_PIXELS: usize = 256 * 1024;
 const MAX_CELL_PIXELS: u16 = 512;
@@ -181,7 +183,7 @@ impl<I: Eq> CursorGraphics<I> {
         kind: CursorKind,
         width_cells: u16,
         now: Instant,
-    ) {
+    ) -> bool {
         let Some(cursor) = cursor.filter(|&position| {
             config.enabled
                 && kind != CursorKind::Hidden
@@ -189,10 +191,18 @@ impl<I: Eq> CursorGraphics<I> {
                 && contains(bounds, position)
         }) else {
             self.clear();
-            return;
+            return true;
         };
         let settings = Settings::from(config);
         let target = target_quad(cursor, bounds, cell_size, kind, width_cells);
+        let changed = self.last.as_ref().is_none_or(|previous| {
+            previous.identity != identity
+                || previous.bounds != bounds
+                || previous.settings != settings
+                || previous.cell_size != cell_size
+                || previous.kind != kind
+                || previous.target != target
+        });
         if let Some(previous) = &self.last {
             if previous.identity != identity
                 || previous.bounds != bounds
@@ -220,6 +230,94 @@ impl<I: Eq> CursorGraphics<I> {
             kind,
             target,
         });
+        changed
+    }
+
+    /// Prepare a finite 60 Hz clip. Full decoded canvases, rather than just
+    /// transmitted rectangles, count against the terminal's storage budget.
+    pub(crate) fn animation_clip(&mut self, color: Color, now: Instant) -> Option<CursorAnimation> {
+        let animation = self
+            .animation
+            .filter(|animation| animation.is_active(now))?;
+        let elapsed = now.saturating_duration_since(animation.started);
+        let durations = animation
+            .durations
+            .map(|duration| duration.saturating_sub(elapsed));
+        let duration_ms = durations
+            .iter()
+            .max()?
+            .as_nanos()
+            .div_ceil(1_000_000)
+            .max(1) as u32;
+        let steps = (duration_ms * 60).div_ceil(1000).max(1);
+        let count = steps as usize + 1;
+        let max_pixels = (MAX_CURSOR_ANIMATION_BYTES / 4 / count).min(MAX_FRAME_PIXELS);
+        let last = self.last.as_ref()?;
+        let bounds = last.bounds;
+        let size = last.cell_size;
+        let from = bounded_source_with_limit(
+            animation.corners(now),
+            animation.to,
+            f64::INFINITY,
+            bounds,
+            size,
+            max_pixels,
+        );
+        let canvas = raster_bounds(from.into_iter().chain(animation.to), bounds, size)?;
+        if canvas.pixels() > max_pixels {
+            // A cursor this large cannot fit a clip. Show its static destination.
+            self.animation = None;
+            return None;
+        }
+        let animation = Animation {
+            from,
+            started: now,
+            durations,
+            ..animation
+        };
+        let mut frames = Vec::with_capacity(count);
+        let mut snapped = false;
+        for index in 0..=steps {
+            let time_ms = duration_ms * index / steps;
+            let next_ms = duration_ms * (index + 1) / steps;
+            self.animation = Some(animation);
+            let image = self.frame(color, now + Duration::from_millis(time_ms.into()))?;
+            let x = image.position.col as u32 * u32::from(size.width) + u32::from(image.offset_x);
+            let y = image.position.row as u32 * u32::from(size.height) + u32::from(image.offset_y);
+            frames.push(CursorAnimationFrame {
+                x: x - canvas.x,
+                y: y - canvas.y,
+                width: image.width,
+                height: image.height,
+                gap_ms: (next_ms - time_ms).max(1),
+                rgba: image.rgba.to_vec(),
+            });
+            if self.animation.is_none() && index < steps {
+                snapped = true;
+                break;
+            }
+        }
+        // Sampling future frames must not advance the live retargeting model.
+        self.animation = (!snapped).then_some(animation);
+        Some(CursorAnimation {
+            position: Position::new(
+                (canvas.y / u32::from(size.height)) as usize,
+                (canvas.x / u32::from(size.width)) as usize,
+            ),
+            offset_x: (canvas.x % u32::from(size.width)) as u16,
+            offset_y: (canvas.y % u32::from(size.height)) as u16,
+            width: canvas.width,
+            height: canvas.height,
+            frames,
+        })
+    }
+
+    /// Approximate Ghostty's playback clock from the completed placement write.
+    /// Retargeting samples this model without scheduling editor frame ticks.
+    pub(crate) fn start_terminal_playback(&mut self, now: Instant) {
+        if let Some(animation) = &mut self.animation {
+            animation.started = now;
+        }
     }
 
     pub(crate) fn frame(&mut self, color: Color, now: Instant) -> Option<CursorImage<'_>> {
@@ -367,6 +465,17 @@ fn paint_row(
 }
 
 fn bounded_source(from: Quad, target: Quad, maximum: f64, bounds: Rect, size: CellSize) -> Quad {
+    bounded_source_with_limit(from, target, maximum, bounds, size, MAX_FRAME_PIXELS)
+}
+
+fn bounded_source_with_limit(
+    from: Quad,
+    target: Quad,
+    maximum: f64,
+    bounds: Rect,
+    size: CellSize,
+    max_pixels: usize,
+) -> Quad {
     let displacement = from
         .iter()
         .zip(target)
@@ -380,7 +489,7 @@ fn bounded_source(from: Quad, target: Quad, maximum: f64, bounds: Rect, size: Ce
     let source = |scale| std::array::from_fn(|index| target[index].lerp(from[index], scale));
     let fits = |from: Quad| {
         raster_bounds(from.into_iter().chain(target), bounds, size)
-            .is_some_and(|raster| raster.pixels() <= MAX_FRAME_PIXELS)
+            .is_some_and(|raster| raster.pixels() <= max_pixels)
     };
     let limited = if scale == 1.0 { from } else { source(scale) };
     if fits(limited) {
@@ -679,6 +788,101 @@ mod tests {
             1,
             now,
         );
+    }
+
+    #[test]
+    fn terminal_clip_settles_with_exact_timing_and_preserves_retargeting() {
+        let now = Instant::now();
+        let mut graphics = CursorGraphics::<u8>::default();
+        update(&mut graphics, Position::new(2, 3), now);
+        update(&mut graphics, Position::new(12, 23), now);
+        // A non-integral elapsed millisecond must still include an opaque final frame.
+        let sampled = now + Duration::from_micros(1234);
+        let clip = graphics
+            .animation_clip(Color::Rgb(80, 120, 240), sampled)
+            .unwrap();
+        assert!(clip.frames.len() > 2);
+        assert_eq!(
+            clip.frames
+                .iter()
+                .take(clip.frames.len() - 1)
+                .map(|frame| frame.gap_ms)
+                .sum::<u32>(),
+            119
+        );
+        let final_frame = clip.frames.last().unwrap();
+        assert_eq!((final_frame.width, final_frame.height), (10, 20));
+        assert!(final_frame
+            .rgba
+            .chunks_exact(4)
+            .all(|pixel| pixel[3] == 255));
+        assert_eq!(
+            clip.position.col as u32 * 10 + u32::from(clip.offset_x) + final_frame.x,
+            230
+        );
+        assert_eq!(
+            clip.position.row as u32 * 20 + u32::from(clip.offset_y) + final_frame.y,
+            240
+        );
+        let start = sampled + Duration::from_millis(10);
+        graphics.start_terminal_playback(start);
+        let retargeted = start + Duration::from_millis(25);
+        let corners = graphics.animation.unwrap().corners(retargeted);
+        update(&mut graphics, Position::new(3, 4), retargeted);
+        assert_eq!(graphics.animation.unwrap().from, corners);
+    }
+
+    #[test]
+    fn terminal_clips_bound_all_decoded_canvases_even_for_long_high_dpi_jumps() {
+        let now = Instant::now();
+        for duration in [16, 120, 1000] {
+            let mut graphics = CursorGraphics::<u8>::default();
+            let config = CursorSmearConfig {
+                duration,
+                max_distance: 256,
+                ..config()
+            };
+            let size = CellSize {
+                width: 40,
+                height: 80,
+            };
+            for (index, cursor) in [Position::new(0, 0), Position::new(80, 150)]
+                .into_iter()
+                .enumerate()
+            {
+                graphics.update(
+                    Some(cursor),
+                    Rect::new(0, 0, 200, 100),
+                    0,
+                    &config,
+                    size,
+                    CursorKind::Block,
+                    1,
+                    now,
+                );
+                if index == 0 {
+                    continue;
+                }
+                let clip = graphics
+                    .animation_clip(Color::Rgb(80, 120, 240), now)
+                    .unwrap();
+                assert!(
+                    clip.width as usize * clip.height as usize * 4 * clip.frames.len()
+                        <= MAX_CURSOR_ANIMATION_BYTES
+                );
+                for frame in &clip.frames {
+                    assert!(frame.x + frame.width <= clip.width);
+                    assert!(frame.y + frame.height <= clip.height);
+                }
+                assert!(clip
+                    .frames
+                    .last()
+                    .unwrap()
+                    .rgba
+                    .chunks_exact(4)
+                    .all(|pixel| pixel[3] == 255));
+            }
+        }
     }
 
     #[test]
